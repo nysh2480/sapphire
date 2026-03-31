@@ -1,9 +1,42 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="sapphire-version" content="ng-0.3">
 <title>Sapphire NG 0.3</title>
+<script>
+// ── SAB/crossOriginIsolated via inline ServiceWorker ─────────────
+// COOP + COEP ヘッダをServiceWorkerで注入することでfile://でもSABが使用可能になる
+// 参考: https://github.com/nicolo-ribaudo/tc39-proposal-coi-without-headers
+(function(){
+  const SW_SRC = `
+self.addEventListener('install',e=>{e.waitUntil(self.skipWaiting());});
+self.addEventListener('activate',e=>{e.waitUntil(self.clients.claim());});
+self.addEventListener('fetch',e=>{
+  if(e.request.cache==='only-if-cached'&&e.request.mode!=='same-origin')return;
+  e.respondWith(fetch(e.request).then(r=>{
+    if(!r||r.status!==200||r.type!=='basic')return r;
+    const h=new Headers(r.headers);
+    h.set('Cross-Origin-Opener-Policy','same-origin');
+    h.set('Cross-Origin-Embedder-Policy','require-corp');
+    return new Response(r.body,{status:r.status,statusText:r.statusText,headers:h});
+  }).catch(()=>fetch(e.request)));
+});`;
+  if(!window.crossOriginIsolated && 'serviceWorker' in navigator){
+    const blob=new Blob([SW_SRC],{type:'application/javascript'});
+    const url=URL.createObjectURL(blob);
+    navigator.serviceWorker.register(url,{scope:'./'}).then(()=>{
+      if(!window.crossOriginIsolated){
+        // 初回登録時はリロードが必要
+        console.log('[SAB] ServiceWorker registered, reloading for crossOriginIsolated...');
+        location.reload();
+      }
+    }).catch(e=>console.warn('[SAB] SW registration failed:',e.message));
+  } else if(window.crossOriginIsolated){
+    console.log('[SAB] crossOriginIsolated: active');
+  }
+})();
+</script>
 <style>
 /* ── sph-color-* interface ─────────────────────────
    IDE holds defaults only.
@@ -53,6 +86,61 @@ body{display:flex;flex-direction:column;
 [data-mode=app]     #panel-log{display:none}
 [data-mode=app]     #frame-a{height:100vh!important;max-height:100vh}
 [data-mode=app]     #frame-a-ext{height:100%}
+/* ── UI transitions ──────────────────────────────────────── */
+/* frame-a-ext: slide+fade in when panel mounts */
+#frame-a-ext{
+  transition:opacity .18s ease, transform .18s ease;
+}
+#frame-a-ext.sph-mounting{
+  opacity:0;
+  transform:translateY(6px);
+}
+/* frame-b-ext: fade in */
+#frame-b-ext{
+  transition:opacity .15s ease;
+}
+#frame-b-ext.sph-mounting{
+  opacity:0;
+}
+/* log entries: fade in */
+.log-entry{
+  animation:sph-fadein .12s ease;
+}
+@keyframes sph-fadein{
+  from{opacity:0;transform:translateY(3px)}
+  to{opacity:1;transform:none}
+}
+/* tab active indicator: smooth slide */
+.tab-btn{
+  transition:color .12s ease, border-bottom-color .12s ease;
+}
+/* toolbar buttons: smooth hover */
+.abtn{
+  transition:opacity .1s ease, background .1s ease;
+}
+/* stat dot: smooth color change */
+#stat{
+  transition:background .2s ease;
+}
+/* resize handle: hover highlight */
+#frame-resize{
+  transition:background .1s ease, border-color .1s ease;
+}
+#frame-resize:hover{
+  background:var(--sph-accent)!important;
+  border-color:var(--sph-accent)!important;
+}
+/* sph-btn: smooth all */
+.sph-btn{
+  transition:opacity .1s ease, background .1s ease, border-color .1s ease;
+}
+/* EXT panel sections: stagger fade in */
+.sph-section{
+  animation:sph-fadein .15s ease both;
+}
+.sph-section:nth-child(2){animation-delay:.04s}
+.sph-section:nth-child(3){animation-delay:.08s}
+.sph-section:nth-child(4){animation-delay:.12s}
 /* toolbar */
 #toolbar{height:36px;background:var(--sph-surface);border-bottom:1px solid var(--sph-border);
          display:flex;align-items:center;flex-shrink:0;gap:4px;padding:0 8px}
@@ -172,6 +260,13 @@ body[data-frame-a="doc"]  #logo{color:var(--sph-ok)}
 
 /* ── legacy compat shims (old EXTs that still call ide.view.set) ── */
 body[data-view="doc"] #logo{color:var(--sph-ok)}
+
+/* ── hover/active feedback ────────────────────────────── */
+.abtn:hover{opacity:.8}
+.abtn:active{opacity:.6;transform:scale(.97)}
+.tab-btn:active{opacity:.7}
+.sph-btn:hover{opacity:.85}
+.sph-btn:active{opacity:.6}
 </style>
 </head>
 <body data-frame="V" data-frame-a="editor" data-frame-b="log">
@@ -1110,7 +1205,7 @@ function activateTab(name){
 }
 function log(cls,msg){
   const el=$id('log');if(!el)return;
-  const span=mk('span');span.className={print:'lp',ok:'lo',err:'le',warn:'lw',info:'li'}[cls]||'lp';
+  const span=mk('span');span.className=({print:'lp',ok:'lo',err:'le',warn:'lw',info:'li'}[cls]||'lp')+' log-entry';
   // Error code object: ERR EXT formats it; otherwise display code as-is
   if(msg&&typeof msg==='object'&&msg.code){
     const converted=sph.call('err.format',[msg]);
@@ -1374,11 +1469,16 @@ function frameGet(){return document.body.dataset.frame||'V';}
 function _writePane(slot,html){
   const el=$id(slot==='a'?'frame-a-ext':'frame-b-ext');
   if(!el)return;
+  // mounting アニメーション: opacity+translate でfade-slide in
+  el.className='sph-panel sph-mounting';
   el.innerHTML='';
-  el.className='sph-panel';
   const tmp=mk('div');tmp.innerHTML=html;
   for(const s of tmp.querySelectorAll('style'))document.head.appendChild(s.cloneNode(true));
   while(tmp.firstChild)el.appendChild(tmp.firstChild);
+  // 次フレームでクラスを外してトランジション発火
+  requestAnimationFrame(()=>requestAnimationFrame(()=>{
+    el.classList.remove('sph-mounting');
+  }));
 }
 
 // Mount EXT into frame-a (and optionally frame-b)
@@ -1443,14 +1543,19 @@ function frameMount(extId){
 function frameUnmount(){
   if(!_frameOwner)return;
   const prev=_frameOwner;
-  // M4: unwire on:{} handlers before clearing owner
   _wireOn(prev,false);
   _frameOwner=null;
-  $id('frame-a-ext').innerHTML='';
-  $id('frame-b-ext').innerHTML='';
-  document.body.dataset.frameA='editor';
-  document.body.dataset.frameB='log';
-  sph.emit('frame-unmounted',{id:prev});
+  // フェードアウト後にクリア
+  const extA=$id('frame-a-ext'), extB=$id('frame-b-ext');
+  if(extA){extA.style.transition='opacity .12s ease';extA.style.opacity='0';}
+  if(extB){extB.style.transition='opacity .1s ease'; extB.style.opacity='0';}
+  setTimeout(()=>{
+    if(extA){extA.innerHTML='';extA.style.opacity='';extA.style.transition='';}
+    if(extB){extB.innerHTML='';extB.style.opacity='';extB.style.transition='';}
+    document.body.dataset.frameA='editor';
+    document.body.dataset.frameB='log';
+    sph.emit('frame-unmounted',{id:prev});
+  },130);
 }
 
 // Refresh current mounted EXT panels
@@ -2488,10 +2593,16 @@ class SyncPoint{
 class SharedBuf{
   constructor(id,size=1024){
     this.id=id;
-    this.buf=typeof SharedArrayBuffer!=='undefined'?new SharedArrayBuffer(size):new ArrayBuffer(size);
-    this.isShared=typeof SharedArrayBuffer!=='undefined';
+    // crossOriginIsolated=trueかつSAB利用可能時のみSABを使用
+    // そうでなければArrayBufferにfallback（Worker間共有不可だが安全）
+    const canSAB=window.crossOriginIsolated&&typeof SharedArrayBuffer!=='undefined';
+    this.buf=canSAB?new SharedArrayBuffer(size):new ArrayBuffer(size);
+    this.isShared=canSAB;
     this.dv=new DataView(this.buf);this.size=size;
   }
+  // raw ArrayBuffer/SABへのアクセス（monitor等がUint8ClampedArrayを作る際に使用）
+  get raw(){return this.buf;}
+  get byteLength(){return this.buf.byteLength;}
   read(off,t='i32'){
     switch(t){case'i32':return this.dv.getInt32(off,true);case'f32':return this.dv.getFloat32(off,true);case'f64':return this.dv.getFloat64(off,true);case'i8':return this.dv.getInt8(off);}
   }
@@ -2549,6 +2660,9 @@ sph.mount('bridge','BRIDGE_EXT','\uD83C\uDF09',{
     'sync.delete':    (id)=>_syncPts.delete(id),
     'buf.create':     (id,size=1024)=>{if(!_buffers.has(id))_buffers.set(id,new SharedBuf(id,size));return _buffers.get(id);},
     'buf.get':        (id)=>_buffers.get(id),
+    'buf.raw':        (id)=>_buffers.get(id)?.raw??null,     // raw ArrayBuffer/SAB
+    'buf.isShared':   (id)=>_buffers.get(id)?.isShared??false, // SAB利用中か
+
     'buf.read':       (id,off,t='i32')=>_buffers.get(id)?.read(off,t)??null,
     'buf.write':      (id,off,v,t='i32')=>_buffers.get(id)?.write(off,v,t),
     'buf.atomicLoad': (id,off)=>_buffers.get(id)?.atomicLoad(off)??null,
@@ -4222,6 +4336,641 @@ await sph.call('abcd.flow', [[
     <tr><td>D → A (direct call)</td><td>✗</td><td>D must not know A exists</td></tr>
   </tbody>
 </table>
+</script>
+
+
+
+<!-- ⬡ MONITOR_EXT — external EXT -->
+<script type="sph/meta" data-ext-id="monitor">
+{
+  "cat": "A",
+  "version": "1.1",
+  "label": "MONITOR",
+  "icon": "📺",
+  "consumes": ["bridge", "timeline"],
+  "produces": ["ui_event"],
+  "signals": []
+}
+</script>
+<script type="sph/ext" data-ext-id="monitor">
+(function(){
+'use strict';
+
+var _canvas = null;
+var _ctx = null;
+var _rafId = null;
+var _config = {
+  w: sph._reg.get('sph.monitor.width')  ?? 854,   // injection || default (480p)
+  h: sph._reg.get('sph.monitor.height') ?? 480,
+};
+var _pixelBuf = null;    // Uint8ClampedArray view over bridge.buf.raw
+var _offscreen = null;   // OffscreenCanvas fallback
+
+// ── 描画ループ (VSYNC同期) ──────────────────────────────────────
+function _draw() {
+  if (!_ctx) return;
+
+  if (_pixelBuf) {
+    // SAB/ArrayBuffer → ImageData → putImageData
+    try {
+      var imgData = new ImageData(_pixelBuf, _config.w, _config.h);
+      _ctx.putImageData(imgData, 0, 0);
+    } catch(e) {
+      // サイズ不一致などは無視して継続
+    }
+  } else {
+    // バッファ未接続時: プレースホルダー描画
+    _ctx.fillStyle = 'var(--sph-surface, #0d1520)';
+    _ctx.fillRect(0, 0, _config.w, _config.h);
+    _ctx.fillStyle = 'var(--sph-dim, #5a7a9a)';
+    _ctx.font = '14px monospace';
+    _ctx.fillText('Waiting for bridge.buf "video_main"...', 20, _config.h / 2);
+  }
+
+  _rafId = requestAnimationFrame(_draw);
+}
+
+// ── bridge.buf から Uint8ClampedArray ビューを取得 ────────────────
+function _attachBuffer() {
+  var needed = _config.w * _config.h * 4;
+
+  // バッファが存在しなければ作成
+  var existing = sph.call('bridge.buf.get', ['video_main']);
+  if (!existing) {
+    sph.call('bridge.buf.create', ['video_main', needed]);
+    existing = sph.call('bridge.buf.get', ['video_main']);
+  }
+  if (!existing) {
+    sph.call('ide.log', ['[MONITOR] ERR: Failed to create bridge.buf "video_main"']);
+    return false;
+  }
+
+  // SAB優先、フォールバックはArrayBuffer
+  var rawBuf = sph.call('bridge.buf.raw', ['video_main']);
+  var isShared = sph.call('bridge.buf.isShared', ['video_main']);
+
+  if (rawBuf && rawBuf.byteLength >= needed) {
+    _pixelBuf = new Uint8ClampedArray(rawBuf, 0, needed);
+    var mode = isShared ? 'SAB (cross-origin isolated)' : 'ArrayBuffer (main thread only)';
+    sph.call('ide.log', ['[MONITOR] buffer attached: ' + _config.w + 'x' + _config.h + ' via ' + mode]);
+    return true;
+  } else {
+    sph.call('ide.log', ['[MONITOR] ERR: buffer too small (' + (rawBuf?.byteLength ?? 0) + ' < ' + needed + ')']);
+    return false;
+  }
+}
+
+// ── パネル HTML ──────────────────────────────────────────────────
+var _panel = function() {
+  return sph.ui.panel('monitor',
+    '<div style="width:100%;height:calc(100% - 32px);background:#000;display:flex;align-items:center;justify-content:center;overflow:hidden">' +
+      '<canvas id="v-mon" width="' + _config.w + '" height="' + _config.h +
+      '" style="max-width:100%;max-height:100%;object-fit:contain;display:block"></canvas>' +
+    '</div>' +
+    '<div style="padding:4px 8px;font-size:var(--sph-sz-sm);color:var(--sph-dim);border-top:1px solid var(--sph-border)">' +
+      '<span id="mon-status">idle</span>' +
+      ' &nbsp;|&nbsp; ' +
+      '<span id="mon-res">' + _config.w + 'x' + _config.h + '</span>' +
+      ' &nbsp;|&nbsp; ' +
+      '<span id="mon-sab">SAB: checking...</span>' +
+    '</div>'
+  );
+};
+
+// ── sph.mount ────────────────────────────────────────────────────
+sph.mount('monitor', 'MONITOR', '📺', {
+  panel: _panel,
+  commands: [
+    { name: 'monitor.attach',  desc: 'Attach to bridge.buf video_main' },
+    { name: 'monitor.detach',  desc: 'Stop drawing and release buffer' },
+    { name: 'monitor.resize',  desc: 'Change resolution', args: 'w, h' },
+    { name: 'monitor.consume', desc: 'Receive config from another EXT', args: 'data, fromId' },
+    { name: 'monitor.produce', desc: 'Export current state' },
+    { name: 'monitor.describe',desc: 'ABCD metadata' },
+  ],
+  api: {
+    attach: function() {
+      if (_rafId) return; // already running
+      if (_attachBuffer()) {
+        _draw();
+        var st = document.getElementById('mon-status');
+        if (st) st.textContent = 'drawing';
+      }
+    },
+    detach: function() {
+      if (_rafId) { cancelAnimationFrame(_rafId); _rafId = null; }
+      _pixelBuf = null;
+      var st = document.getElementById('mon-status');
+      if (st) st.textContent = 'idle';
+    },
+    resize: function(w, h) {
+      sph.call('monitor.detach');
+      _config.w = w || _config.w;
+      _config.h = h || _config.h;
+      var c = document.getElementById('v-mon');
+      if (c) { c.width = _config.w; c.height = _config.h; }
+      var res = document.getElementById('mon-res');
+      if (res) res.textContent = _config.w + 'x' + _config.h;
+    },
+    // ABCD standard
+    consume: function(data, from) {
+      if (data && data.width && data.height) sph.call('monitor.resize', [data.width, data.height]);
+    },
+    produce: function() {
+      return { width: _config.w, height: _config.h, running: !!_rafId, isShared: !!(_pixelBuf && window.crossOriginIsolated) };
+    },
+    describe: function() {
+      return { cat: 'A', version: '1.1', consumes: ['bridge', 'timeline'], produces: ['ui_event'], signals: [] };
+    },
+  },
+  on: {
+    'ide-ready': function() {
+      sph.call('abcd.register', ['monitor', 'A']);
+    },
+    'frame-mounted': function(e) {
+      if (e.id !== 'monitor') return;
+      _canvas = document.getElementById('v-mon');
+      if (!_canvas) return;
+      _ctx = _canvas.getContext('2d', { alpha: false, willReadFrequently: false });
+
+      // SAB状態をUIに反映
+      var sabEl = document.getElementById('mon-sab');
+      if (sabEl) {
+        var isolated = window.crossOriginIsolated;
+        sabEl.textContent = 'SAB: ' + (isolated ? 'active ✓' : 'unavailable (ArrayBuffer mode)');
+        sabEl.style.color = isolated ? 'var(--sph-ok)' : 'var(--sph-warn)';
+      }
+
+      // 自動アタッチ
+      sph.call('monitor.attach');
+    },
+    'frame-unmounted': function(e) {
+      if (e.id !== 'monitor') return;
+      sph.call('monitor.detach');
+      _canvas = null; _ctx = null;
+    },
+    // timeline:tick でステータス更新
+    'abcd:signal': function(detail) {
+      if (detail.signal !== 'timeline:tick') return;
+      var st = document.getElementById('mon-status');
+      if (st && _rafId) st.textContent = 'drawing t=' + detail.payload.toFixed(3);
+    },
+  },
+});
+})();
+</script>
+<script type="sph/doc" data-doc-ext="monitor">
+{
+  "title": "MONITOR Extension",
+  "icon": "📺",
+  "description": "High-performance canvas display. Reads pixel data from bridge.buf 'video_main' and renders via requestAnimationFrame. Supports SAB (SharedArrayBuffer) for zero-copy Worker→Canvas pipeline when crossOriginIsolated is true.",
+  "version": "1.1",
+  "api": [
+    { "method": "monitor.attach",  "args": "", "returns": "void", "description": "Attach to bridge.buf 'video_main' and start drawing loop" },
+    { "method": "monitor.detach",  "args": "", "returns": "void", "description": "Stop drawing and release buffer reference" },
+    { "method": "monitor.resize",  "args": "w, h", "returns": "void", "description": "Change canvas resolution (detaches and re-attaches)" },
+    { "method": "monitor.consume", "args": "data, fromId", "returns": "void", "description": "Receive {width, height} config from another EXT" },
+    { "method": "monitor.produce", "args": "", "returns": "object", "description": "Export {width, height, running, isShared}" },
+    { "method": "monitor.describe","args": "", "returns": "MetaInfo", "description": "ABCD metadata" }
+  ]
+}
+</script>
+
+<!-- ⬡ TIMELINE_EXT — external EXT -->
+<script type="sph/meta" data-ext-id="timeline">
+{
+  "cat": "C",
+  "version": "1.1",
+  "label": "TIMELINE",
+  "icon": "⏳",
+  "consumes": ["bridge"],
+  "produces": [],
+  "signals": ["timeline:tick", "timeline:state"]
+}
+</script>
+<script type="sph/ext" data-ext-id="timeline">
+(function(){
+'use strict';
+
+var _state = {
+  isPlaying: false,
+  currentTime: 0,
+  bpm: sph._reg.get('sph.timeline.bpm') ?? 120,  // injection || default
+  _timer: null,
+  _tickInterval: sph._reg.get('sph.timeline.tickMs') ?? 16, // ~60fps
+};
+
+// ── bridge.channel でB層に同期命令を送る ──────────────────────────
+function _syncB(action, extra) {
+  // bridge.channel 'timeline:sync' が存在すれば publish
+  var ch = sph.call('bridge.channel.get', ['timeline:sync']);
+  if (ch) {
+    sph.call('bridge.channel.publish', ['timeline:sync', Object.assign({action: action}, extra||{}), 'timeline']);
+  }
+}
+
+// ── パネル HTML ──────────────────────────────────────────────────
+var _panel = function() {
+  return sph.ui.panel('timeline',
+    sph.ui.section('Transport',
+      '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">' +
+        '<button class="sph-btn sph-btn-ok" onclick="sph.call('timeline.play')">▶ PLAY</button>' +
+        '<button class="sph-btn" onclick="sph.call('timeline.stop')">■ STOP</button>' +
+        '<button class="sph-btn" onclick="sph.call('timeline.seek',[0])">⏮ RESET</button>' +
+      '</div>' +
+      '<div style="margin-top:8px;display:flex;align-items:center;gap:8px">' +
+        '<span style="color:var(--sph-dim);font-size:var(--sph-sz-md)">Time:</span>' +
+        '<span id="tl-time" style="font-family:var(--sph-font);font-size:var(--sph-sz-lg);color:var(--sph-accent)">0.000</span>' +
+        '<span style="color:var(--sph-dim);font-size:var(--sph-sz-sm)" id="tl-state">stopped</span>' +
+      '</div>'
+    ) +
+    sph.ui.section('Settings',
+      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">' +
+        '<span style="color:var(--sph-dim);font-size:var(--sph-sz-md);width:40px">BPM</span>' +
+        '<input id="tl-bpm" type="number" class="sph-input" value="' + _state.bpm + '" min="20" max="400" style="width:70px"' +
+        ' onchange="sph.call('timeline.setBpm',[+this.value])">' +
+      '</div>' +
+      '<div style="display:flex;align-items:center;gap:8px">' +
+        '<span style="color:var(--sph-dim);font-size:var(--sph-sz-md);width:40px">SAB</span>' +
+        '<span id="tl-sab" style="font-size:var(--sph-sz-sm);color:var(--sph-dim)">checking...</span>' +
+      '</div>'
+    )
+  );
+};
+
+// ── UI更新 ───────────────────────────────────────────────────────
+function _updateTimeDisplay() {
+  var el = document.getElementById('tl-time');
+  if (el) el.textContent = _state.currentTime.toFixed(3);
+}
+function _updateStateDisplay(s) {
+  var el = document.getElementById('tl-state');
+  if (el) {
+    el.textContent = s;
+    el.style.color = s === 'playing' ? 'var(--sph-ok)' : 'var(--sph-dim)';
+  }
+}
+
+// ── sph.mount ────────────────────────────────────────────────────
+sph.mount('timeline', 'TIMELINE', '⏳', {
+  panel: _panel,
+  commands: [
+    { name: 'timeline.play',     desc: 'Start playback' },
+    { name: 'timeline.stop',     desc: 'Stop playback' },
+    { name: 'timeline.seek',     desc: 'Seek to time', args: 'time: number' },
+    { name: 'timeline.setBpm',   desc: 'Set BPM', args: 'bpm: number' },
+    { name: 'timeline.consume',  desc: 'Receive config', args: 'data, fromId' },
+    { name: 'timeline.produce',  desc: 'Export state' },
+    { name: 'timeline.describe', desc: 'ABCD metadata' },
+  ],
+  api: {
+    play: function() {
+      if (_state.isPlaying) return;
+      _state.isPlaying = true;
+      // B層に同期命令（bridge.channelがあれば）
+      _syncB('start', { time: _state.currentTime });
+      _state._timer = setInterval(function() {
+        _state.currentTime += _state._tickInterval / 1000;
+        _updateTimeDisplay();
+        // sph.signal は存在しないため abcd.signal を使用
+        sph.call('abcd.signal', ['timeline:tick', _state.currentTime, 'timeline']);
+      }, _state._tickInterval);
+      sph.call('abcd.signal', ['timeline:state', 'playing', 'timeline']);
+      _updateStateDisplay('playing');
+    },
+    stop: function() {
+      if (!_state.isPlaying) return;
+      _state.isPlaying = false;
+      if (_state._timer) { clearInterval(_state._timer); _state._timer = null; }
+      _syncB('stop');
+      sph.call('abcd.signal', ['timeline:state', 'stopped', 'timeline']);
+      _updateStateDisplay('stopped');
+    },
+    seek: function(time) {
+      _state.currentTime = parseFloat(time) || 0;
+      _syncB('seek', { time: _state.currentTime });
+      _updateTimeDisplay();
+      sph.call('abcd.signal', ['timeline:tick', _state.currentTime, 'timeline']);
+    },
+    setBpm: function(bpm) {
+      _state.bpm = Math.max(20, Math.min(400, bpm || 120));
+      // BPMに連動してtickIntervalを変更する場合はここで
+    },
+    // ABCD standard
+    consume: function(data, from) {
+      if (data && data.bpm) sph.call('timeline.setBpm', [data.bpm]);
+      if (data && data.seek !== undefined) sph.call('timeline.seek', [data.seek]);
+    },
+    produce: function() {
+      return { isPlaying: _state.isPlaying, currentTime: _state.currentTime, bpm: _state.bpm };
+    },
+    describe: function() {
+      return { cat: 'C', version: '1.1', consumes: ['bridge'], produces: [], signals: ['timeline:tick', 'timeline:state'] };
+    },
+  },
+  on: {
+    'ide-ready': function() {
+      sph.call('abcd.register', ['timeline', 'C']);
+      // bridge.channel を作成（B層への同期用）
+      sph.call('bridge.channel.create', ['timeline:sync', 'async']);
+    },
+    'frame-mounted': function(e) {
+      if (e.id !== 'timeline') return;
+      // SAB状態をUIに反映
+      var sabEl = document.getElementById('tl-sab');
+      if (sabEl) {
+        var isolated = window.crossOriginIsolated;
+        sabEl.textContent = isolated ? 'active ✓' : 'unavailable (ArrayBuffer mode)';
+        sabEl.style.color = isolated ? 'var(--sph-ok)' : 'var(--sph-warn)';
+      }
+    },
+    'frame-unmounted': function(e) {
+      if (e.id !== 'timeline') return;
+      sph.call('timeline.stop');
+    },
+  },
+});
+})();
+</script>
+<script type="sph/doc" data-doc-ext="timeline">
+{
+  "title": "TIMELINE Extension",
+  "icon": "⏳",
+  "description": "Transport control [C]. Manages playback time, BPM, and broadcasts timeline:tick signals via abcd.signal. Sends sync commands to B-layer via bridge.channel 'timeline:sync'.",
+  "version": "1.1",
+  "api": [
+    { "method": "timeline.play",    "args": "", "returns": "void", "description": "Start playback and begin tick broadcasts" },
+    { "method": "timeline.stop",    "args": "", "returns": "void", "description": "Stop playback" },
+    { "method": "timeline.seek",    "args": "time: number", "returns": "void", "description": "Seek to a specific time position" },
+    { "method": "timeline.setBpm",  "args": "bpm: number", "returns": "void", "description": "Set BPM (20-400)" },
+    { "method": "timeline.consume", "args": "data, fromId", "returns": "void", "description": "Receive {bpm, seek} config" },
+    { "method": "timeline.produce", "args": "", "returns": "object", "description": "Export {isPlaying, currentTime, bpm}" },
+    { "method": "timeline.describe","args": "", "returns": "MetaInfo", "description": "ABCD metadata" }
+  ]
+}
+</script>
+
+<!-- ⬡ COMPUTE_EXT — external EXT -->
+<script type="sph/meta" data-ext-id="compute">
+{
+  "cat": "B",
+  "version": "1.2",
+  "label": "COMPUTE ENGINE",
+  "icon": "[C]",
+  "consumes": ["bridge"],
+  "produces": ["compute_result"],
+  "signals": ["compute:error", "media:error"]
+}
+</script>
+<script type="sph/ext" data-ext-id="compute">
+(function(){
+'use strict';
+
+const _workers = new Map();
+const _taskResolvers = new Map();
+// timeout: sph.register('sph.ext.timeout', N) で injection 可能
+
+// Worker Source: Built-in error handling and WASM isolation
+const WORKER_SRC = `
+  let wasmInstance = null;
+  self.onmessage = async (e) => {
+    const { type, id, data } = e.data;
+    try {
+      if (type === 'INIT') {
+        const module = await WebAssembly.compile(data.binary);
+        wasmInstance = await WebAssembly.instantiate(module, data.imports || {});
+        self.postMessage({ type: 'READY', id });
+      } 
+      else if (type === 'EXEC') {
+        if (!wasmInstance) throw new Error('WASM_NOT_INITIALIZED');
+        const fn = wasmInstance.exports[data.method];
+        if (!fn) throw new Error('METHOD_NOT_FOUND:' + data.method);
+        
+        // Execute WASM function
+        const result = fn(...(data.args || []));
+        self.postMessage({ type: 'RESULT', id, result });
+      }
+    } catch (err) {
+      self.postMessage({ type: 'FATAL', id, message: err.message });
+    }
+  };
+`;
+
+/**
+ * Forcefully terminates a worker to prevent main thread blockage.
+ */
+function terminateWorker(id) {
+  const w = _workers.get(id);
+  if (w) {
+    w.terminate();
+    _workers.delete(id);
+    sph.call('ide.log', ['[COMPUTE] Safety Guard: Worker terminated -> ' + id]);
+  }
+}
+
+sph.mount('compute', 'COMPUTE ENGINE', '[C]', {
+  api: {
+    /**
+     * setup: Initializes a worker using the Injection || Default pattern.
+     * @param {Object} config - { id: string }
+     */
+    setup: (config) => {
+      const id = config?.id || 'default_worker'; // Default if injection fails
+      if (_workers.has(id)) return id;
+
+      const blob = new Blob([WORKER_SRC], { type: 'application/javascript' });
+      const worker = new Worker(URL.createObjectURL(blob));
+      
+      worker.onmessage = (e) => {
+        const { type, id: taskId, result, message } = e.data;
+        if (type === 'RESULT') {
+          const res = _taskResolvers.get(taskId);
+          if (res) { res.resolve(result); _taskResolvers.delete(taskId); }
+        }
+        if (type === 'FATAL') {
+          const res = _taskResolvers.get(taskId);
+          if (res) res.reject(message);
+          sph.emit('compute:error', { id, message });
+          // Strict stop on fatal WASM errors
+          sph.emit('error', {code:'E011', args:['compute.exec', 'FATAL WASM: '+message], severity:'error', phase:'ext.call'});
+          sph.call('ide.log', ['[COMPUTE] FATAL: ' + message]);
+        }
+      };
+      _workers.set(id, worker);
+      return id;
+    },
+
+    /**
+     * exec: Executes WASM with a mandatory timeout guard.
+     */
+    exec: async (id, method, args = [], timeoutMs) => {
+      const workerId = id || 'default_worker';
+      const worker = _workers.get(workerId);
+      
+      if (!worker) {
+        sph.emit('error', {code:'E010', args:['compute.worker.'+workerId], severity:'error', phase:'ext.call'});
+        return null;
+      }
+
+      const taskId = `t_${Math.random().toString(36).slice(2)}`;
+      const limit = timeoutMs || sph._reg.get('sph.ext.timeout') || 5000;
+
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          _taskResolvers.delete(taskId);
+          terminateWorker(workerId); // Kill the runaway worker
+          reject(new Error('COMPUTE_TIMEOUT_EXCEEDED'));
+          sph.emit('error', {code:'E012', args:['compute.exec.'+method, limit], severity:'error', phase:'ext.call'});
+          sph.call('ide.log', ['[COMPUTE] TIMEOUT: ' + method + ' exceeded ' + limit + 'ms']);
+        }, limit);
+
+        _taskResolvers.set(taskId, { 
+          resolve: (r) => { clearTimeout(timer); resolve(r); },
+          reject: (m) => { clearTimeout(timer); reject(m); }
+        });
+
+        worker.postMessage({ type: 'EXEC', id: taskId, data: { method, args } });
+      });
+    },
+
+    kill: (id) => terminateWorker(id),
+    // ABCD standard interface
+    consume: (data, from) => {
+      if (data?.kill) terminateWorker(data.kill);
+    },
+    produce: () => ({ workers: [..._workers.keys()], pending: _taskResolvers.size }),
+    describe: () => ({ cat: 'B', version: '1.2', consumes: ['bridge'], produces: ['compute_result'], signals: ['compute:error'] }),
+
+  }
+  on: {
+    'ide-ready': () => sph.call('abcd.register', ['compute', 'B']),
+  },
+});
+})();
+</script>
+<script type="sph/tab" data-tab-name="compute_lib" data-tab-type="lib">
+; lib compute_lib
+; High-level patterns for safe WASM orchestration.
+
+; --- Pattern: Robust Initialization ---
+!safe_init_compute [#_worker_id] [$name]
+  ; Fallback to default if name is empty
+  if $name == "" { $name = "anon_worker" }
+  #_worker_id = compute.setup { id: $name }
+  RET #_worker_id
+
+; --- Pattern: Guarded Execution ---
+; Stops the entire system if the task fails or times out.
+!safe_exec [#_res] [$worker, $method, #_ptr, #_size]
+  sys.print "[COMPUTE] Dispatching" $method "to" $worker
+  #_res = compute.exec $worker $method [#_ptr, #_size] 2000 ; 2s limit
+  if #_res == null {
+    sys.print "[FATAL] Compute pipeline broken. Halting."
+    sys.stop "COMPUTE_PIPELINE_FAILURE"
+  }
+  RET #_res
+</script>
+<script type="sph/doc" data-doc-ext="compute">
+{
+  "title": "COMPUTE - Safe High-Performance Runtime",
+  "icon": "[C]",
+  "description": "WASM/WebGPU execution layer with mandatory timeout guards and auto-termination to prevent browser freezing.",
+  "api": [
+    { "method": "compute.setup", "args": "config", "description": "Initializes a worker thread. Uses default ID if config is missing." },
+    { "method": "compute.exec", "args": "id, method, args, timeout", "returns": "Promise", "description": "Executes WASM. If no response within timeout, the worker is killed and the system stops." },
+    { "method": "compute.kill", "args": "id", "description": "Immediately terminates a specific worker thread." }
+  ]
+}
+</script>
+<script type="sph/sec" data-sec-ext="compute" data-sec-title="Safety & Guardrails">
+<h2>COMPUTE Safety Architecture</h2>
+<p>This EXT implements the <strong>Base [B]</strong> layer with a focus on system stability. It protects the main IDE thread from heavy computational loads.</p>
+
+<h3>1. Zombie Worker Prevention</h3>
+<p>Infinite loops in WASM cannot be stopped by standard JS async patterns. <code>compute.exec</code> uses an external watchdog timer. If a task exceeds the <code>timeout</code>, it triggers <code>worker.terminate()</code>, physically removing the thread from memory.</p>
+
+<h3>2. Strict Error Propagation</h3>
+<p>Memory out-of-bounds or arithmetic errors within WASM trigger an immediate <code>sys.stop</code>. This prevents corrupted data from flowing into other sensitive EXTs like Audio or Video engines.</p>
+
+<h3>3. Robust Initialization</h3>
+<p>Following the <strong>Injection || Default</strong> pattern, <code>compute.setup</code> ensures that even incomplete configurations result in a valid, working state.</p>
+
+<h3>Example Usage</h3>
+<pre>
+!main
+  lib compute_lib
+  ; Initialize safely
+  $worker = call safe_init_compute ["dsp_processor"]
+  
+  ; Execute with a 2-second safety limit
+  #status = call safe_exec [$worker, "process_audio", #ptr, 4096]
+  sys.print "Processing successful"
+</pre>
+</script>
+
+<!-- ⬡ MEDIA_STUDIO_EXT — external EXT -->
+<script type="sph/meta" data-ext-id="media_studio">
+{
+  "cat": "A",
+  "version": "1.0",
+  "label": "MEDIA STUDIO",
+  "icon": "🎵",
+  "consumes": ["media_core", "find"],
+  "signals": ["media_studio:applied"]
+}
+</script>
+<script type="sph/ext" data-ext-id="media_studio">
+(function(){
+  const _panel = () => sph.ui.panel('media_studio',
+    sph.ui.section('MML Input', 
+      '<textarea id="ms-input" class="sph-input" style="width:100%;height:150px"></textarea>' +
+      sph.ui.btn('Apply & Play', "sph.call('media_studio.apply')", 'ok')
+    ) +
+    sph.ui.section('Monitor', '<div id="ms-monitor" class="sph-meta">Ready</div>')
+  );
+
+  sph.mount('media_studio', 'MEDIA STUDIO', '🎵', {
+    panel: _panel,
+    commands: [
+      { name: 'media_studio.apply',   desc: 'Parse and play MML input' },
+      { name: 'media_studio.consume', desc: 'Receive MML from another EXT', args: 'data, fromId' },
+      { name: 'media_studio.produce', desc: 'Export current MML' },
+      { name: 'media_studio.describe',desc: 'ABCD metadata' },
+    ],
+    api: {
+      apply: () => {
+        const input = document.getElementById('ms-input');
+        const mml = input ? input.value : '';
+        const mon = document.getElementById('ms-monitor');
+        if (mon) mon.textContent = 'Parsing...';
+        // media_core が利用可能ならパースして再生
+        const parsed = sph.call('media_core.parse', [mml]);
+        if (parsed !== null) {
+          sph.call('media_core.play');
+          if (mon) mon.textContent = 'Playing';
+          sph.call('abcd.signal', ['media_studio:applied', mml, 'media_studio']);
+        } else {
+          if (mon) mon.textContent = 'media_core not loaded — load it via EXT manager';
+        }
+      },
+      // ABCD standard
+      consume: (data, from) => {
+        if (data && typeof data.mml === 'string') {
+          const input = document.getElementById('ms-input');
+          if (input) { input.value = data.mml; sph.call('media_studio.apply'); }
+        }
+      },
+      produce: () => {
+        const input = document.getElementById('ms-input');
+        return { mml: input ? input.value : '' };
+      },
+      describe: () => ({ cat: 'A', version: '1.0', consumes: ['media_core', 'find'], produces: [], signals: ['media_studio:applied'] }),
+    },
+    on: {
+      'ide-ready': () => sph.call('abcd.register', ['media_studio', 'A']),
+    },
+  });
+})();
 </script>
 
 <!-- ??? Tab data ??? -->
