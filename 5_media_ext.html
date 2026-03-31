@@ -1,0 +1,31 @@
+<script type="sph/meta" data-ext-id="media_studio">
+{
+  "cat": "A",
+  "version": "1.0",
+  "label": "MEDIA STUDIO",
+  "icon": "[A]",
+  "consumes": ["media_core", "find"]
+}
+</script>
+<script type="sph/ext" data-ext-id="media_studio">
+(function(){
+  const _panel = () => sph.ui.panel('media_studio',
+    sph.ui.section('MML Input', 
+      '<textarea id="ms-input" class="sph-input" style="width:100%;height:150px"></textarea>' +
+      sph.ui.btn('Apply & Play', "sph.call('media_studio.apply')", 'ok')
+    ) +
+    sph.ui.section('Monitor', '<div id="ms-monitor" class="sph-meta">Ready</div>')
+  );
+
+  sph.mount('media_studio', 'MEDIA STUDIO', '[A]', {
+    panel: _panel,
+    api: {
+      apply: () => {
+        const mml = document.getElementById('ms-input').value;
+        sph.call('media_core.parse', [mml]);
+        sph.call('media_core.play');
+      }
+    }
+  });
+})();
+</script>

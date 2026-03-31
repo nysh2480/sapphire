@@ -1,0 +1,74 @@
+﻿<!DOCTYPE html>
+<html lang="ja">
+<head><meta charset="UTF-8"><title>TIMELINE EXT</title></head>
+<body>
+<script type="sph/meta" data-ext-id="timeline">
+{
+	"cat": "C",
+	"version": "1.0",
+	"label": "TIMELINE",
+	"icon": "⏳",
+	"consumes": ["bridge"],
+	"signals": ["timeline:tick", "timeline:state"]
+}
+</script>
+<script type="sph/ext" data-ext-id="timeline">
+(function(){
+'use strict';
+
+var _state = {
+	isPlaying: false,
+	currentTime: 0,
+	bpm: 120,
+	_timer: null
+};
+
+sph.mount('timeline', 'TIMELINE', '⏳', {
+	api: {
+		// 再生開始
+		play: function() {
+			if (_state.isPlaying) return;
+			_state.isPlaying = true;
+			
+			// BRIDGEを介してB層(WASM/GPU)に同期命令
+			sph.call('bridge.sync', { action: 'start', time: _state.currentTime });
+			
+			_state._timer = setInterval(function() {
+				_state.currentTime += 0.016; // 約60fps換算
+				sph.signal('timeline:tick', _state.currentTime);
+			}, 16);
+			
+			sph.signal('timeline:state', 'playing');
+		},
+		// 停止
+		stop: function() {
+			_state.isPlaying = false;
+			if (_state._timer) clearInterval(_state._timer);
+			sph.call('bridge.sync', { action: 'stop' });
+			sph.signal('timeline:state', 'stopped');
+		},
+		// シーク
+		seek: function(time) {
+			_state.currentTime = parseFloat(time) || 0;
+			sph.call('bridge.sync', { action: 'seek', time: _state.currentTime });
+			sph.signal('timeline:tick', _state.currentTime);
+		}
+	},
+	render: function() {
+		return '<div class="sph-p-2" style="border-top:1px solid var(--sph-border);">' +
+					'<button onclick="sph.call(\'timeline.play\')">PLAY</button>' +
+					'<button onclick="sph.call(\'timeline.stop\')">STOP</button>' +
+					'<span id="time-disp" style="margin-left:10px; font-family:var(--sph-font);">0.000</span>' +
+				'</div>';
+	},
+	on: {
+		'timeline:tick': function(time) {
+			var el = document.getElementById('time-disp');
+			if (el) el.innerText = time.toFixed(3);
+		}
+	}
+});
+})();
+</script>
+</body>
+</html>
