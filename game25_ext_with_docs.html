@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="sph-ext" content="game25">
+<meta name="sph-ext-version" content="0.4.0">
+<title>2.5D Raycast Engine EXT</title>
+</head>
+<body>
+<script type="sph/ext" data-ext-id="game25">
+(function(){
+'use strict';
+
+// ── 1. 定数 ──────────────────────────────────────────────────────
+const W = 320, H = 200, MAP = 32;
+
+// ── 2. 内部状態 ──────────────────────────────────────────────────
+let _canvas   = null;
+let _ctx      = null;
+let _off      = null;   // OffscreenCanvas または通常 Canvas
+let _offCtx   = null;
+let _imgData  = null;
+let _px32     = null;   // Uint32Array ピクセルバッファ
+
+const _map    = new Uint8Array(MAP * MAP);
+const _bits   = new Uint32Array(MAP);   // ビットボード（行ごと）
+
+// ゲーム状態（DSL / game loop から操作）
+let _player   = { x: 4.5, y: 4.5, angle: 0 };
+let _rafId    = null;   // requestAnimationFrame ID
+let _running  = false;
+let _keyState = {};     // キー状態テーブル
+
+// フレーム統計
+let _fpsLast  = performance.now();
+let _fpsCount = 0;
+let _fpsCur   = 0;
+
+// ── 3. ビットボード ───────────────────────────────────────────────
+function _buildBits() {
+  for (let y = 0; y < MAP; y++) {
+    let row = 0;
+    for (let x = 0; x < MAP; x++) {
+      if (_map[y * MAP + x]) row |= (1 << x);
+    }
+    _bits[y] = row;
+  }
+}
+
+function _isWall(x, y) {
+  const ix = x | 0, iy = y | 0;
+  if (ix < 0 || ix >= MAP || iy < 0 || iy >= MAP) return true;
+  return (_bits[iy] & (1 << ix)) !== 0;
+}
+
+// ── 4. DDA レイキャスト ───────────────────────────────────────────
+function _castRay(px, py, rdx, rdy) {
+  let mx = px | 0, my = py | 0;
+  const ddx = Math.abs(1 / rdx), ddy = Math.abs(1 / rdy);
+  let sdx, sdy, sx, sy;
+
+  if (rdx < 0) { sx = -1; sdx = (px - mx) * ddx; }
+  else          { sx =  1; sdx = (mx + 1 - px) * ddx; }
+  if (rdy < 0) { sy = -1; sdy = (py - my) * ddy; }
+  else          { sy =  1; sdy = (my + 1 - py) * ddy; }
+
+  let side = 0;
+  for (let i = 0; i < 64; i++) {
+    if (sdx < sdy) { sdx += ddx; mx += sx; side = 0; }
+    else           { sdy += ddy; my += sy; side = 1; }
+    if (_isWall(mx, my)) break;
+  }
+  const dist = side ? sdy - ddy : sdx - ddx;
+  return { dist: Math.max(dist, 0.1), side, mx, my,
+           // 壁面の UV (将来のテクスチャ用)
+           wallX: side ? py + dist * rdy - (py + dist * rdy | 0)
+                       : px + dist * rdx - (px + dist * rdx | 0) };
+}
+
+// ── 5. レンダリング ───────────────────────────────────────────────
+function _renderFrame() {
+  if (!_px32) return;
+
+  const { x: px, y: py, angle } = _player;
+  const dx = Math.cos(angle), dy = Math.sin(angle);
+  const plX = -dy * 0.66, plY = dx * 0.66; // FOV ~66°
+
+  // 天井・床を塗りつぶす（水平グラデーションの代わりに2トーン）
+  const half = W * (H >> 1);
+  _px32.fill(0xFF333333, 0, half);      // 天井
+  _px32.fill(0xFF222222, half, W * H);  // 床
+
+  for (let x = 0; x < W; x++) {
+    const cx  = 2 * x / W - 1;
+    const rdx = dx + plX * cx, rdy = dy + plY * cx;
+    const { dist, side } = _castRay(px, py, rdx, rdy);
+
+    const lineH = (H / dist) | 0;
+    const yS = Math.max(0, ((H - lineH) >> 1));
+    const yE = Math.min(H - 1, ((H + lineH) >> 1));
+
+    // 距離減衰（0.15 係数）＋サイド明暗
+    const base = side ? 0x99 : 0xCC;
+    const att  = Math.max(0, base - (dist * 18) | 0);
+    const col  = 0xFF000000 | (att << 16) | (att << 8) | att;
+
+    for (let y = yS; y < yE; y++) _px32[y * W + x] = col;
+  }
+
+  // OffscreenCanvas → main canvas
+  _offCtx.putImageData(_imgData, 0, 0);
+  _ctx.clearRect(0, 0, _canvas.width, _canvas.height);
+  _ctx.drawImage(_off, 0, 0, _canvas.width, _canvas.height);
+
+  // FPS カウンタ（HUD）
+  _fpsCount++;
+  const now = performance.now();
+  if (now - _fpsLast >= 1000) {
+    _fpsCur = _fpsCount;
+    _fpsCount = 0;
+    _fpsLast = now;
+    const el = document.getElementById('game25-fps');
+    if (el) el.textContent = _fpsCur + ' fps';
+  }
+}
+
+// ── 6. ゲームループ ───────────────────────────────────────────────
+const MOVE_SPEED = 0.05, ROT_SPEED = 0.04;
+
+function _tick() {
+  if (!_running) return;
+
+  // キー入力処理（DSL と並立できるよう関数として分離）
+  if (_keyState['ArrowLeft']  || _keyState['KeyA']) _player.angle -= ROT_SPEED;
+  if (_keyState['ArrowRight'] || _keyState['KeyD']) _player.angle += ROT_SPEED;
+  if (_keyState['ArrowUp']    || _keyState['KeyW']) {
+    const nx = _player.x + Math.cos(_player.angle) * MOVE_SPEED;
+    const ny = _player.y + Math.sin(_player.angle) * MOVE_SPEED;
+    if (!_isWall(nx, _player.y)) _player.x = nx;
+    if (!_isWall(_player.x, ny)) _player.y = ny;
+  }
+  if (_keyState['ArrowDown']  || _keyState['KeyS']) {
+    const nx = _player.x - Math.cos(_player.angle) * MOVE_SPEED;
+    const ny = _player.y - Math.sin(_player.angle) * MOVE_SPEED;
+    if (!_isWall(nx, _player.y)) _player.x = nx;
+    if (!_isWall(_player.x, ny)) _player.y = ny;
+  }
+
+  _renderFrame();
+  _rafId = requestAnimationFrame(_tick);
+}
+
+// ── 7. キー入力リスナー ───────────────────────────────────────────
+function _attachKeys() {
+  window.addEventListener('keydown', _onKeyDown);
+  window.addEventListener('keyup',   _onKeyUp);
+}
+function _detachKeys() {
+  window.removeEventListener('keydown', _onKeyDown);
+  window.removeEventListener('keyup',   _onKeyUp);
+}
+function _onKeyDown(e) { _keyState[e.code] = true; }
+function _onKeyUp(e)   { _keyState[e.code] = false; }
+
+// ── 8. 初期化 ─────────────────────────────────────────────────────
+// OffscreenCanvas が使えない場合（Safari <16.4）は通常 Canvas で代替
+function _init(canvasId) {
+  const id = canvasId || 'game25-canvas';
+  _canvas = document.getElementById(id);
+  if (!_canvas) { console.warn('[game25] canvas not found:', id); return false; }
+  _ctx = _canvas.getContext('2d', { alpha: false });
+
+  if (typeof OffscreenCanvas !== 'undefined') {
+    _off    = new OffscreenCanvas(W, H);
+    _offCtx = _off.getContext('2d');
+  } else {
+    // Fallback: invisible canvas
+    _off    = document.createElement('canvas');
+    _off.width = W; _off.height = H;
+    _offCtx = _off.getContext('2d');
+    console.info('[game25] OffscreenCanvas unavailable, using fallback');
+  }
+  _imgData = _offCtx.createImageData(W, H);
+  _px32    = new Uint32Array(_imgData.data.buffer);
+
+  // デフォルトマップ生成（外壁のみ）
+  _map.fill(0);
+  for (let i = 0; i < MAP; i++) {
+    _map[i] = _map[(MAP - 1) * MAP + i] = 1;
+    _map[i * MAP] = _map[i * MAP + (MAP - 1)] = 1;
+  }
+  _buildBits();
+  return true;
+}
+
+// ── 9. パネル HTML ────────────────────────────────────────────────
+const _panel = () => sph.ui.panel('game25',
+  '<div class="sph-section" style="padding:0;overflow:hidden">'+
+  '<canvas id="game25-canvas" style="width:100%;image-rendering:pixelated;background:#000;display:block;aspect-ratio:1.6/1"></canvas>'+
+  '</div>'+
+  '<div style="display:flex;gap:8px;margin-top:8px;align-items:center">'+
+  '<button class="sph-btn sph-btn-ok" onclick="sph.call(\'game25.start\')">▶ Start</button>'+
+  '<button class="sph-btn" onclick="sph.call(\'game25.stop\')">■ Stop</button>'+
+  '<button class="sph-btn" onclick="sph.call(\'game25.reset\')">↺ Reset</button>'+
+  '<span id="game25-fps" class="sph-meta" style="margin-left:auto">— fps</span>'+
+  '</div>'+
+  '<div class="sph-meta" style="margin-top:6px;font-size:9px">'+
+  'WASD / Arrow keys · game25.move(dx,dy) · game25.render()</div>'
+);
+
+// ── 10. sph.mount ─────────────────────────────────────────────────
+sph.mount('game25', '2.5D_GAME', '\uD83C\uDFAE', {
+  panel: _panel,
+  commands: [
+    {name:'game25.init',     desc:'Initialize canvas and engine',      args:'canvasId?'},
+    {name:'game25.start',    desc:'Start the game loop (RAF)'},
+    {name:'game25.stop',     desc:'Stop the game loop'},
+    {name:'game25.reset',    desc:'Reset player position and clear map'},
+    {name:'game25.render',   desc:'Render one frame (manual mode)',     args:'x?, y?, angle?'},
+    {name:'game25.move',     desc:'Move player by delta',               args:'dx, dy, dAngle?'},
+    {name:'game25.teleport', desc:'Set player position directly',       args:'x, y, angle?'},
+    {name:'game25.map_set',  desc:'Set map cell value',                 args:'x, y, val(0|1)'},
+    {name:'game25.map_load', desc:'Load map from flat 0/1 array',      args:'arr(MAP*MAP)'},
+    {name:'game25.map_clear',desc:'Clear map (keep outer walls)'},
+    {name:'game25.is_wall',  desc:'Bitboard wall check',               args:'x, y → 0|1'},
+    {name:'game25.cast_ray', desc:'Cast a single ray',                 args:'x,y,angle → {dist,side,mx,my}'},
+    {name:'game25.player',   desc:'Get current player state',          args:'→ {x,y,angle}'},
+  ],
+  api: {
+    init: (canvasId) => {
+      const ok = _init(canvasId);
+      if (ok) _renderFrame(); // 初期フレームを描画
+      return ok;
+    },
+    start: () => {
+      if (_running) return;
+      _running = true;
+      _attachKeys();
+      _tick();
+    },
+    stop: () => {
+      _running = false;
+      cancelAnimationFrame(_rafId);
+      _detachKeys();
+      _keyState = {};
+    },
+    reset: () => {
+      _player = { x: 4.5, y: 4.5, angle: 0 };
+      _renderFrame();
+    },
+    render: (x, y, angle) => {
+      if (x !== undefined) _player.x = +x;
+      if (y !== undefined) _player.y = +y;
+      if (angle !== undefined) _player.angle = +angle;
+      _renderFrame();
+    },
+    move: (dx, dy, dAngle = 0) => {
+      _player.angle += +dAngle;
+      const nx = _player.x + +dx;
+      const ny = _player.y + +dy;
+      if (!_isWall(nx, _player.y)) _player.x = nx;
+      if (!_isWall(_player.x, ny)) _player.y = ny;
+      if (!_running) _renderFrame(); // 手動モードのみ再描画
+    },
+    teleport: (x, y, angle) => {
+      _player.x = +x; _player.y = +y;
+      if (angle !== undefined) _player.angle = +angle;
+      if (!_running) _renderFrame();
+    },
+    map_set: (x, y, val) => {
+      _map[(y | 0) * MAP + (x | 0)] = val | 0;
+      _buildBits();
+    },
+    map_load: (arr) => {
+      if (!Array.isArray(arr) || arr.length < MAP * MAP) {
+        console.warn('[game25] map_load: array too short');
+        return;
+      }
+      for (let i = 0; i < MAP * MAP; i++) _map[i] = arr[i] ? 1 : 0;
+      _buildBits();
+      if (!_running) _renderFrame();
+    },
+    map_clear: () => {
+      _map.fill(0);
+      for (let i = 0; i < MAP; i++) {
+        _map[i] = _map[(MAP - 1) * MAP + i] = 1;
+        _map[i * MAP] = _map[i * MAP + (MAP - 1)] = 1;
+      }
+      _buildBits();
+      if (!_running) _renderFrame();
+    },
+    is_wall:  (x, y) => _isWall(+x, +y) ? 1 : 0,
+    cast_ray: (x, y, angle) => {
+      const r = _castRay(+x, +y, Math.cos(+angle), Math.sin(+angle));
+      return { dist: r.dist, side: r.side, mx: r.mx, my: r.my };
+    },
+    player: () => ({ ...  _player }),
+  },
+  on: {
+    'frame-mounted': ({ id }) => {
+      if (id !== 'game25') return;
+      // DOM が確実に構築された後に init
+      requestAnimationFrame(() => {
+        if (!_canvas) _init();
+        else _renderFrame();
+      });
+    },
+    'frame-unmounted': ({ id }) => {
+      if (id !== 'game25') return;
+      // ループとキーリスナーをクリーンアップ
+      _running = false;
+      cancelAnimationFrame(_rafId);
+      _detachKeys();
+      _keyState = {};
+    },
+  },
+});
+
+})();
+</script>
+
+<script type="sph/doc" data-doc-ext="game25">
+
+{
+  "title": "2.5D GAME - Raycast Engine",
+  "icon": "🎮",
+  "description": "High-performance 2.5D raycasting engine using DDA algorithm with TypedArray pixel buffers, bitboard collision, WASD/Arrow controls, and built-in game loop.",
+  "version": "0.4",
+  "api": [
+    {
+      "method": "game25.init",
+      "args": "canvasId?: string",
+      "returns": "boolean",
+      "description": "Initialise the engine and canvas. Defaults to canvas id='game25-canvas'. Returns false if canvas not found."
+    },
+    {
+      "method": "game25.start",
+      "args": "",
+      "returns": "void",
+      "description": "Start the RAF game loop. Attaches WASD/Arrow key handlers automatically."
+    },
+    {
+      "method": "game25.stop",
+      "args": "",
+      "returns": "void",
+      "description": "Stop the game loop and detach all key handlers."
+    },
+    {
+      "method": "game25.reset",
+      "args": "",
+      "returns": "void",
+      "description": "Reset player to (4.5, 4.5, angle=0) and redraw."
+    },
+    {
+      "method": "game25.render",
+      "args": "x?: number, y?: number, angle?: number",
+      "returns": "void",
+      "description": "Draw one frame. Optionally update player position/angle first."
+    },
+    {
+      "method": "game25.move",
+      "args": "dx: number, dy: number, dAngle?: number",
+      "returns": "void",
+      "description": "Move player by delta with wall-collision. Redraws if loop not running."
+    },
+    {
+      "method": "game25.teleport",
+      "args": "x: number, y: number, angle?: number",
+      "returns": "void",
+      "description": "Set player position directly (no collision). Redraws if loop not running."
+    },
+    {
+      "method": "game25.map_set",
+      "args": "x: number, y: number, val: 0|1",
+      "returns": "void",
+      "description": "Set a single map cell and rebuild the bitboard."
+    },
+    {
+      "method": "game25.map_load",
+      "args": "arr: number[] (length >= MAP*MAP)",
+      "returns": "void",
+      "description": "Bulk-load a 32x32 flat map array. Non-zero values become walls."
+    },
+    {
+      "method": "game25.map_clear",
+      "args": "",
+      "returns": "void",
+      "description": "Clear the map to all empty except outer boundary walls."
+    },
+    {
+      "method": "game25.is_wall",
+      "args": "x: number, y: number",
+      "returns": "0 | 1",
+      "description": "Fast bitboard wall check. Returns 1 if the cell is a wall or out of bounds."
+    },
+    {
+      "method": "game25.cast_ray",
+      "args": "x: number, y: number, angle: number",
+      "returns": "{dist, side, mx, my}",
+      "description": "Cast a single ray from (x,y) in the given angle (radians). Returns hit distance, side (0=X, 1=Y), and map coordinates."
+    },
+    {
+      "method": "game25.player",
+      "args": "",
+      "returns": "{x, y, angle}",
+      "description": "Get a copy of the current player state."
+    }
+  ]
+}
+
+</script>
+
+<script type="sph/sec" data-sec-ext="game25" data-sec-title="GAME25">
+
+<h2>🎮 2.5D GAME — Raycast Engine</h2>
+
+<p>A high-performance 2.5D first-person raycasting engine built on the DDA
+(Digital Differential Analysis) algorithm. Renders at 320×200 into a
+<code>Uint32Array</code> pixel buffer via <code>OffscreenCanvas</code>
+(falls back to a hidden canvas on older browsers), then blits the result to
+the display canvas at full panel size.</p>
+
+<h3>Architecture</h3>
+<table>
+  <thead><tr><th>Layer</th><th>Technology</th><th>Purpose</th></tr></thead>
+  <tbody>
+    <tr><td>Map</td><td>Uint8Array 32×32</td><td>Wall layout storage</td></tr>
+    <tr><td>Collision</td><td>Uint32Array bitboard (1 row = 1 word)</td><td>O(1) wall check per ray step</td></tr>
+    <tr><td>Raycaster</td><td>DDA (per-column)</td><td>320 rays per frame, FOV ≈ 66°</td></tr>
+    <tr><td>Pixel buffer</td><td>Uint32Array (ABGR)</td><td>Direct pixel write, no draw calls</td></tr>
+    <tr><td>Output</td><td>OffscreenCanvas / canvas fallback</td><td>putImageData → drawImage to display canvas</td></tr>
+    <tr><td>Game loop</td><td>requestAnimationFrame</td><td>Smooth 60 fps when GPU-limited</td></tr>
+  </tbody>
+</table>
+
+<h3>Quick Start</h3>
+<pre>
+; 1. Open the panel (it auto-inits via frame-mounted)
+; 2. Click ▶ Start
+
+; Or from DSL — manual frame control
+game25.teleport 4.5 4.5 0
+game25.map_set 8 8 1       ; place a wall
+game25.render               ; draw one frame
+</pre>
+
+<h3>Map Format</h3>
+<p>The map is a 32×32 grid. <code>map_load</code> accepts a flat array of
+1024 values (row-major, y×32+x). Use <code>0</code> for floor and any
+non-zero value for a wall. The outer boundary is always walls.</p>
+
+<pre>
+// Build a simple room with a pillar
+const map = new Array(32 * 32).fill(0);
+// outer walls (already set by map_clear / init)
+// inner pillar
+map[10 * 32 + 10] = 1;
+sph.call('game25.map_load', [map]);
+</pre>
+
+<h3>Manual / @loop Mode</h3>
+<p>If you want DSL code to drive the game instead of the built-in RAF loop,
+call <code>game25.stop()</code> first, then update state and call
+<code>game25.render()</code> each frame from a <code>@loop</code> block.</p>
+
+<pre>
+@gameLoop
+  ; Read input via sys.input.key
+  #left  = sys.input.key "ArrowLeft"
+  #right = sys.input.key "ArrowRight"
+  #fwd   = sys.input.key "ArrowUp"
+
+  if #left  { game25.move 0 0 -0.04 }
+  if #right { game25.move 0 0  0.04 }
+  if #fwd   {
+    ; compute dx/dy from player angle using DSL
+    %p = game25.player
+    game25.move 0.05 0 0
+  }
+  game25.render
+  sys.wait
+</pre>
+
+<h3>Rendering Details</h3>
+<table>
+  <thead><tr><th>Property</th><th>Value</th></tr></thead>
+  <tbody>
+    <tr><td>Resolution</td><td>320 × 200 (scaled to canvas size)</td></tr>
+    <tr><td>FOV</td><td>≈ 66° (camera plane factor 0.66)</td></tr>
+    <tr><td>Ceiling colour</td><td>0x444444 (dark grey)</td></tr>
+    <tr><td>Floor colour</td><td>0x333333 (darker grey)</td></tr>
+    <tr><td>Wall shading</td><td>Distance attenuation × 18 + side dimming</td></tr>
+    <tr><td>Max ray steps</td><td>64 (prevents infinite loop in open maps)</td></tr>
+  </tbody>
+</table>
+
+<h3>Browser Compatibility</h3>
+<table>
+  <thead><tr><th>Feature</th><th>Requirement</th><th>Fallback</th></tr></thead>
+  <tbody>
+    <tr><td>OffscreenCanvas</td><td>Chrome 69+, Firefox 105+, Safari 16.4+</td><td>Hidden &lt;canvas&gt; element</td></tr>
+    <tr><td>Uint32Array</td><td>All modern browsers</td><td>—</td></tr>
+    <tr><td>requestAnimationFrame</td><td>All modern browsers</td><td>—</td></tr>
+  </tbody>
+</table>
+
+<h3>FPS Counter</h3>
+<p>The panel footer shows a live FPS counter updated once per second
+(<code>#game25-fps</code> element). Typical performance is 60 fps when
+the browser is not CPU-throttled.</p>
+
+</script>
+</body>
+</html>

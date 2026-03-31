@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="sph-ext" content="find">
+<title>FINDER EXT</title>
+</head>
+<body>
+<script type="sph/ext" data-ext-id="find">
+(function(){
+'use strict';
+
+// ── 内部レジストリ ──────────────────────────────────────────────
+const _sources = new Map();   // id -> fetchFn: () => Promise<FindItem[]>
+let _lastResults = [];        // 最後の検索結果（UI アクション用）
+let _searchDebounce = null;   // 入力 debounce タイマー
+
+// FindItem スキーマ:
+// { id:string, name:string, ext:string, type?:string,
+//   summary?:string, timestamp?:number, tags?:string[],
+//   details?:{[key:string]: string|number},
+//   onSelect?: (item) => void }
+
+// ── 検索エンジン ─────────────────────────────────────────────────
+async function _search(query = '') {
+  const filterExt = document.getElementById('find-ext-sel')?.value || 'all';
+
+  // 全ソースからデータ収集
+  let all = [];
+  for (const [id, fetchFn] of _sources) {
+    if (filterExt !== 'all' && id !== filterExt) continue;
+    try {
+      const items = await fetchFn();
+      if (!Array.isArray(items)) continue;
+      all = all.concat(items.map(it => ({ ...it, ext: it.ext || id })));
+    } catch (e) {
+      console.warn(`[find] source "${id}" error:`, e.message);
+    }
+  }
+
+  // クエリパース: @key:val / @key>val / @key<val / @key=val
+  const universalQ = query.replace(/@\w+[:<>=]\S*/g, '').trim().toLowerCase();
+  const detailFilters = [...query.matchAll(/@(\w+)([:<>=])(\S+)/g)]
+    .map(m => ({ key: m[1], op: m[2], val: m[3] }));
+
+  // 1次フィルタ: name / tags / ext / type
+  let results = universalQ
+    ? all.filter(it =>
+        it.name?.toLowerCase().includes(universalQ) ||
+        it.ext?.toLowerCase().includes(universalQ) ||
+        it.type?.toLowerCase().includes(universalQ) ||
+        it.summary?.toLowerCase().includes(universalQ) ||
+        it.tags?.some(t => t.toLowerCase().includes(universalQ))
+      )
+    : all;
+
+  // 2次フィルタ: details フィールド
+  for (const f of detailFilters) {
+    results = results.filter(it => {
+      const raw = it.details?.[f.key];
+      if (raw === undefined) return false;
+      const str = String(raw).toLowerCase();
+      const tN = parseFloat(raw), vN = parseFloat(f.val);
+      const numeric = !isNaN(tN) && !isNaN(vN);
+      if (f.op === ':' || f.op === '=') return str.includes(f.val.toLowerCase());
+      if (f.op === '>')  return numeric && tN > vN;
+      if (f.op === '<')  return numeric && tN < vN;
+      return false;
+    });
+  }
+
+  _lastResults = results.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+  return _lastResults;
+}
+
+// ── UI レンダリング ───────────────────────────────────────────────
+async function _render() {
+  const query = document.getElementById('find-in')?.value || '';
+  const results = await _search(query);
+
+  const list = document.getElementById('find-results');
+  if (!list) return;
+
+  if (!results.length) {
+    list.innerHTML = '<div class="sph-meta" style="padding:20px;text-align:center">No items found.</div>';
+    _renderChips([]);
+    return;
+  }
+
+  list.innerHTML = results.map((it, idx) => {
+    const dateStr = it.timestamp ? new Date(it.timestamp).toLocaleDateString() : '—';
+    // id を安全にエスケープ（onclick インジェクション防止）
+    const safeIdx = String(idx);
+    const detailsHtml = it.details
+      ? Object.entries(it.details).map(([k, v]) =>
+          `<div><span style="color:var(--sph-dim)">${_esc(k)}:</span> `+
+          `<span style="color:var(--sph-accent)">${_esc(String(v))}</span></div>`
+        ).join('')
+      : '';
+    const tagsHtml = it.tags?.length
+      ? '<div style="margin-top:6px;display:flex;gap:4px;flex-wrap:wrap">'+
+        it.tags.map(t => `<span style="background:var(--sph-bg);padding:1px 6px;border-radius:10px;font-size:8px;color:var(--sph-dim)">#${_esc(t)}</span>`).join('')+
+        '</div>'
+      : '';
+
+    return `<div class="sph-section" style="margin-bottom:6px;padding:0;overflow:hidden;border-left:3px solid var(--sph-accent)">
+      <div style="display:flex;align-items:center;gap:10px;padding:10px;cursor:pointer"
+           onclick="var d=this.parentElement.querySelector('.fd');d.style.display=d.style.display==='none'?'block':'none'">
+        <div style="flex:1;min-width:0">
+          <div style="display:flex;align-items:center;gap:6px;margin-bottom:2px">
+            <span class="sph-label" style="font-size:8px;background:var(--sph-accent)22;padding:1px 4px;border-radius:2px">${_esc(it.ext)}</span>
+            <span class="sph-body" style="font-weight:700">${_esc(it.name)}</span>
+            ${it.type ? `<span class="sph-meta" style="font-size:8px;opacity:.7">${_esc(it.type)}</span>` : ''}
+          </div>
+          <div class="sph-meta" style="font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${_esc(it.summary||'')}</div>
+        </div>
+        <div style="text-align:right;flex-shrink:0">
+          <div class="sph-meta" style="font-size:9px;margin-bottom:4px">${dateStr}</div>
+          <button class="sph-btn sph-btn-ok" style="font-size:9px;padding:2px 8px"
+            onclick="event.stopPropagation();sph.call('find.open',[${safeIdx}])">Open</button>
+        </div>
+      </div>
+      <div class="fd" style="display:none;padding:10px;background:var(--sph-surface);border-top:1px solid var(--sph-border);font-size:10px">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px">${detailsHtml}</div>
+        ${tagsHtml}
+      </div>
+    </div>`;
+  }).join('');
+
+  _renderChips(results);
+}
+
+function _esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function _renderChips(results) {
+  const el = document.getElementById('find-chips');
+  if (!el) return;
+  const keys = new Set();
+  results.forEach(it => { if (it.details) Object.keys(it.details).forEach(k => keys.add(k)); });
+
+  if (!keys.size) { el.innerHTML = ''; return; }
+
+  el.innerHTML = '<span class="sph-meta" style="margin-right:8px;font-size:9px;font-weight:700">FILTER:</span>'+
+    [...keys].map(k =>
+      `<button class="sph-btn" style="font-size:8px;padding:1px 6px;margin-right:4px;margin-bottom:4px;border-color:var(--sph-accent)44"
+         onclick="var i=document.getElementById('find-in');i.value+=' @${_esc(k)}:';i.focus()">${_esc(k)}</button>`
+    ).join('');
+}
+
+// ── EXT セレクタ同期 ───────────────────────────────────────────────
+function _syncSelector() {
+  const sel = document.getElementById('find-ext-sel');
+  if (!sel) return;
+  // 既存オプションを保持しつつ、未登録ソースを追加
+  const existing = new Set([...(sel.options)].map(o => o.value));
+  for (const id of _sources.keys()) {
+    if (!existing.has(id)) {
+      const opt = document.createElement('option');
+      opt.value = id; opt.textContent = id.toUpperCase();
+      sel.appendChild(opt);
+    }
+  }
+}
+
+// ── Debounce 付き検索トリガー ─────────────────────────────────────
+function _triggerSearch() {
+  clearTimeout(_searchDebounce);
+  _searchDebounce = setTimeout(_render, 150);
+}
+
+// ── パネル HTML ───────────────────────────────────────────────────
+const _panel = () => sph.ui.panel('find',
+  sph.ui.section('Search',
+    '<div style="display:flex;gap:8px;margin-bottom:8px">'+
+    '<input id="find-in" class="sph-input" style="flex:1" placeholder="Name, tag, @key:val..." oninput="sph.call(\'find.ui.refresh\')">'+
+    '<select id="find-ext-sel" class="sph-input" style="width:110px" onchange="sph.call(\'find.ui.refresh\')">'+
+    '<option value="all">All Sources</option>'+
+    '</select>'+
+    '<button class="sph-btn" onclick="document.getElementById(\'find-in\').value=\'\';sph.call(\'find.ui.refresh\')">CLR</button>'+
+    '</div>'+
+    '<div id="find-chips" style="display:flex;flex-wrap:wrap;align-items:center;min-height:20px;margin-bottom:4px"></div>'
+  )+
+  '<div id="find-results" style="flex:1;overflow-y:auto;padding-top:4px"></div>'
+);
+
+// ── sph.mount ─────────────────────────────────────────────────────
+sph.mount('find', 'FINDER', '\uD83D\uDD0D', {
+  panel: _panel,
+  commands: [
+    {name:'find.register_source', desc:'Register a searchable data source', args:'id, fetchFn: ()=>Promise<FindItem[]>'},
+    {name:'find.unregister',      desc:'Remove a data source',              args:'id'},
+    {name:'find.search',          desc:'Execute search and return results', args:'query → FindItem[]'},
+    {name:'find.open',            desc:'Trigger onSelect for result by index', args:'resultIndex'},
+    {name:'find.ui.refresh',      desc:'Refresh the search UI'},
+  ],
+  api: {
+    register_source: (id, fetchFn) => {
+      if (typeof id !== 'string' || typeof fetchFn !== 'function') {
+        console.warn('[find] register_source: invalid args');
+        return;
+      }
+      _sources.set(id, fetchFn);
+      _syncSelector();
+    },
+    unregister: (id) => {
+      _sources.delete(id);
+    },
+    search: (query) => _search(query),
+    open: (idx) => {
+      const item = _lastResults[idx];
+      if (item?.onSelect) item.onSelect(item);
+      else sph.call('ide.log', [`[find] No action for result[${idx}]`]);
+    },
+    'ui.refresh': () => _triggerSearch(),
+  },
+  on: {
+    'frame-mounted': ({ id }) => {
+      if (id !== 'find') return;
+      _syncSelector();
+      _render();
+    },
+  },
+});
+
+})();
+</script>
+
+<script type="sph/doc" data-doc-ext="find">
+
+{
+  "title": "FINDER - Universal Search",
+  "icon": "🔍",
+  "description": "Universal cross-EXT search engine. Sources register metadata; FINDER indexes, filters, and displays results with drill-down queries.",
+  "version": "1.0",
+  "api": [
+    {
+      "method": "find.register_source",
+      "args": "id: string, fetchFn: () => Promise<FindItem[]>",
+      "returns": "void",
+      "description": "Register a searchable data source. fetchFn must return an array of FindItem objects."
+    },
+    {
+      "method": "find.unregister",
+      "args": "id: string",
+      "returns": "void",
+      "description": "Remove a previously registered data source."
+    },
+    {
+      "method": "find.search",
+      "args": "query: string",
+      "returns": "Promise<FindItem[]>",
+      "description": "Execute a search across all registered sources. Supports @key:val drill-down syntax."
+    },
+    {
+      "method": "find.open",
+      "args": "resultIndex: number",
+      "returns": "void",
+      "description": "Trigger the onSelect callback for a result by its index in the last search result."
+    },
+    {
+      "method": "find.ui.refresh",
+      "args": "",
+      "returns": "void",
+      "description": "Re-run the current search and refresh the panel UI (debounced 150ms)."
+    }
+  ]
+}
+
+</script>
+
+<script type="sph/sec" data-sec-ext="find" data-sec-title="FIND">
+
+<h2>🔍 FINDER — Universal Search</h2>
+
+<p>FINDER is a cross-EXT search engine. Any EXT can register a data source;
+FINDER indexes, filters, and presents results in a unified panel with
+expandable detail rows and drill-down query syntax.</p>
+
+<h3>FindItem Schema</h3>
+<p>Each item returned by a source function must conform to:</p>
+<table>
+  <thead><tr><th>Field</th><th>Type</th><th>Required</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>id</td><td>string</td><td>✓</td><td>Unique identifier within the source</td></tr>
+    <tr><td>name</td><td>string</td><td>✓</td><td>Display name (searched in universal query)</td></tr>
+    <tr><td>ext</td><td>string</td><td>—</td><td>Source EXT id (auto-set from registration)</td></tr>
+    <tr><td>type</td><td>string</td><td>—</td><td>Item type label (searched in universal query)</td></tr>
+    <tr><td>summary</td><td>string</td><td>—</td><td>One-line description shown in the list</td></tr>
+    <tr><td>timestamp</td><td>number</td><td>—</td><td>Unix ms timestamp (used for default sort order)</td></tr>
+    <tr><td>tags</td><td>string[]</td><td>—</td><td>Tags (searchable, shown as chips)</td></tr>
+    <tr><td>details</td><td>{[key]: string|number}</td><td>—</td><td>Key-value pairs for drill-down filter and detail view</td></tr>
+    <tr><td>onSelect</td><td>(item) => void</td><td>—</td><td>Called when user clicks "Open" button</td></tr>
+  </tbody>
+</table>
+
+<h3>Query Syntax</h3>
+<table>
+  <thead><tr><th>Example</th><th>Behaviour</th></tr></thead>
+  <tbody>
+    <tr><td><code>piano</code></td><td>Universal search across name, ext, type, summary, tags</td></tr>
+    <tr><td><code>@bpm:120</code></td><td>Match items where details.bpm contains "120"</td></tr>
+    <tr><td><code>@bpm=120</code></td><td>Exact match (numeric or string)</td></tr>
+    <tr><td><code>@bpm&gt;100</code></td><td>Numeric greater-than on details.bpm</td></tr>
+    <tr><td><code>loop @bpm&gt;90</code></td><td>Universal + detail filter combined</td></tr>
+  </tbody>
+</table>
+
+<h3>Registering a Source</h3>
+<pre>
+sph.call('find.register_source', ['myext', async () => {
+  return [
+    {
+      id: 'item-1',
+      name: 'My Item',
+      type: 'preset',
+      summary: 'A brief description',
+      timestamp: Date.now(),
+      tags: ['audio', 'loop'],
+      details: { bpm: 120, key: 'C' },
+      onSelect: (item) => sph.call('myext.load', [item.id])
+    }
+  ];
+}]);
+</pre>
+
+<h3>Drill-down Chips</h3>
+<p>When search results contain <code>details</code> fields, FINDER automatically
+displays filter chips below the search box. Clicking a chip appends
+<code>@fieldName:</code> to the query, letting users narrow results interactively.</p>
+
+<h3>EXT Filter</h3>
+<p>The dropdown next to the search box filters results to a single registered
+source. It is populated automatically when sources are registered.</p>
+
+</script>
+</body>
+</html>

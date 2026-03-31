@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="sph-ext" content="abcd">
+<title>ABCD Runtime EXT</title>
+</head>
+<body>
+
+<script type="sph/meta" data-ext-id="abcd">
+{
+  "cat": "C",
+  "version": "1.0",
+  "label": "ABCD Runtime",
+  "icon": "⬡",
+  "consumes": [],
+  "produces": [],
+  "signals": ["abcd:registered", "abcd:signal", "abcd:pipe"]
+}
+</script>
+
+<script type="sph/ext" data-ext-id="abcd">
+(function(){
+'use strict';
+
+// ══════════════════════════════════════════════════════════════════
+// ABCD RUNTIME
+// Sapphire NG EXT カテゴリ管理・EXT間連携基盤
+//
+// Categories:
+//   A - Action     : UI・末端実行系
+//   B - Base       : リソース・通信・計算基盤
+//   C - Control    : 管理・監視・フロー制御
+//   D - Definition : 設定・スキーマ・ドキュメント定義
+// ══════════════════════════════════════════════════════════════════
+
+// ── 内部レジストリ ──────────────────────────────────────────────
+// Map<extId, ABCDEntry>
+// ABCDEntry: { id, cat, version, label, icon, consumes, produces, signals, registeredAt }
+const _registry = new Map();
+
+// シグナル購読者
+// Map<signalName, Set<{extId, fn}>>
+const _subscribers = new Map();
+
+// ── カテゴリ定義 ────────────────────────────────────────────────
+const CATS = {
+  A: { name: 'Action',     icon: '⚡', desc: 'UI・末端実行系',      color: 'var(--sph-accent)' },
+  B: { name: 'Base',       icon: '🔧', desc: 'リソース・通信基盤',   color: 'var(--sph-ok)'     },
+  C: { name: 'Control',    icon: '⚙',  desc: '管理・監視・フロー',   color: 'var(--sph-warn)'   },
+  D: { name: 'Definition', icon: '📐', desc: '設定・スキーマ・定義', color: 'var(--sph-dim)'    },
+};
+
+// ── sph/meta タグの自動収集 ─────────────────────────────────────
+function _collectMeta() {
+  document.querySelectorAll('script[type="sph/meta"][data-ext-id]').forEach(el => {
+    const id = el.dataset.extId;
+    if (_registry.has(id)) return; // already registered
+    try {
+      const meta = JSON.parse(el.textContent.trim());
+      _register(id, meta.cat || 'A', meta);
+    } catch (e) {
+      console.warn('[abcd] Failed to parse sph/meta for', id, e.message);
+    }
+  });
+}
+
+// ── 登録 ────────────────────────────────────────────────────────
+function _register(id, cat, meta = {}) {
+  if (!CATS[cat]) {
+    console.warn('[abcd] Unknown category:', cat, 'for EXT:', id);
+    cat = 'A';
+  }
+  const entry = {
+    id,
+    cat,
+    version:      meta.version  || '1.0',
+    label:        meta.label    || id.toUpperCase(),
+    icon:         meta.icon     || CATS[cat].icon,
+    consumes:     Array.isArray(meta.consumes) ? meta.consumes : [],
+    produces:     Array.isArray(meta.produces) ? meta.produces : [],
+    signals:      Array.isArray(meta.signals)  ? meta.signals  : [],
+    registeredAt: Date.now(),
+  };
+  _registry.set(id, entry);
+  sph.emit('abcd:registered', { id, cat, entry });
+  return entry;
+}
+
+// ── クエリ ──────────────────────────────────────────────────────
+function _query(cat = null, filter = null) {
+  let entries = [..._registry.values()];
+  if (cat) entries = entries.filter(e => e.cat === cat);
+  if (filter) {
+    entries = entries.filter(e =>
+      Object.entries(filter).every(([k, v]) => e[k] === v)
+    );
+  }
+  return entries.sort((a, b) => a.id.localeCompare(b.id));
+}
+
+// ── pipe: EXT間データ転送 ────────────────────────────────────────
+// fromId.produce() → data → toId.consume(data, fromId)
+async function _pipe(fromId, toId, data) {
+  // data が指定されていない場合は fromId.produce() を呼ぶ
+  let payload = data;
+  if (payload === undefined) {
+    payload = sph.get(`${fromId}.produce`);
+  }
+
+  const consumeFn = sph._reg.get(`${toId}.consume`);
+  if (!consumeFn) {
+    console.warn(`[abcd] pipe: ${toId}.consume not found`);
+    return null;
+  }
+
+  try {
+    const r = consumeFn(payload, fromId);
+    sph.emit('abcd:pipe', { from: fromId, to: toId, payload });
+    return r instanceof Promise ? await r : r;
+  } catch (e) {
+    console.error(`[abcd] pipe ${fromId}→${toId} error:`, e.message);
+    return null;
+  }
+}
+
+// ── signal: ブロードキャスト ─────────────────────────────────────
+function _signal(signalName, payload, fromId = null) {
+  sph.emit('abcd:signal', { signal: signalName, payload, from: fromId });
+  // 購読者に配送
+  const subs = _subscribers.get(signalName);
+  if (subs) {
+    subs.forEach(({ extId, fn }) => {
+      if (extId === fromId) return; // 自己配送しない
+      try { fn(payload, fromId); } catch (e) {
+        console.warn(`[abcd] signal "${signalName}" handler in "${extId}" failed:`, e.message);
+      }
+    });
+  }
+}
+
+// ── on_signal: 購読登録 ─────────────────────────────────────────
+function _onSignal(signalName, extId, fn) {
+  if (!_subscribers.has(signalName)) _subscribers.set(signalName, new Set());
+  const entry = { extId, fn };
+  _subscribers.get(signalName).add(entry);
+  // アンサブスクライブ関数を返す
+  return () => _subscribers.get(signalName)?.delete(entry);
+}
+
+// ── flow: パイプラインステップ実行 ──────────────────────────────
+// steps: Array<{call?, pipe?, signal?, args?, key?}>
+async function _flow(steps) {
+  let _lastResult = null;
+  for (const step of steps) {
+    try {
+      if (step.call) {
+        // { call: 'find.search', args: ['keyword'] }
+        const args = step.args || [];
+        _lastResult = await sph.call(step.call, args);
+      } else if (step.pipe) {
+        // { pipe: ['find', 'storage'], key: 'last_search' }
+        const [from, to] = step.pipe;
+        const data = step.key
+          ? { key: step.key, val: _lastResult }
+          : _lastResult;
+        _lastResult = await _pipe(from, to, data);
+      } else if (step.signal) {
+        // { signal: 'search:done', from: 'find' }
+        _signal(step.signal, _lastResult, step.from || null);
+      } else if (step.consume) {
+        // { consume: 'storage', from: 'find' }
+        _lastResult = await _pipe(step.from || '?', step.consume, _lastResult);
+      }
+    } catch (e) {
+      console.error('[abcd] flow step error:', JSON.stringify(step), e.message);
+      break;
+    }
+  }
+  return _lastResult;
+}
+
+// ── UI レンダリング ─────────────────────────────────────────────
+function _renderPanel() {
+  const el = document.getElementById('abcd-content');
+  if (!el) return;
+
+  const counts = { A: 0, B: 0, C: 0, D: 0 };
+  _registry.forEach(e => { if (counts[e.cat] !== undefined) counts[e.cat]++; });
+
+  let html =
+    // サマリーバー
+    '<div style="display:flex;gap:8px;margin-bottom:12px">' +
+    Object.entries(CATS).map(([cat, info]) =>
+      `<div style="flex:1;background:var(--sph-surface);border:1px solid var(--sph-border);` +
+      `border-top:3px solid ${info.color};border-radius:4px;padding:8px;text-align:center">` +
+      `<div style="font-size:18px;margin-bottom:2px">${info.icon}</div>` +
+      `<div style="font-weight:700;color:${info.color};font-size:var(--sph-sz-lg)">[${cat}]</div>` +
+      `<div style="font-size:var(--sph-sz-sm);color:var(--sph-dim)">${info.name}</div>` +
+      `<div style="font-size:20px;font-weight:700;margin-top:4px;color:var(--sph-text)">${counts[cat]}</div>` +
+      `</div>`
+    ).join('') +
+    '</div>';
+
+  // カテゴリ別リスト
+  html += Object.entries(CATS).map(([cat, catInfo]) => {
+    const members = _query(cat);
+    if (!members.length) return '';
+    return (
+      `<div style="margin-bottom:12px">` +
+      `<div style="font-size:var(--sph-sz-sm);font-weight:700;letter-spacing:2px;` +
+      `color:${catInfo.color};margin-bottom:6px;padding-bottom:4px;` +
+      `border-bottom:1px solid ${catInfo.color}44">` +
+      `[${cat}] ${catInfo.name} — ${catInfo.desc}</div>` +
+      members.map(e => {
+        const consumes = e.consumes.length ? e.consumes.join(', ') : '—';
+        const produces = e.produces.length ? e.produces.join(', ') : '—';
+        const signals  = e.signals.length  ? e.signals.join(', ')  : '—';
+        return (
+          `<div style="display:flex;align-items:flex-start;gap:10px;padding:7px 0;` +
+          `border-bottom:1px solid var(--sph-border)22">` +
+          `<div style="width:22px;text-align:center;font-size:14px;flex-shrink:0">${e.icon}</div>` +
+          `<div style="flex:1;min-width:0">` +
+          `<div style="font-weight:700;font-size:var(--sph-sz-md)">${e.label}` +
+          `<span style="color:var(--sph-dim);font-weight:400;font-size:var(--sph-sz-sm)"> ${e.id}</span>` +
+          `<span style="color:var(--sph-dim);font-size:var(--sph-sz-sm);margin-left:8px">v${e.version}</span></div>` +
+          `<div style="font-size:var(--sph-sz-sm);color:var(--sph-dim);margin-top:2px">` +
+          `◀ ${consumes} &nbsp;▶ ${produces}` +
+          `${e.signals.length ? ` &nbsp;📡 ${signals}` : ''}` +
+          `</div></div></div>`
+        );
+      }).join('') +
+      `</div>`
+    );
+  }).join('');
+
+  // シグナル一覧
+  if (_subscribers.size) {
+    html +=
+      `<div style="margin-top:8px">` +
+      `<div style="font-size:var(--sph-sz-sm);font-weight:700;letter-spacing:2px;color:var(--sph-accent);` +
+      `margin-bottom:6px;padding-bottom:4px;border-bottom:1px solid var(--sph-border)">` +
+      `ACTIVE SIGNALS</div>` +
+      [..._subscribers.entries()].map(([sig, subs]) =>
+        `<div style="font-size:var(--sph-sz-sm);padding:3px 0;border-bottom:1px solid var(--sph-border)22">` +
+        `<span style="color:var(--sph-accent)">📡 ${sig}</span>` +
+        `<span style="color:var(--sph-dim)"> — ${subs.size} subscriber(s)</span></div>`
+      ).join('') +
+      `</div>`;
+  }
+
+  el.innerHTML = html;
+}
+
+// ── パネル HTML ─────────────────────────────────────────────────
+const _panel = () => sph.ui.panel('abcd',
+  '<div id="abcd-content" style="flex:1;overflow-y:auto"></div>'
+);
+
+// ── sph.mount ───────────────────────────────────────────────────
+sph.mount('abcd', 'ABCD', '\u2B21', {
+  panel: _panel,
+  commands: [
+    { name: 'abcd.register',    desc: 'Register EXT to ABCD category',           args: 'extId, cat(A/B/C/D), meta?' },
+    { name: 'abcd.query',       desc: 'Query EXTs by category',                   args: 'cat?, filter? → ABCDEntry[]' },
+    { name: 'abcd.get_meta',    desc: 'Get meta for an EXT',                      args: 'extId → ABCDEntry | null' },
+    { name: 'abcd.pipe',        desc: 'Transfer data between EXTs via consume()', args: 'fromId, toId, data?' },
+    { name: 'abcd.signal',      desc: 'Broadcast a named signal to subscribers',  args: 'signalName, payload, fromId?' },
+    { name: 'abcd.on_signal',   desc: 'Subscribe to a signal',                    args: 'signalName, extId, fn → unsub' },
+    { name: 'abcd.flow',        desc: 'Execute a pipeline of EXT steps',          args: 'steps[] → lastResult' },
+    { name: 'abcd.refresh',     desc: 'Refresh panel and re-collect sph/meta' },
+    { name: 'abcd.describe',    desc: 'Get ABCD runtime metadata' },
+  ],
+  api: {
+    register:  (id, cat, meta)      => _register(id, cat, meta),
+    query:     (cat, filter)        => _query(cat, filter),
+    get_meta:  (id)                 => _registry.get(id) || null,
+    pipe:      (from, to, data)     => _pipe(from, to, data),
+    signal:    (name, payload, from)=> _signal(name, payload, from),
+    on_signal: (name, extId, fn)    => _onSignal(name, extId, fn),
+    flow:      (steps)              => _flow(steps),
+    refresh:   () => { _collectMeta(); _renderPanel(); },
+    describe:  () => ({
+      cat: 'C', version: '1.0',
+      registered: _registry.size,
+      subscribers: _subscribers.size,
+    }),
+  },
+  on: {
+    'frame-mounted': ({ id }) => {
+      if (id === 'abcd') {
+        _collectMeta();
+        setTimeout(_renderPanel, 50);
+      }
+    },
+    'ide-ready': () => {
+      // 起動時に sph/meta を自動収集
+      _collectMeta();
+      // abcd 自身を登録
+      _register('abcd', 'C', {
+        version: '1.0', label: 'ABCD Runtime', icon: '⬡',
+        signals: ['abcd:registered', 'abcd:signal', 'abcd:pipe'],
+      });
+    },
+    // 外部から EXT が追加された時も収集
+    'ext-loaded': () => {
+      _collectMeta();
+      _renderPanel();
+    },
+  },
+});
+
+})();
+</script>
+
+<script type="sph/doc" data-doc-ext="abcd">
+{
+  "title": "ABCD - EXT Structure Runtime",
+  "icon": "⬡",
+  "description": "ABCD category system runtime. Classifies EXTs into Action/Base/Control/Definition and provides inter-EXT communication via pipe, signal, and flow.",
+  "version": "1.0",
+  "api": [
+    {
+      "method": "abcd.register",
+      "args": "extId, cat(A/B/C/D), meta?",
+      "returns": "ABCDEntry",
+      "description": "Register an EXT to an ABCD category. Auto-collected from sph/meta tags on ide-ready."
+    },
+    {
+      "method": "abcd.query",
+      "args": "cat?: string, filter?: object",
+      "returns": "ABCDEntry[]",
+      "description": "List registered EXTs, optionally filtered by category or property."
+    },
+    {
+      "method": "abcd.get_meta",
+      "args": "extId: string",
+      "returns": "ABCDEntry | null",
+      "description": "Get the ABCD metadata entry for a specific EXT."
+    },
+    {
+      "method": "abcd.pipe",
+      "args": "fromId, toId, data?",
+      "returns": "Promise<any>",
+      "description": "Transfer data from one EXT to another by calling toId.consume(data, fromId). If data is omitted, calls fromId.produce() first."
+    },
+    {
+      "method": "abcd.signal",
+      "args": "signalName, payload, fromId?",
+      "returns": "void",
+      "description": "Broadcast a named signal to all subscribers (except the sender). Also emits sph event 'abcd:signal'."
+    },
+    {
+      "method": "abcd.on_signal",
+      "args": "signalName, extId, fn: (payload, from)=>void",
+      "returns": "unsubFn",
+      "description": "Subscribe to a named signal. Returns an unsubscribe function."
+    },
+    {
+      "method": "abcd.flow",
+      "args": "steps: FlowStep[]",
+      "returns": "Promise<any>",
+      "description": "Execute a pipeline of EXT operations sequentially. Each step's result is passed to the next."
+    },
+    {
+      "method": "abcd.refresh",
+      "args": "",
+      "returns": "void",
+      "description": "Re-collect sph/meta tags and refresh the panel."
+    }
+  ]
+}
+</script>
+
+<script type="sph/sec" data-sec-ext="abcd" data-sec-title="ABCD Structure Runtime">
+<h2>⬡ ABCD — EXT Structure Runtime</h2>
+
+<p>The ABCD Runtime manages the category-based EXT architecture for Sapphire NG.
+It collects <code>sph/meta</code> declarations, enforces category conventions,
+and provides the <strong>pipe / signal / flow</strong> primitives for loosely-coupled inter-EXT communication.</p>
+
+<h3>Categories</h3>
+<table>
+  <thead><tr><th>Cat</th><th>Name</th><th>Role</th><th>Has UI?</th></tr></thead>
+  <tbody>
+    <tr><td>[A]</td><td>Action</td><td>User-facing operations (search, play, render)</td><td>Yes</td></tr>
+    <tr><td>[B]</td><td>Base</td><td>Resources: storage, comms, compute</td><td>Minimal</td></tr>
+    <tr><td>[C]</td><td>Control</td><td>Management, monitoring, flow orchestration</td><td>Yes</td></tr>
+    <tr><td>[D]</td><td>Definition</td><td>Config, schema, theme, documentation</td><td>Minimal</td></tr>
+  </tbody>
+</table>
+
+<h3>sph/meta Declaration</h3>
+<p>Each EXT declares its category and dependencies via a <code>sph/meta</code> script tag.
+The ABCD runtime auto-collects these on <code>ide-ready</code>.</p>
+<pre>
+&lt;script type="sph/meta" data-ext-id="sound"&gt;
+{
+  "cat":      "A",
+  "version":  "1.0",
+  "label":    "SOUND",
+  "icon":     "🔊",
+  "consumes": ["appearance"],
+  "produces": ["storage"],
+  "signals":  ["sound:played"]
+}
+&lt;/script&gt;
+</pre>
+
+<h3>Standard API (recommended for all EXTs)</h3>
+<table>
+  <thead><tr><th>Method</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>{extId}.describe()</td><td>Return MetaInfo object</td></tr>
+    <tr><td>{extId}.consume(data, fromId)</td><td>Receive data from another EXT</td></tr>
+    <tr><td>{extId}.produce()</td><td>Export current state to caller</td></tr>
+  </tbody>
+</table>
+
+<h3>Communication Primitives</h3>
+
+<h4>pipe — directed data transfer</h4>
+<pre>
+// find passes its last search result to storage for caching
+await sph.call('abcd.pipe', ['find', 'storage', {
+  key: 'last_search', val: results
+}]);
+</pre>
+
+<h4>signal — broadcast notification</h4>
+<pre>
+// sound notifies all listeners that playback finished
+sph.call('abcd.signal', ['sound:played', { freq: 440, dur: 0.1 }, 'sound']);
+
+// dev subscribes to monitor audio events
+sph.call('abcd.on_signal', ['sound:played', 'dev', (payload, from) => {
+  console.log('Audio played by', from, payload);
+}]);
+</pre>
+
+<h4>flow — sequential pipeline</h4>
+<pre>
+await sph.call('abcd.flow', [[
+  { call: 'find.search',   args: ['keyword'] },
+  { pipe: ['find', 'storage'], key: 'search_cache' },
+  { signal: 'search:done', from: 'find' }
+]]);
+</pre>
+
+<h3>Information Flow Rules</h3>
+<table>
+  <thead><tr><th>Direction</th><th>Allowed?</th><th>Mechanism</th></tr></thead>
+  <tbody>
+    <tr><td>D → A (config)</td><td>✓</td><td>abcd.pipe or A calls D.produce()</td></tr>
+    <tr><td>A → B (processing)</td><td>✓</td><td>sph.call or abcd.pipe</td></tr>
+    <tr><td>A → C (notification)</td><td>✓</td><td>abcd.signal</td></tr>
+    <tr><td>C → A (control)</td><td>✓</td><td>sph.call</td></tr>
+    <tr><td>B → A (direct call)</td><td>✗</td><td>B must not know A exists</td></tr>
+    <tr><td>D → A (direct call)</td><td>✗</td><td>D must not know A exists</td></tr>
+  </tbody>
+</table>
+</script>
+
+</body>
+</html>

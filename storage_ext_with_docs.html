@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="sph-ext" content="storage">
+<title>STORAGE EXT</title>
+</head>
+<body>
+<script type="sph/ext" data-ext-id="storage">
+(function(){
+'use strict';
+
+const PREFIX = 'sph:data:';
+
+// ── localStorage ラッパー (try/catch 必須) ──────────────────────
+function _lsSet(k, v) {
+  try { localStorage.setItem(k, v); return true; }
+  catch (e) { console.warn('[storage] write failed:', e.message); return false; }
+}
+function _lsGet(k) {
+  try { return localStorage.getItem(k); }
+  catch (e) { console.warn('[storage] read failed:', e.message); return null; }
+}
+function _lsDel(k) {
+  try { localStorage.removeItem(k); return true; }
+  catch (e) { console.warn('[storage] delete failed:', e.message); return false; }
+}
+function _lsKeys() {
+  try { return Object.keys(localStorage); }
+  catch (e) { console.warn('[storage] keys failed:', e.message); return []; }
+}
+
+// ── 汎用 CRUD ────────────────────────────────────────────────────
+const db = {
+  set(key, val, tag = 'general') {
+    const entry = { v: val, tag, t: Date.now() };
+    const ok = _lsSet(PREFIX + key, JSON.stringify(entry));
+    if (ok) _scheduleRefresh();
+    return ok;
+  },
+  get(key) {
+    const raw = _lsGet(PREFIX + key);
+    if (!raw) return null;
+    try { return JSON.parse(raw); }
+    catch (e) { console.warn('[storage] parse failed:', key); return null; }
+  },
+  remove(key) {
+    const ok = _lsDel(PREFIX + key);
+    if (ok) _scheduleRefresh();
+    return ok;
+  },
+  list(tag = null) {
+    return _lsKeys()
+      .filter(k => k.startsWith(PREFIX))
+      .map(k => {
+        const raw = _lsGet(k);
+        if (!raw) return null;
+        try {
+          const parsed = JSON.parse(raw);
+          return { key: k.slice(PREFIX.length), ...parsed };
+        } catch (_) { return null; }
+      })
+      .filter(item => item && (!tag || item.tag === tag))
+      .sort((a, b) => b.t - a.t);
+  },
+  clear() {
+    const keys = _lsKeys().filter(k => k.startsWith(PREFIX));
+    keys.forEach(k => _lsDel(k));
+    _scheduleRefresh();
+    return keys.length;
+  },
+};
+
+// ── Debounce 付き UI リフレッシュ ─────────────────────────────────
+// set/remove が連続しても UI は 1 回だけ更新する
+let _refreshTimer = null;
+function _scheduleRefresh() {
+  clearTimeout(_refreshTimer);
+  _refreshTimer = setTimeout(_refresh, 50);
+}
+
+// ── UI ───────────────────────────────────────────────────────────
+function _refresh() {
+  const list = document.getElementById('st-list');
+  if (!list) return;
+
+  const items = db.list();
+  if (!items.length) {
+    list.innerHTML = '<div class="sph-meta" style="padding:20px;text-align:center">Storage is empty.</div>';
+    return;
+  }
+
+  // タグフィルタを反映
+  const filterTag = document.getElementById('st-tag-filter')?.value || 'all';
+  const visible = filterTag === 'all' ? items : items.filter(i => i.tag === filterTag);
+
+  // タグ候補を更新
+  const tagSel = document.getElementById('st-tag-filter');
+  if (tagSel) {
+    const existingTags = new Set([...(tagSel.options)].map(o => o.value));
+    const allTags = new Set(items.map(i => i.tag));
+    allTags.forEach(t => {
+      if (!existingTags.has(t)) {
+        const opt = document.createElement('option');
+        opt.value = t; opt.textContent = t;
+        tagSel.appendChild(opt);
+      }
+    });
+  }
+
+  if (!visible.length) {
+    list.innerHTML = '<div class="sph-meta" style="padding:12px">No items with tag "'+filterTag+'".</div>';
+    return;
+  }
+
+  list.innerHTML = visible.map((item, idx) => {
+    const dateStr = new Date(item.t).toLocaleString();
+    const preview = typeof item.v === 'string' ? item.v.slice(0, 60).replace(/\n/g, ' ') : JSON.stringify(item.v).slice(0, 60);
+    const safeKey = String(idx); // use index in _lastList, not raw key in onclick
+    return `<div class="sph-section" style="display:flex;align-items:flex-start;gap:8px;margin-bottom:4px;padding:8px">
+      <div style="flex:1;min-width:0">
+        <div class="sph-body" style="font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${_esc(item.key)}</div>
+        <div class="sph-meta" style="font-size:9px">[${_esc(item.tag)}] ${dateStr}</div>
+        <div class="sph-meta" style="font-size:9px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.7">${_esc(preview)}</div>
+      </div>
+      <div style="display:flex;gap:4px;flex-shrink:0">
+        <button class="sph-btn sph-btn-ok" style="font-size:9px;padding:2px 6px"
+          onclick="sph.call('storage.ui.load_idx',[${safeKey}])">Load</button>
+        <button class="sph-btn" style="font-size:9px;padding:2px 6px;color:var(--sph-err);border-color:var(--sph-err)44"
+          onclick="if(confirm('Delete \\'${_esc(item.key)}\\' ?'))sph.call('storage.remove',['${_escQ(item.key)}'])">✕</button>
+      </div>
+    </div>`;
+  }).join('');
+  // 一覧を保存（index アクセス用）
+  _lastList = visible;
+}
+
+let _lastList = [];
+
+function _esc(s)  { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function _escQ(s) { return String(s).replace(/\\/g,'\\\\').replace(/'/g,"\\'"); }
+
+// ── パネル HTML ───────────────────────────────────────────────────
+const _panel = () => sph.ui.panel('storage',
+  sph.ui.section('Data',
+    '<div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">'+
+    '<select id="st-tag-filter" class="sph-input" style="flex:1" onchange="sph.call(\'storage.ui.refresh\')">'+
+    '<option value="all">All Tags</option></select>'+
+    '<button class="sph-btn" onclick="sph.call(\'storage.export\')">Export JSON</button>'+
+    '<button class="sph-btn" style="color:var(--sph-err)" onclick="if(confirm(\'Clear ALL?\'))sph.call(\'storage.clear\')">Clear</button>'+
+    '</div>'+
+    '<div id="st-list" style="max-height:320px;overflow-y:auto;border-top:1px solid var(--sph-border);padding-top:8px"></div>'
+  )+
+  sph.ui.section('Save Active Tab',
+    sph.ui.row('Key',  sph.ui.input('st-key-in'))+
+    sph.ui.row('Tag',  sph.ui.input('st-tag-in'))+
+    '<div style="margin-top:8px;display:flex;gap:8px">'+
+    '<button class="sph-btn sph-btn-ok" onclick="sph.call(\'storage.ui.save_active\')">Save</button>'+
+    '<button class="sph-btn" onclick="sph.call(\'storage.ui.refresh\')">↺ Refresh</button>'+
+    '</div>'
+  )
+);
+
+// ── sph.mount ─────────────────────────────────────────────────────
+sph.mount('storage', 'STORAGE', '\uD83D\uDCE6', {
+  panel: _panel,
+  commands: [
+    {name:'storage.set',    desc:'Store a value',       args:'key, val, tag?'},
+    {name:'storage.get',    desc:'Retrieve a value',    args:'key → val'},
+    {name:'storage.remove', desc:'Delete a key',        args:'key'},
+    {name:'storage.list',   desc:'List all entries',    args:'tag? → [{key,v,tag,t}]'},
+    {name:'storage.clear',  desc:'Delete all entries',  args:'→ count'},
+    {name:'storage.export', desc:'Download JSON backup'},
+    {name:'storage.ui.refresh', desc:'Refresh storage panel'},
+    {name:'storage.ui.save_active', desc:'Save active tab content to storage'},
+  ],
+  api: {
+    // 公開 CRUD
+    set:    (key, val, tag)  => db.set(key, val, tag),
+    get:    (key)            => db.get(key)?.v ?? null,
+    remove: (key)            => db.remove(key),
+    list:   (tag)            => db.list(tag),
+    clear:  ()               => db.clear(),
+
+    // エクスポート
+    export: () => {
+      const data = db.list();
+      const json = JSON.stringify(data, null, 2);
+      const blob = new Blob([json], { type: 'application/json' });
+      const url  = URL.createObjectURL(blob);
+      // <a> を body に一瞬追加して click → 即削除（CSP に配慮）
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `sph_backup_${Date.now()}.json`;
+      a.style.display = 'none';
+      document.body.appendChild(a);
+      try { a.click(); } finally { document.body.removeChild(a); URL.revokeObjectURL(url); }
+    },
+
+    // UI 用
+    'ui.refresh': () => _refresh(),
+    'ui.save_active': () => {
+      const key = document.getElementById('st-key-in')?.value?.trim();
+      const tag = document.getElementById('st-tag-in')?.value?.trim() || 'manual';
+      if (!key) { sph.call('ide.log', ['[storage] Key is required']); return; }
+      // FIX: sph.get() は引数を渡さず結果を受け取る
+      const active  = sph.get('ide.tab.active');       // → string
+      const content = sph.get('ide.tab.get', [active]); // → string
+      if (db.set(key, content, tag)) {
+        sph.call('ide.log', [`[storage] Saved: ${key} [${tag}]`]);
+      }
+    },
+    'ui.load_idx': (idx) => {
+      const item = _lastList[idx];
+      if (!item) return;
+      // 確認ダイアログは onclick 側で処理済み
+      sph.call('ide.tab.insert', [item.v]);
+      sph.call('ide.log', [`[storage] Loaded: ${item.key}`]);
+    },
+  },
+  on: {
+    'frame-mounted': ({ id }) => { if (id === 'storage') _refresh(); },
+  },
+});
+
+})();
+</script>
+
+<script type="sph/doc" data-doc-ext="storage">
+
+{
+  "title": "STORAGE - Persistent Key-Value Store",
+  "icon": "📦",
+  "description": "localStorage-backed key-value store with tagging, JSON export, and IDE tab content save/load.",
+  "version": "1.0",
+  "api": [
+    {
+      "method": "storage.set",
+      "args": "key: string, val: any, tag?: string",
+      "returns": "boolean",
+      "description": "Store a value. Default tag is 'general'. Returns true on success."
+    },
+    {
+      "method": "storage.get",
+      "args": "key: string",
+      "returns": "any | null",
+      "description": "Retrieve the stored value for a key. Returns null if key not found."
+    },
+    {
+      "method": "storage.remove",
+      "args": "key: string",
+      "returns": "boolean",
+      "description": "Delete a key from storage. Returns true on success."
+    },
+    {
+      "method": "storage.list",
+      "args": "tag?: string",
+      "returns": "StorageEntry[]",
+      "description": "List all entries, optionally filtered by tag. Sorted newest-first."
+    },
+    {
+      "method": "storage.clear",
+      "args": "",
+      "returns": "number",
+      "description": "Delete all entries with the sph:data: prefix. Returns deleted count."
+    },
+    {
+      "method": "storage.export",
+      "args": "",
+      "returns": "void",
+      "description": "Download all entries as a JSON file (sph_backup_<timestamp>.json)."
+    },
+    {
+      "method": "storage.ui.save_active",
+      "args": "",
+      "returns": "void",
+      "description": "Save the content of the active editor tab using the Key/Tag fields in the panel."
+    },
+    {
+      "method": "storage.ui.refresh",
+      "args": "",
+      "returns": "void",
+      "description": "Refresh the storage panel list."
+    }
+  ]
+}
+
+</script>
+
+<script type="sph/sec" data-sec-ext="storage" data-sec-title="STORAGE">
+
+<h2>📦 STORAGE — Persistent Key-Value Store</h2>
+
+<p>STORAGE_EXT provides a simple, reliable key-value store backed by
+<code>localStorage</code>. It wraps all browser storage calls in try/catch
+so it degrades gracefully in sandboxed environments, and supports tagging
+entries for organisation.</p>
+
+<h3>StorageEntry Schema</h3>
+<table>
+  <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>key</td><td>string</td><td>The entry key (without the internal prefix)</td></tr>
+    <tr><td>v</td><td>any</td><td>The stored value</td></tr>
+    <tr><td>tag</td><td>string</td><td>Organisational tag (default: "general")</td></tr>
+    <tr><td>t</td><td>number</td><td>Unix ms timestamp of last write</td></tr>
+  </tbody>
+</table>
+
+<h3>Usage from DSL</h3>
+<pre>
+; Store a value
+storage.set "high_score" 9999 "game"
+
+; Retrieve
+#score = storage.get "high_score"
+
+; Delete
+storage.remove "high_score"
+
+; List all game entries
+#entries = storage.list "game"
+</pre>
+
+<h3>Usage from JavaScript</h3>
+<pre>
+// Store
+sph.call('storage.set', ['theme', {bg:'#000', text:'#fff'}, 'settings']);
+
+// Retrieve
+const theme = sph.call('storage.get', ['theme']);
+
+// Iterate
+const entries = sph.call('storage.list', ['settings']);
+entries.forEach(e => console.log(e.key, e.v));
+
+// Export backup
+sph.call('storage.export');
+</pre>
+
+<h3>Saving Tab Content</h3>
+<p>Open the STORAGE panel, fill in <strong>Key</strong> and (optionally)
+<strong>Tag</strong>, then click <strong>Save</strong>. The content of the
+currently active editor tab is stored. Load it later by clicking the
+<strong>Load</strong> button next to any entry — the content is inserted
+at the current cursor position via <code>ide.tab.insert</code>.</p>
+
+<h3>Tag Filter</h3>
+<p>The panel header shows a tag dropdown that filters the visible entries.
+All tags found in stored data are automatically added to the dropdown.</p>
+
+<h3>Storage Prefix</h3>
+<p>All keys are internally prefixed with <code>sph:data:</code> to avoid
+conflicts with other browser storage users. This prefix is stripped in all
+public APIs.</p>
+
+<h3>Error Handling</h3>
+<p>All <code>localStorage</code> calls are wrapped in try/catch. If the
+browser throws a <code>SecurityError</code> (e.g. sandboxed iframe) or a
+<code>QuotaExceededError</code>, a warning is logged to the console and the
+operation returns <code>false</code> / <code>null</code>.</p>
+
+</script>
+</body>
+</html>

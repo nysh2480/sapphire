@@ -1,0 +1,540 @@
+<!-- ═══ DEV_EXT (Integrated: ERR + DEBUG + TESTER) ═══ -->
+<script type="sph/ext" data-ext-id="dev">
+(function(){
+'use strict';
+
+// ═════════════════════════════════════════════════════════════════
+// ERROR SYSTEM (from ERR_EXT)
+// ═════════════════════════════════════════════════════════════════
+
+const _errMessages={
+  // Compile errors
+  'E001': a=>`[L${a[0]}] Purity Violation: sys.* used inside pure block &${a[1]}`,
+  'E002': ()=>`No entry point — write: -> BlockName`,
+  'E003': a=>`Undefined block: "${a[0]}"`,
+  'E004': a=>`[${a[0]}] Runtime error: ${a[1]}`,
+  'E005': a=>`[${a[0]}] Compile error: ${a[1]}`,
+  'E006': a=>`&pure block "${a[0]}" must not use await — use !action or @loop for async`,
+  // Warnings
+  'W001': a=>`lib "${a[0]}" not found`,
+  'W002': a=>`doc "${a[0]}" not found`,
+  'W003': a=>`Falsy cast: ${a[0]} value "${a[1]}" became ${a[2]}`,
+  'W004': a=>`[L${a[0]}] Unknown syntax: ${a[1]}`,
+  'W005': a=>`${a[0]} slot overflow — increase mem.${a[0]}`,
+  'W006': a=>`@loop "${a[0]}" stopped after ${a[1]} iterations (limit: 1,000,000)`,
+  'W007': a=>`@loop "${a[0]}" stopped after 8s timeout`,
+  'W010': a=>`[L${a[0]}] &pure side-effect in "${a[1]}": ${a[2]}`,
+};
+
+function formatError(obj){
+  if(!obj||!obj.code)return null;
+  const fn=_errMessages[obj.code];
+  const msg=fn?fn(obj.args||[]):`[${obj.code}] ${(obj.args||[]).join(' ')}`;
+  return(obj.phase?`{${obj.phase}} `:'')+msg;
+}
+
+// Listen for errors and warnings
+document.addEventListener('sph:error',({detail})=>{
+  const msg=formatError(detail);
+  sph.call('ide.log.entry',['err', msg||`[${detail.code}]`]);
+});
+document.addEventListener('sph:warn',({detail})=>{
+  const msg=formatError(detail);
+  sph.call('ide.log.entry',['warn', msg||`[${detail.code}]`]);
+});
+document.addEventListener('sph:compile-done',({detail})=>{
+  if(detail.errors.length===0&&detail.warnings.length===0)return;
+  if(detail.errors.length>0)
+    sph.call('ide.log.entry',['err',`Compile errors: ${detail.errors.length}`]);
+  if(detail.warnings.length>0)
+    sph.call('ide.log.entry',['warn',`Warnings: ${detail.warnings.length}`]);
+});
+
+// ═════════════════════════════════════════════════════════════════
+// DEBUG SYSTEM (from DEBUG_EXT)
+// ═════════════════════════════════════════════════════════════════
+
+let _traceEnabled=false;
+let _consoleEnabled=true;
+const MAX_TRACE=200;
+const MAX_CONSOLE=500;
+let _traceLog=[];
+let _consoleLog=[];
+let _activeTab='console'; // 'trace' | 'console' | 'test'
+
+// Console trap
+const _nativeConsole=window.console;
+function _safe(fn){
+  if(typeof fn==='function'){
+    try{return fn.bind(_nativeConsole);}catch(_){return fn;}
+  }
+  return function(){};
+}
+if(_nativeConsole._sphTrapped){
+  const o=_nativeConsole._sphOrig||{};
+  ['log','warn','error','info'].forEach(k=>{
+    if(typeof o[k]==='function')try{_nativeConsole[k]=o[k];}catch(_){}
+  });
+}
+const _origConsole={
+  log:_safe(_nativeConsole.log),
+  warn:_safe(_nativeConsole.warn),
+  error:_safe(_nativeConsole.error),
+  info:_safe(_nativeConsole.info),
+};
+try{_nativeConsole._sphOrig=_origConsole;_nativeConsole._sphTrapped=true;}catch(_){}
+
+function _pushConsole(level,args){
+  if(!_consoleEnabled)return;
+  let msg='';
+  try{msg=args.map(a=>typeof a==='string'?a:JSON.stringify(a)).join(' ');}
+  catch(_){msg=String(args);}
+  _consoleLog.push({t:Date.now(),level,msg});
+  if(_consoleLog.length>MAX_CONSOLE)_consoleLog.shift();
+  _refreshPanel();
+  try{_origConsole[level]?.(...args);}catch(_){}
+}
+
+try{
+  console.log=(...a)=>_pushConsole('log',a);
+  console.warn=(...a)=>_pushConsole('warn',a);
+  console.error=(...a)=>_pushConsole('error',a);
+  console.info=(...a)=>_pushConsole('info',a);
+}catch(_){}
+
+// Window error trap
+window.addEventListener('error',e=>{
+  _pushConsole('error',[`[JS Error] ${e.message}`,`  at ${e.filename}:${e.lineno}:${e.colno}`]);
+});
+window.addEventListener('unhandledrejection',e=>{
+  const msg=e.reason?.message||String(e.reason)||'Unhandled Promise rejection';
+  _pushConsole('error',['[Promise] '+msg]);
+});
+
+// SPH block trace
+document.addEventListener('sph:block-call',({detail})=>{
+  if(!_traceEnabled)return;
+  _traceLog.push({t:Date.now(),ev:'call',name:detail.name,args:detail.args});
+  if(_traceLog.length>MAX_TRACE)_traceLog.shift();
+  if(_activeTab==='trace')_refreshPanel();
+});
+document.addEventListener('sph:block-return',({detail})=>{
+  if(!_traceEnabled)return;
+  _traceLog.push({t:Date.now(),ev:'return',name:detail.name,value:detail.value});
+  if(_traceLog.length>MAX_TRACE)_traceLog.shift();
+  if(_activeTab==='trace')_refreshPanel();
+});
+document.addEventListener('sph:run-start',()=>{
+  if(_traceEnabled){_traceLog=[];}
+  _refreshPanel();
+});
+
+// ═════════════════════════════════════════════════════════════════
+// TEST SYSTEM (from TESTER_EXT)
+// ═════════════════════════════════════════════════════════════════
+
+const _tests=[];
+let _results=[];
+
+async function runAllTests(){
+  _results=[];
+  if(!_tests.length){
+    _results.push({name:'(no tests)',ok:false,msg:'Add tests with dev.test.add(name, fn)'});
+    _refreshPanel();
+    return _results;
+  }
+  const tabGet=sph._reg.get('ide.tab.get');
+  const tabList=sph._reg.get('ide.tab.list');
+  const active=sph._reg.get('ide.tab.active')?.();
+  const src=tabGet?.(active)||'';
+  const tabs=Array.isArray(tabList?.())?tabList():[];
+  const libs=tabs.filter(t=>t.type==='lib').reduce((o,t)=>{o[t.name]=tabGet?.(t.name)||'';return o;},{});
+  const docs=tabs.filter(t=>t.type==='doc'||t.type==='section').reduce((o,t)=>{o[t.name]=tabGet?.(t.name)||'';return o;},{});
+  const compiled=sph.compile(src,libs,docs);
+  if(compiled.errors.length){
+    _results.push({name:'[compile]',ok:false,msg:compiled.errors[0].code});
+    _refreshPanel();
+    return _results;
+  }
+  for(const t of _tests){
+    const output=[];
+    const logFn=(_,m)=>output.push(String(m));
+    try{
+      let passed=true,failMsg='';
+      const assert=(cond,msg)=>{if(!cond){passed=false;failMsg=msg||'assertion failed';throw new Error(failMsg);}};
+      await t.fn({
+        assert,
+        run:async()=>sph.run(compiled.registry,{mem:compiled.memOpts,docs,log:logFn}),
+        compile:(s)=>sph.compile(s,libs,docs),
+        log:output
+      });
+      _results.push({name:t.name,ok:true,log:output});
+    }catch(e){
+      _results.push({name:t.name,ok:false,msg:e.message,log:output});
+    }
+  }
+  _refreshPanel();
+  return _results;
+}
+
+// ═════════════════════════════════════════════════════════════════
+// UI PANEL
+// ═════════════════════════════════════════════════════════════════
+
+function _ts(t){return new Date(t).toISOString().slice(11,23);}
+function _levelColor(lv){
+  return{log:'var(--sph-text)',warn:'var(--sph-warn)',error:'var(--sph-err)',info:'var(--sph-dim)'}[lv]||'var(--sph-text)';
+}
+
+function _refreshPanel(){
+  const el=$id('dev-content');if(!el)return;
+  
+  // Update tab buttons
+  ['console','trace','test'].forEach(tab=>{
+    const btn=$id('dev-tab-'+tab);
+    if(btn)btn.style.color=_activeTab===tab?'var(--sph-accent)':'var(--sph-dim)';
+  });
+  
+  if(_activeTab==='console'){
+    // Console tab
+    const rows=_consoleLog.slice(-100).reverse();
+    el.innerHTML=rows.length?rows.map(r=>
+      `<div style="font-size:var(--sph-sz-md);padding:2px 0;border-bottom:1px solid var(--sph-border)22;color:${_levelColor(r.level)}">`
+      +`<span style="color:var(--sph-dim);margin-right:6px;font-size:var(--sph-sz-sm)">${_ts(r.t)}</span>`
+      +`<span style="margin-right:4px;font-size:var(--sph-sz-sm);opacity:.7">${r.level.toUpperCase()}</span>`
+      +`<span>${r.msg}</span></div>`
+    ).join(''):'<div style="font-size:var(--sph-sz-md);color:var(--sph-dim);padding:8px 0">No console output.</div>';
+  } else if(_activeTab==='trace'){
+    // Trace tab
+    const rows=_traceLog.slice(-100).reverse();
+    el.innerHTML=rows.length?rows.map(r=>{
+      const col=r.ev==='call'?'var(--sph-accent)':'var(--sph-ok)';
+      const detail=r.ev==='call'
+        ?`(${(r.args||[]).map(a=>{try{return JSON.stringify(a);}catch(_){return '?';}}).join(', ')})`
+        :`→ ${(()=>{try{return JSON.stringify(r.value);}catch(_){return '?';}})()}`;
+      return `<div style="font-size:var(--sph-sz-md);padding:2px 0;border-bottom:1px solid var(--sph-border)22">`
+        +`<span style="color:var(--sph-dim);margin-right:6px;font-size:var(--sph-sz-sm)">${_ts(r.t)}</span>`
+        +`<span style="color:${col}">${r.ev==='call'?'▶':'◀'} ${r.name}</span>`
+        +`<span style="color:var(--sph-dim);margin-left:4px;font-size:var(--sph-sz-sm)">${detail}</span></div>`;
+    }).join('')
+    :(_traceEnabled
+      ?'<div style="font-size:var(--sph-sz-md);color:var(--sph-dim);padding:8px 0">Waiting for RUN...</div>'
+      :'<div style="font-size:var(--sph-sz-md);color:var(--sph-dim);padding:8px 0">Enable trace then RUN.</div>');
+  } else if(_activeTab==='test'){
+    // Test tab
+    if(!_results.length){
+      el.innerHTML='<div style="color:var(--sph-dim);font-size:var(--sph-sz-md);padding:8px 0">No results yet. Add tests and run.</div>';
+    } else {
+      const pass=_results.filter(r=>r.ok).length;
+      el.innerHTML=`<div style="font-size:var(--sph-sz-md);margin-bottom:8px;color:${pass===_results.length?'var(--sph-ok)':'var(--sph-err)'}">`
+        +`${pass} / ${_results.length} passed</div>`
+        +_results.map(r=>`<div style="font-size:var(--sph-sz-md);padding:3px 0;border-bottom:1px solid var(--sph-border)44;display:flex;gap:8px">`
+          +`<span style="color:${r.ok?'var(--sph-ok)':'var(--sph-err)'}">${r.ok?'✓':'✗'}</span>`
+          +`<span>${r.name}</span>`
+          +(r.msg?`<span style="color:var(--sph-err);font-size:var(--sph-sz-sm)">${r.msg}</span>`:'')
+          +'</div>').join('');
+    }
+  }
+}
+
+const _tabBtn=(id,label,onclick)=>
+  `<button id="dev-tab-${id}" onclick="${onclick}" class="sph-btn" style="font-size:var(--sph-sz-sm);padding:3px 10px;text-transform:uppercase;letter-spacing:var(--sph-ls-label)">${label}</button>`;
+
+const _devPanel=
+  '<div style="font-size:var(--sph-sz-lg);color:var(--sph-text);padding:16px;height:100%;display:flex;flex-direction:column">'
+  +'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--sph-border)">'
+  +'<span style="font-size:var(--sph-sz-lg);letter-spacing:var(--sph-ls-head);color:var(--sph-accent)">◆ DEV</span>'
+  +'<div style="display:flex;gap:4px">'
+  +_tabBtn('console','Console',"window._devTab('console')")
+  +_tabBtn('trace','Trace',"window._devTab('trace')")
+  +_tabBtn('test','Test',"window._devTab('test')")
+  +'<button onclick="sph.call(\'dev.debug.enable\')" class="sph-btn sph-btn-ok" style="font-size:var(--sph-sz-sm);padding:3px 10px;text-transform:uppercase;letter-spacing:var(--sph-ls-label)">▶ Trace</button>'
+  +'<button onclick="sph.call(\'dev.test.run\')" class="sph-btn sph-btn-ok" style="font-size:var(--sph-sz-sm);padding:3px 10px;text-transform:uppercase;letter-spacing:var(--sph-ls-label)">▶ Test</button>'
+  +'<button onclick="sph.call(\'dev.clear\')" class="sph-btn" style="font-size:var(--sph-sz-sm);padding:3px 10px;text-transform:uppercase;letter-spacing:var(--sph-ls-label)">CLR</button>'
+  +'<button onclick="sph.call(\'ide.frame.unmount\')" class="sph-btn" style="font-size:var(--sph-sz-sm);padding:3px 10px;text-transform:uppercase;letter-spacing:var(--sph-ls-label)">← EXT</button>'
+  +'</div></div>'
+  +'<div id="dev-content" style="flex:1;overflow-y:auto;font-size:var(--sph-sz-md);line-height:1.6"></div>'
+  +'</div>';
+
+window._devTab=function(tab){
+  _activeTab=tab;
+  _refreshPanel();
+};
+
+// ═════════════════════════════════════════════════════════════════
+// API & MOUNT
+// ═════════════════════════════════════════════════════════════════
+
+sph.mount('dev','DEV','🛠',{
+  panel:()=>_devPanel,
+  commands:[
+    // Error formatting
+    {name:'dev.err.format',desc:'Format error code to message',args:'errorObj → string'},
+    // Debug
+    {name:'dev.debug.enable',desc:'Enable block trace'},
+    {name:'dev.debug.disable',desc:'Disable block trace'},
+    {name:'dev.debug.is_enabled',desc:'Check if trace is enabled',args:'→ boolean'},
+    {name:'dev.debug.trace_log',desc:'Get trace log',args:'→ array'},
+    {name:'dev.debug.console_log',desc:'Get console log',args:'→ array'},
+    // Test
+    {name:'dev.test.add',desc:'Register a test case',args:'name, fn: async({assert,run,compile,log})=>void'},
+    {name:'dev.test.run',desc:'Run all tests',args:'→ [{name,ok,msg?,log}]'},
+    {name:'dev.test.results',desc:'Return last test results',args:'→ [{name,ok,msg?,log}]'},
+    {name:'dev.test.clear_tests',desc:'Clear all registered tests'},
+    // General
+    {name:'dev.clear',desc:'Clear all logs and results'},
+  ],
+  api:{
+    // Error
+    err:{format:formatError},
+    // Debug
+    debug:{
+      enable:()=>{_traceEnabled=true;_refreshPanel();},
+      disable:()=>{_traceEnabled=false;_refreshPanel();},
+      is_enabled:()=>_traceEnabled,
+      trace_log:()=>[..._traceLog],
+      console_log:()=>[..._consoleLog],
+    },
+    // Test
+    test:{
+      add:(name,fn)=>{_tests.push({name,fn});},
+      run:runAllTests,
+      results:()=>[..._results],
+      clear_tests:()=>{_tests.length=0;_results=[];_refreshPanel();},
+    },
+    // General
+    clear:()=>{_traceLog=[];_consoleLog=[];_results=[];_refreshPanel();},
+  },
+  on:{'frame-mounted':({id})=>{if(id==='dev')setTimeout(_refreshPanel,50);}},
+});
+
+// Also register flat API for backward compatibility
+sph.register('err.format',formatError);
+sph.register('debug.enable',()=>{_traceEnabled=true;_refreshPanel();});
+sph.register('debug.disable',()=>{_traceEnabled=false;_refreshPanel();});
+sph.register('debug.is_enabled',()=>_traceEnabled);
+sph.register('debug.trace_log',()=>[..._traceLog]);
+sph.register('debug.console_log',()=>[..._consoleLog]);
+sph.register('debug.clear',()=>{_traceLog=[];_consoleLog=[];_refreshPanel();});
+sph.register('test.add',(name,fn)=>{_tests.push({name,fn});});
+sph.register('test.run_all',runAllTests);
+sph.register('test.results',()=>[..._results]);
+sph.register('test.clear',()=>{_tests.length=0;_results=[];_refreshPanel();});
+
+})();
+</script>
+
+<!-- ═══ DEV_EXT Documentation ═══ -->
+<script type="sph/doc" data-doc-ext="dev">
+{
+  "title": "DEV - Development Tools",
+  "icon": "🛠",
+  "description": "Integrated development tools: error formatting, debugging console/trace, and unit testing.",
+  "version": "1.0",
+  "api": [
+    {
+      "method": "dev.err.format",
+      "args": "errorObj",
+      "returns": "string",
+      "description": "Format error/warning code object to human-readable message"
+    },
+    {
+      "method": "dev.debug.enable",
+      "args": "",
+      "returns": "void",
+      "description": "Enable block execution trace (records sph:block-call/return events)"
+    },
+    {
+      "method": "dev.debug.disable",
+      "args": "",
+      "returns": "void",
+      "description": "Disable block execution trace"
+    },
+    {
+      "method": "dev.debug.is_enabled",
+      "args": "",
+      "returns": "boolean",
+      "description": "Check if trace is currently enabled"
+    },
+    {
+      "method": "dev.debug.trace_log",
+      "args": "",
+      "returns": "array",
+      "description": "Get copy of trace log (max 200 entries)"
+    },
+    {
+      "method": "dev.debug.console_log",
+      "args": "",
+      "returns": "array",
+      "description": "Get copy of console log (max 500 entries)"
+    },
+    {
+      "method": "dev.test.add",
+      "args": "name, testFn",
+      "returns": "void",
+      "description": "Register a unit test. testFn receives {assert, run, compile, log}"
+    },
+    {
+      "method": "dev.test.run",
+      "args": "",
+      "returns": "Promise<array>",
+      "description": "Run all registered tests against active DSL tab"
+    },
+    {
+      "method": "dev.test.results",
+      "args": "",
+      "returns": "array",
+      "description": "Get results from last test run"
+    },
+    {
+      "method": "dev.test.clear_tests",
+      "args": "",
+      "returns": "void",
+      "description": "Clear all registered tests and results"
+    },
+    {
+      "method": "dev.clear",
+      "args": "",
+      "returns": "void",
+      "description": "Clear all logs (console + trace) and test results"
+    }
+  ]
+}
+</script>
+
+<!-- ═══ DEV_EXT Detailed Section ═══ -->
+<script type="sph/sec" data-sec-ext="dev" data-sec-title="Development Tools">
+<h2>DEV - Development Tools</h2>
+
+<p>DEV_EXT provides integrated development tools combining error formatting, debugging capabilities, and unit testing in a single unified interface.</p>
+
+<h3>Components</h3>
+
+<h4>1. Error System</h4>
+<p>Automatically converts error codes (E001-E006) and warnings (W001-W010) to human-readable messages. Integrates with IDE log to display formatted errors during compile and runtime.</p>
+
+<table>
+  <thead>
+    <tr><th>Code</th><th>Type</th><th>Description</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>E001</td><td>Error</td><td>Purity violation in &pure block</td></tr>
+    <tr><td>E002</td><td>Error</td><td>No entry point defined</td></tr>
+    <tr><td>E003</td><td>Error</td><td>Undefined block reference</td></tr>
+    <tr><td>E004</td><td>Error</td><td>Runtime error in block execution</td></tr>
+    <tr><td>E005</td><td>Error</td><td>Compile error in block</td></tr>
+    <tr><td>E006</td><td>Error</td><td>Await in &pure block</td></tr>
+    <tr><td>W003</td><td>Warning</td><td>Falsy value type cast</td></tr>
+    <tr><td>W006</td><td>Warning</td><td>@loop iteration limit reached</td></tr>
+    <tr><td>W007</td><td>Warning</td><td>@loop timeout (8s)</td></tr>
+  </tbody>
+</table>
+
+<h4>2. Debug System</h4>
+
+<p><strong>Console Tab:</strong> Captures all console.log/warn/error/info calls plus JavaScript errors and unhandled promise rejections. Stores up to 500 entries with timestamps.</p>
+
+<p><strong>Trace Tab:</strong> Records block execution flow when enabled. Shows block calls (▶) and returns (◀) with arguments and return values. Stores up to 200 entries. Auto-clears on RUN start.</p>
+
+<h4>3. Test System</h4>
+
+<p>Unit testing framework for DSL code. Register tests with <code>dev.test.add(name, testFn)</code> and run all with <code>dev.test.run()</code>.</p>
+
+<p><strong>Test Function API:</strong></p>
+<table>
+  <thead>
+    <tr><th>Property</th><th>Type</th><th>Description</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>assert</td><td>function</td><td>assert(condition, message) - throws on failure</td></tr>
+    <tr><td>run</td><td>async function</td><td>Execute compiled DSL and return result</td></tr>
+    <tr><td>compile</td><td>function</td><td>Compile DSL source to registry</td></tr>
+    <tr><td>log</td><td>array</td><td>Output log from DSL execution</td></tr>
+  </tbody>
+</table>
+
+<h3>Usage Examples</h3>
+
+<h4>Error Formatting</h4>
+<pre>
+const err = {code: 'E001', args: [15, 'calculate'], phase: 'compile'};
+const msg = sph.call('dev.err.format', [err]);
+// → "{compile} [L15] Purity Violation: sys.* used inside pure block &calculate"
+</pre>
+
+<h4>Debugging</h4>
+<pre>
+// Enable trace
+sph.call('dev.debug.enable');
+
+// Run DSL (trace records all block calls)
+
+// Check trace log
+const trace = sph.call('dev.debug.trace_log');
+
+// Check console output
+const logs = sph.call('dev.debug.console_log');
+</pre>
+
+<h4>Unit Testing</h4>
+<pre>
+// Register test
+sph.call('dev.test.add', ['Math test', async ({assert, run}) => {
+  const result = await run();
+  assert(result === 42, 'Expected 42');
+}]);
+
+// Run all tests
+const results = await sph.call('dev.test.run');
+console.log(results); // [{name: 'Math test', ok: true}]
+</pre>
+
+<h3>UI Layout</h3>
+
+<p>DEV panel features three tabs accessible via top buttons:</p>
+<ul>
+  <li><strong>Console:</strong> Real-time console output with timestamps and color-coded log levels</li>
+  <li><strong>Trace:</strong> Block execution flow (requires trace enabled)</li>
+  <li><strong>Test:</strong> Test results showing pass/fail status and error messages</li>
+</ul>
+
+<p>Control buttons:</p>
+<ul>
+  <li><strong>▶ Trace:</strong> Enable block trace</li>
+  <li><strong>▶ Test:</strong> Run all registered tests</li>
+  <li><strong>CLR:</strong> Clear all logs and results</li>
+  <li><strong>← EXT:</strong> Return to EXT management</li>
+</ul>
+
+<h3>Backward Compatibility</h3>
+
+<p>DEV_EXT maintains full compatibility with legacy APIs:</p>
+
+<table>
+  <thead>
+    <tr><th>Legacy API</th><th>New API</th><th>Status</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>err.format</td><td>dev.err.format</td><td>Both work</td></tr>
+    <tr><td>debug.enable</td><td>dev.debug.enable</td><td>Both work</td></tr>
+    <tr><td>debug.disable</td><td>dev.debug.disable</td><td>Both work</td></tr>
+    <tr><td>test.add</td><td>dev.test.add</td><td>Both work</td></tr>
+    <tr><td>test.run_all</td><td>dev.test.run</td><td>Both work</td></tr>
+    <tr><td>test.clear</td><td>dev.test.clear_tests</td><td>Both work</td></tr>
+  </tbody>
+</table>
+
+<h3>Performance</h3>
+
+<table>
+  <thead>
+    <tr><th>Feature</th><th>Limit</th><th>Behavior</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Console log</td><td>500 entries</td><td>FIFO, oldest dropped first</td></tr>
+    <tr><td>Trace log</td><td>200 entries</td><td>FIFO, oldest dropped first</td></tr>
+    <tr><td>Test storage</td><td>Unlimited</td><td>Manual clear with dev.test.clear_tests</td></tr>
+    <tr><td>Trace overhead</td><td>Minimal</td><td>~0.1ms per block call when enabled</td></tr>
+  </tbody>
+</table>
+</script>
