@@ -1,0 +1,2224 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="sph-ext" content="daw">
+</head><body>
+<script type="sph/ext" data-ext-id="daw">
+(function(){
+'use strict';
+// ── DAW EXT v9 ── Track(Vol/Pan/FX) + Wave + Note + Master ─────
+
+if(!window._D){
+  window._D={
+    waves:[{id:'w0',name:'Sine',
+      layers:[{type:'sine',fm:{on:false,ratio:2,depth:100},
+               noise:{mix:0},adsr:{a:.01,d:.1,s:.7,r:.3},
+               filt:{type:'none',freq:2000,q:1}}],
+      chain:[]}],
+    notes:[{id:'n0',name:'Note 1',bpm:120,bars:4,events:[]}],
+    tracks:[
+      {id:'master',name:'Master',isMaster:true,
+       vol:1,pan:0,mute:false,
+       fx:[{type:'reverb',on:false,wet:.3,decay:2},
+           {type:'echo',on:false,wet:.3,delay:.25,feedback:.4},
+           {type:'eq',on:false,low:0,mid:0,high:0}]},
+      {id:'t0',name:'Track 1',waveId:'w0',noteId:'n0',
+       color:'#4c8ef5',vol:.8,pan:0,mute:false,
+       audioCache:null,cacheSource:null,
+       fx:[{type:'reverb',on:false,wet:.3,decay:2},
+           {type:'echo',on:false,wet:.3,delay:.25,feedback:.4},
+           {type:'distortion',on:false,amount:50}]},
+    ],
+    tab:'track',sw:0,sn:0,ctx:null,
+    // automation[noteId] = [{cell, param, value}, ...]
+    automation:{},
+    autoParam:'volume',  // currently selected param in the lane
+    _rec:null, _recStop:null,  // WebM recording state
+    exportFormat:'both',  // 'both' | 'wav' | 'webm'
+    autoTrack:'master', // 'master' or trackId — which track's automation is shown
+    trackGains:{},      // trackId → {gain:GainNode, pan:StereoPannerNode}
+    masterGain:null,masterPan:null,
+    _openTrk:null,
+  };
+}
+const D=window._D;
+
+// ── Audio engine ────────────────────────────────────────────────
+function ac(){
+  if(!D.ctx)D.ctx=new(window.AudioContext||window.webkitAudioContext)();
+  if(D.ctx.state==='suspended')D.ctx.resume();
+  return D.ctx;
+}
+function getMasterDest(){
+  const ctx=ac();
+  if(!D.masterGain||D.masterGain.context!==ctx){
+    D.masterGain=ctx.createGain();
+    D.masterPan=ctx.createStereoPanner();
+    const tr=D.tracks[0];
+    D.masterGain.gain.value=tr.vol;
+    D.masterPan.pan.value=tr.pan;
+    // master EQ (3-band)
+    const eq=D.tracks[0].fx.find(f=>f.type==='eq');
+    if(eq&&eq.on){
+      const low=ctx.createBiquadFilter();low.type='lowshelf';low.frequency.value=300;low.gain.value=eq.low;
+      const mid=ctx.createBiquadFilter();mid.type='peaking';mid.frequency.value=1000;mid.gain.value=eq.mid;
+      const hi=ctx.createBiquadFilter();hi.type='highshelf';hi.frequency.value=4000;hi.gain.value=eq.high;
+      D.masterGain.connect(D.masterPan).connect(low).connect(mid).connect(hi).connect(ctx.destination);
+    } else {
+      D.masterGain.connect(D.masterPan);D.masterPan.connect(ctx.destination);
+    }
+  }
+  return D.masterGain;
+}
+function getTrackGain(trackId){
+  const ctx=ac();
+  const existing=D.trackGains[trackId];
+  if(existing&&existing.gain.context===ctx)return existing;
+  const tr=D.tracks.find(t=>t.id===trackId);
+  const g=ctx.createGain();
+  const p=ctx.createStereoPanner();
+  // 3-band EQ per track
+  const lo=ctx.createBiquadFilter();lo.type='lowshelf'; lo.frequency.value=300; lo.gain.value=0;
+  const md=ctx.createBiquadFilter();md.type='peaking';  md.frequency.value=1000;md.gain.value=0;
+  const hi=ctx.createBiquadFilter();hi.type='highshelf';hi.frequency.value=4000;hi.gain.value=0;
+  g.gain.value=tr?tr.vol:1;
+  p.pan.value=tr?tr.pan:0;
+  // chain: gain → pan → lo → mid → hi → master
+  g.connect(p);p.connect(lo);lo.connect(md);md.connect(hi);hi.connect(getMasterDest());
+  D.trackGains[trackId]={gain:g,pan:p,lo,md,hi};
+  return D.trackGains[trackId];
+}
+function applyFX(ctx,src,fx,dest){
+  let node=src;
+  for(const f of fx){
+    if(!f.on)continue;
+    if(f.type==='reverb'){
+      const conv=ctx.createConvolver();
+      const len=ctx.sampleRate*f.decay;
+      const buf=ctx.createBuffer(2,len,ctx.sampleRate);
+      for(let c=0;c<2;c++){const d=buf.getChannelData(c);for(let i=0;i<len;i++)d[i]=(Math.random()*2-1)*Math.pow(1-i/len,2);}
+      conv.buffer=buf;
+      const dry=ctx.createGain(),wet=ctx.createGain();
+      dry.gain.value=1-f.wet;wet.gain.value=f.wet;
+      node.connect(dry);node.connect(conv);conv.connect(wet);
+      const out=ctx.createGain();dry.connect(out);wet.connect(out);
+      node=out;
+    } else if(f.type==='echo'){
+      const delay=ctx.createDelay(2);delay.delayTime.value=f.delay;
+      const fb=ctx.createGain();fb.gain.value=f.feedback;
+      const dry=ctx.createGain(),wet=ctx.createGain();
+      dry.gain.value=1-f.wet;wet.gain.value=f.wet;
+      node.connect(dry);node.connect(delay);delay.connect(fb);fb.connect(delay);delay.connect(wet);
+      const out=ctx.createGain();dry.connect(out);wet.connect(out);node=out;
+    } else if(f.type==='distortion'){
+      const ws=ctx.createWaveShaper();
+      const k=f.amount;const n=256;const curve=new Float32Array(n);
+      for(let i=0;i<n;i++){const x=i*2/n-1;curve[i]=((Math.PI+k)*x)/(Math.PI+k*Math.abs(x));}
+      ws.curve=curve;ws.oversample='4x';node.connect(ws);node=ws;
+    }
+  }
+  node.connect(dest);
+}
+function mkNoise(ctx,dur,type){
+  const len=Math.ceil(ctx.sampleRate*(dur+.3));
+  const b=ctx.createBuffer(1,len,ctx.sampleRate);
+  const d=b.getChannelData(0);
+  if(!type||type==='white'){
+    for(let i=0;i<len;i++)d[i]=Math.random()*2-1;
+  } else if(type==='pink'){
+    // Paul Kellett's pink noise approximation (6-pole)
+    let b0=0,b1=0,b2=0,b3=0,b4=0,b5=0,b6=0;
+    for(let i=0;i<len;i++){
+      const w=Math.random()*2-1;
+      b0=.99886*b0+w*.0555179;b1=.99332*b1+w*.0750759;
+      b2=.96900*b2+w*.1538520;b3=.86650*b3+w*.3104856;
+      b4=.55000*b4+w*.5329522;b5=-.7616*b5-w*.0168980;
+      d[i]=(b0+b1+b2+b3+b4+b5+b6+w*.5362)*0.11;
+      b6=w*.115926;
+    }
+  } else if(type==='brown'){
+    // Brown/red noise: integration of white
+    let last=0;
+    for(let i=0;i<len;i++){
+      const w=Math.random()*2-1;
+      last=(last+.02*w)/1.02;
+      d[i]=last*3.5; // normalize
+    }
+  }
+  const s=ctx.createBufferSource();s.buffer=b;return s;
+}
+function playWave(wave,hz,t0,dur,vel,trackFx,trackId){
+  const ctx=ac();
+  const nvel=Math.min(1,vel||1); // normalized velocity 0-1
+
+  // ── per-layer synthesis ──────────────────────────────────────
+  // collect all layer outputs into a mix gain → amp (ADSR)
+  const mix=ctx.createGain();mix.gain.value=1;
+  const amp=ctx.createGain();
+  // ADSR from first layer
+  const l0=wave.layers[0];
+  const{a,d,s,r}=l0.adsr;
+  const v=.5*nvel;
+  amp.gain.setValueAtTime(0,t0);
+  amp.gain.linearRampToValueAtTime(v,t0+Math.max(.001,a));
+  amp.gain.linearRampToValueAtTime(s*v,t0+a+Math.max(.001,d));
+  amp.gain.setValueAtTime(s*v,t0+dur-Math.max(.001,r));
+  amp.gain.linearRampToValueAtTime(0,t0+dur);
+
+  // ── filter chain (per layer, slope -12 or -24) ──────────────
+  function makeFilterChain(ctx,ly,baseFreq,velFiltMod){
+    const flt=ly.filt||{type:'none',slope:-12,freq:2000,q:1,drive:0};
+    if(flt.type==='none')return null;
+    const cutoff=Math.max(20,Math.min(20000, flt.freq*(1+velFiltMod*nvel)));
+    const slope=flt.slope||-12;
+    // drive: soft clipper before filter
+    let chain=null;
+    if((flt.drive||0)>0){
+      const driveGain=ctx.createGain();driveGain.gain.value=1+flt.drive*4;
+      const ws=ctx.createWaveShaper();
+      const k=flt.drive*200;const n=256;const cv=new Float32Array(n);
+      for(let i=0;i<n;i++){const x=i*2/n-1;cv[i]=((Math.PI+k)*x)/(Math.PI+k*Math.abs(x));}
+      ws.curve=cv;ws.oversample='4x';
+      driveGain.connect(ws);chain={in:driveGain,out:ws};
+    }
+    // -12dB/oct = 1 biquad, -24dB/oct = 2 biquads in series
+    const stages=slope<=-24?2:1;
+    let last=chain?chain.out:null;
+    const firstF=ctx.createBiquadFilter();
+    firstF.type=flt.type;firstF.frequency.value=cutoff;firstF.Q.value=flt.q||1;
+    if(last)last.connect(firstF); else last=firstF;
+    if(!chain)chain={in:firstF,out:firstF};else chain.out=firstF;
+    if(stages===2){
+      const f2=ctx.createBiquadFilter();
+      f2.type=flt.type;f2.frequency.value=cutoff;f2.Q.value=(flt.q||1)*.7;
+      firstF.connect(f2);chain.out=f2;
+    }
+    return chain;
+  }
+
+  for(const ly of wave.layers){
+    const vm=ly.velocityMapping||{gain:1,filtFreq:0};
+    const layerVel=nvel*((vm.gain||1)*.5+(1-(vm.gain||1))*.5*(1-nvel));
+
+    // noise layer
+    if(ly.type==='noise'){
+      const ng=ctx.createGain();ng.gain.value=(ly.noise?.mix||0)*layerVel;
+      const n=mkNoise(ctx,dur,ly.noise?.type||'white');
+      const fc=makeFilterChain(ctx,ly,hz,vm.filtFreq||0);
+      if(fc){n.connect(fc.in);fc.out.connect(ng);}else n.connect(ng);
+      ng.connect(mix);n.start(t0);n.stop(t0+dur+.1);
+      continue;
+    }
+
+    // oscillator layer
+    const osc=ctx.createOscillator();
+    osc.type=['sine','square','sawtooth','triangle'].includes(ly.type)?ly.type:'sine';
+    osc.frequency.value=hz;
+    // detune (cents)
+    if(ly.detune)osc.detune.value=ly.detune;
+
+    // FM modulation
+    if(ly.fm?.on&&ly.fm.depth>0){
+      const m=ctx.createOscillator(),mg=ctx.createGain();
+      m.frequency.value=hz*ly.fm.ratio;mg.gain.value=ly.fm.depth;
+      m.connect(mg);mg.connect(osc.frequency);m.start(t0);m.stop(t0+dur+.1);
+    }
+
+    // AM / Ring modulation
+    // AM: carrier * (1 + depth/100 * modulator)  → Ring: depth=100 → bipolar
+    let oscOut=osc;
+    if(ly.am?.on&&(ly.am.depth||0)>0){
+      const amMod=ctx.createOscillator();
+      amMod.frequency.value=hz*(ly.am.ratio||1);
+      const amDepth=ctx.createGain();amDepth.gain.value=ly.am.depth/100;
+      const amDC=ctx.createConstantSource?ctx.createConstantSource():null;
+      const amMix=ctx.createGain();amMix.gain.value=1;
+      if(amDC&&ly.am.depth<100){
+        // AM: add DC offset so signal stays positive
+        amDC.offset.value=1-(ly.am.depth/100);
+        amDC.start(t0);amDC.stop(t0+dur+.1);
+        amDC.connect(amMix);
+      }
+      amMod.connect(amDepth);amDepth.connect(amMix);
+      // multiply osc by amMix using GainNode trick
+      const ringGain=ctx.createGain();ringGain.gain.value=0;
+      amMix.connect(ringGain.gain);
+      osc.connect(ringGain);
+      oscOut=ringGain;
+      amMod.start(t0);amMod.stop(t0+dur+.1);
+    }
+
+    // noise mix on oscillator layer
+    if((ly.noise?.mix||0)>0){
+      const ng=ctx.createGain();ng.gain.value=ly.noise.mix*.3*layerVel;
+      const n=mkNoise(ctx,dur,ly.noise?.type||'white');n.connect(ng);ng.connect(mix);
+      n.start(t0);n.stop(t0+dur+.1);
+    }
+
+    // filter chain per layer
+    const fc=makeFilterChain(ctx,ly,hz,vm.filtFreq||0);
+    if(fc){oscOut.connect(fc.in);fc.out.connect(mix);}
+    else oscOut.connect(mix);
+
+    osc.start(t0);osc.stop(t0+dur+.1);
+  }
+
+  mix.connect(amp);
+  const dest=trackId?getTrackGain(trackId).gain:getMasterDest();
+  if(trackFx&&trackFx.some(f=>f.on)){
+    applyFX(ctx,amp,trackFx,dest);
+  } else {
+    amp.connect(dest);
+  }
+}
+function midiHz(m){return 440*Math.pow(2,(m-69)/12);}
+const PN=['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+function pname(p){return PN[p%12]+(Math.floor(p/12)-1);}
+// cellToSec: セル番号→秒 (オートメーションによるBPM変化対応)
+function cellToSec(cell, baseBpm, bpmAutos) {
+  // bpmAutos: [{cell, value}] sorted by cell
+  const sorted=(bpmAutos||[]).filter(a=>a.param==='bpm').sort((a,b)=>a.cell-b.cell);
+  let t=0, bpm=baseBpm, prevCell=0;
+  for(const pt of sorted){
+    if(pt.cell>=cell)break;
+    t+=(pt.cell-prevCell)*(60/bpm)/4;
+    bpm=pt.value;prevCell=pt.cell;
+  }
+  t+=(cell-prevCell)*(60/bpm)/4;
+  return t;
+}
+
+// applyAutomation: オートメーションポイントを AudioContext にスケジューリング
+function applyAutomation(noteId, baseBpm, startTime){
+  const ctx=ac();
+  const autos=D.automation[noteId]||[];
+  // --- Master automation (trackId===undefined/null/'master') ---
+  const masterAutos=autos.filter(a=>!a.trackId||a.trackId==='master');
+  const bpmAutos=masterAutos.filter(a=>a.param==='bpm').sort((a,b)=>a.cell-b.cell);
+  const mParams=['volume','pan','lo','mid','hi','bpm'];
+  for(const pid of mParams){
+    const pts=masterAutos.filter(a=>a.param===pid).sort((a,b)=>a.cell-b.cell);
+    if(!pts.length)continue;
+    const pd=AUTO_PARAMS.find(p=>p.id===pid);
+    const isStep=pd?.interp==='step';
+    let prevVal=pd?pd.def:1, prevT=startTime;
+    for(let i=0;i<pts.length;i++){
+      const pt=pts[i];
+      const t=startTime+cellToSec(pt.cell,baseBpm,autos);
+      if(pid==='volume'&&D.masterGain){
+        if(isStep) D.masterGain.gain.setValueAtTime(pt.value,t);
+        else{D.masterGain.gain.setValueAtTime(prevVal,prevT);D.masterGain.gain.linearRampToValueAtTime(pt.value,t);}
+      } else if(pid==='pan'&&D.masterPan){
+        if(isStep) D.masterPan.pan.setValueAtTime(pt.value,t);
+        else{D.masterPan.pan.setValueAtTime(prevVal,prevT);D.masterPan.pan.linearRampToValueAtTime(pt.value,t);}
+      }
+      // lo/mid/hi master EQ: schedule on rebuilt nodes next play — mark dirty
+      prevVal=pt.value; prevT=t;
+    }
+  }
+  // --- Per-track automation (trackId === tr.id) ---
+  const trackIds=[...new Set(autos.filter(a=>a.trackId&&a.trackId!=='master').map(a=>a.trackId))];
+  for(const tid of trackIds){
+    const tg=getTrackGain(tid);
+    const tAutos=autos.filter(a=>a.trackId===tid);
+    const tParams=['volume','pan','lo','mid','hi'];
+    for(const pid of tParams){
+      const pts=tAutos.filter(a=>a.param===pid).sort((a,b)=>a.cell-b.cell);
+      if(!pts.length)continue;
+      const pd=AUTO_PARAMS.find(p=>p.id===pid);
+      const tr=D.tracks.find(t=>t.id===tid);
+      // initial value: track setting or param default
+      const initVal={volume:tr?tr.vol:1,pan:tr?tr.pan:0,lo:0,mid:0,hi:0}[pid]??0;
+      const nodeMap={
+        volume:tg.gain.gain, pan:tg.pan.pan,
+        lo:tg.lo.gain,       mid:tg.md.gain, hi:tg.hi.gain
+      };
+      const node=nodeMap[pid];if(!node)continue;
+      node.setValueAtTime(initVal,startTime);
+      let prevVal=initVal, prevT=startTime;
+      for(const pt of pts){
+        const t=startTime+cellToSec(pt.cell,baseBpm,autos);
+        // lerp: anchor prev value at prev time, ramp to new value
+        node.setValueAtTime(prevVal,prevT);
+        node.linearRampToValueAtTime(pt.value,t);
+        prevVal=pt.value; prevT=t;
+      }
+    }
+  }
+}
+
+function playNote(ni,trackFx,trackId){
+  const n=D.notes[ni];if(!n||!n.events.length)return;
+  const now=ac().currentTime+.1;
+  const autos=D.automation[n.id]||[];
+  // Apply automation scheduling
+  applyAutomation(n.id,n.bpm,now);
+  for(const ev of n.events){
+    if(trackId&&ev.trackId&&ev.trackId!==trackId)continue;
+    const w=D.waves.find(w=>w.id===ev.waveId)||D.waves[0];
+    // use BPM-aware timing
+    const t=now+cellToSec(ev.start,n.bpm,autos);
+    const dur=cellToSec(ev.start+ev.dur,n.bpm,autos)-cellToSec(ev.start,n.bpm,autos);
+    playWave(w,midiHz(ev.pitch),t,Math.max(0.01,dur),ev.vel/127,trackFx||[],ev.trackId||null);
+  }
+}
+
+// ── Save/Load ───────────────────────────────────────────────────
+function save(){
+  // キャッシュを除外してトラックを保存
+  const tracksToSave = D.tracks.map(tr => {
+    const {audioCache, cacheSource, ...rest} = tr;
+    return rest;
+  });
+  const j=JSON.stringify({v:10,waves:D.waves,notes:D.notes,tracks:tracksToSave,automation:D.automation},null,2);
+  const el=document.querySelector('script[type="sph/tab"][data-tab-name="daw_data"]');
+  if(el)el.textContent=j;else sph._reg.get('ide.tab.add')?.('lib','daw_data',j);
+  sph.call('ide.log',['[DAW] saved']);
+}
+function load(){
+  const src=sph._reg.get('ide.tab.get')?.('daw_data');if(!src)return false;
+  try{const d=JSON.parse(src);
+    if(d.waves)D.waves=d.waves;
+    if(d.notes)D.notes=d.notes;
+    if(d.tracks){
+      // キャッシュフィールドを追加
+      D.tracks=d.tracks.map(tr=>({...tr,audioCache:null,cacheSource:null}));
+    }
+    if(d.automation)D.automation=d.automation;
+    D.masterGain=null;return true;
+  }catch(e){sph.call('ide.log',['[DAW] load:'+e.message]);return false;}
+}
+// ── Export ───────────────────────────────────────────────────────
+
+// --- WAV writer: AudioBuffer → Blob ---
+function audioBufferToWav(buf){
+  const numCh=buf.numberOfChannels,sr=buf.sampleRate,len=buf.length;
+  const bytesPerSample=2,blockAlign=numCh*bytesPerSample;
+  const dataLen=len*blockAlign;
+  const ab=new ArrayBuffer(44+dataLen);
+  const view=new DataView(ab);
+  const str=(s,o)=>{for(let i=0;i<s.length;i++)view.setUint8(o+i,s.charCodeAt(i));};
+  str('RIFF',0);view.setUint32(4,36+dataLen,true);str('WAVE',8);
+  str('fmt ',12);view.setUint32(16,16,true);view.setUint16(20,1,true);
+  view.setUint16(22,numCh,true);view.setUint32(24,sr,true);
+  view.setUint32(28,sr*blockAlign,true);view.setUint16(32,blockAlign,true);
+  view.setUint16(34,16,true);str('data',36);view.setUint32(40,dataLen,true);
+  let off=44;
+  for(let i=0;i<len;i++){
+    for(let ch=0;ch<numCh;ch++){
+      const s=Math.max(-1,Math.min(1,buf.getChannelData(ch)[i]));
+      view.setInt16(off,s<0?s*0x8000:s*0x7fff,true);off+=2;
+    }
+  }
+  return new Blob([ab],{type:'audio/wav'});
+}
+
+// --- Offline render: play all tracks through OfflineAudioContext ---
+async function renderOffline(sampleRate=44100){
+  // total duration: Bars length × BPM (fixed, not dependent on events)
+  let maxSec=0;
+  let maxDecay=0;
+  for(const tr of D.tracks){
+    if(tr.isMaster||tr.mute)continue;
+    const n=D.notes.find(x=>x.id===tr.noteId);if(!n)continue;
+    const autos=D.automation[n.id]||[];
+    // use note.bars × BPM as authoritative length
+    const barsSec=cellToSec(n.bars*16,n.bpm,autos);
+    if(barsSec>maxSec)maxSec=barsSec;
+    // measure FX tail: reverb decay + echo feedback decay
+    for(const f of tr.fx){
+      if(!f.on)continue;
+      if(f.type==='reverb') maxDecay=Math.max(maxDecay,f.decay||2);
+      if(f.type==='echo'){
+        // echo fades to silence in about -60dB: n_repeats = -60/20/log10(feedback)
+        const fb=Math.max(0.01,Math.min(0.99,f.feedback||0.4));
+        const nRep=Math.ceil(-3/Math.log10(fb)); // repeats to -60dB
+        maxDecay=Math.max(maxDecay,(f.delay||0.25)*nRep);
+      }
+    }
+  }
+  // also check master FX
+  for(const f of D.tracks[0].fx){
+    if(!f.on)continue;
+    if(f.type==='reverb') maxDecay=Math.max(maxDecay,f.decay||2);
+    if(f.type==='echo'){
+      const fb=Math.max(0.01,Math.min(0.99,f.feedback||0.4));
+      maxDecay=Math.max(maxDecay,(f.delay||0.25)*Math.ceil(-3/Math.log10(fb)));
+    }
+  }
+  if(maxSec<=0){sph.call('ide.log',['[DAW] nothing to export (no active tracks)']);return null;}
+  const totalSec=maxSec+Math.min(maxDecay,8); // FX tail, capped at 8s
+  const offCtx=new OfflineAudioContext(2,Math.ceil(totalSec*sampleRate),sampleRate);
+
+  // Build master chain in offline context (full FX: Reverb, Echo, EQ)
+  const offMasterGain=offCtx.createGain();
+  const offMasterPan=offCtx.createStereoPanner();
+  const mtr=D.tracks[0];
+  offMasterGain.gain.value=mtr.vol;
+  offMasterPan.pan.value=mtr.pan;
+  // applyFX handles Reverb/Echo/EQ for master too
+  if(mtr.fx&&mtr.fx.some(f=>f.on)){
+    offMasterGain.connect(offMasterPan);
+    applyFX(offCtx,offMasterPan,mtr.fx,offCtx.destination);
+  } else {
+    offMasterGain.connect(offMasterPan).connect(offCtx.destination);
+  }
+
+  // Per-track gains in offline context
+  const offTrackGains={};
+  function getOffTrackGain(trackId){
+    if(offTrackGains[trackId])return offTrackGains[trackId];
+    const tr=D.tracks.find(t=>t.id===trackId);
+    const g=offCtx.createGain(),p=offCtx.createStereoPanner();
+    const lo=offCtx.createBiquadFilter();lo.type='lowshelf';lo.frequency.value=300;lo.gain.value=0;
+    const md=offCtx.createBiquadFilter();md.type='peaking';md.frequency.value=1000;md.gain.value=0;
+    const hi=offCtx.createBiquadFilter();hi.type='highshelf';hi.frequency.value=4000;hi.gain.value=0;
+    g.gain.value=tr?tr.vol:1;p.pan.value=tr?tr.pan:0;
+    g.connect(p);p.connect(lo);lo.connect(md);md.connect(hi);hi.connect(offMasterGain);
+    offTrackGains[trackId]={gain:g,pan:p,lo,md,hi};
+    return offTrackGains[trackId];
+  }
+
+  const startT=0.05;
+
+  // Schedule automation in offline context
+  function applyOfflineAutomation(noteId,baseBpm,startTime){
+    const autos=D.automation[noteId]||[];
+    // Master automation
+    const masterAutos=autos.filter(a=>!a.trackId||a.trackId==='master');
+    for(const pid of['volume','pan']){
+      const pts=masterAutos.filter(a=>a.param===pid).sort((a,b)=>a.cell-b.cell);
+      if(!pts.length)continue;
+      const pd=AUTO_PARAMS.find(p=>p.id===pid);
+      let prevVal=pd.def,prevT=startTime;
+      for(const pt of pts){
+        const t=startTime+cellToSec(pt.cell,baseBpm,autos);
+        if(pid==='volume'){offMasterGain.gain.setValueAtTime(prevVal,prevT);offMasterGain.gain.linearRampToValueAtTime(pt.value,t);}
+        if(pid==='pan'){offMasterPan.pan.setValueAtTime(prevVal,prevT);offMasterPan.pan.linearRampToValueAtTime(pt.value,t);}
+        prevVal=pt.value;prevT=t;
+      }
+    }
+    // Per-track automation
+    const tids=[...new Set(autos.filter(a=>a.trackId&&a.trackId!=='master').map(a=>a.trackId))];
+    for(const tid of tids){
+      const tg=getOffTrackGain(tid);
+      const tAutos=autos.filter(a=>a.trackId===tid);
+      const nodeMap={volume:tg.gain.gain,pan:tg.pan.pan,lo:tg.lo.gain,mid:tg.md.gain,hi:tg.hi.gain};
+      for(const pid of Object.keys(nodeMap)){
+        const pts=tAutos.filter(a=>a.param===pid).sort((a,b)=>a.cell-b.cell);
+        if(!pts.length)continue;
+        const pd=AUTO_PARAMS.find(p=>p.id===pid);
+        const node=nodeMap[pid];
+        let prevVal=pd.def,prevT=startTime;
+        node.setValueAtTime(prevVal,startTime);
+        for(const pt of pts){
+          const t=startTime+cellToSec(pt.cell,baseBpm,autos);
+          node.setValueAtTime(prevVal,prevT);node.linearRampToValueAtTime(pt.value,t);
+          prevVal=pt.value;prevT=t;
+        }
+      }
+    }
+  }
+
+  // Schedule all notes
+  function scheduleOfflineNote(ni,trackFx,trackId){
+    const n=D.notes[ni];if(!n||!n.events.length)return;
+    const autos=D.automation[n.id]||[];
+    applyOfflineAutomation(n.id,n.bpm,startT);
+    for(const ev of n.events){
+      if(trackId&&ev.trackId&&ev.trackId!==trackId)continue;
+      const w=D.waves.find(w=>w.id===ev.waveId)||D.waves[0];
+      const t=startT+cellToSec(ev.start,n.bpm,autos);
+      const dur=Math.max(0.01,cellToSec(ev.start+ev.dur,n.bpm,autos)-cellToSec(ev.start,n.bpm,autos));
+      // playWave inline for offline context
+      const amp=offCtx.createGain(),gain=offCtx.createGain(),pan=offCtx.createStereoPanner();
+      const l=w.layers[0];const{a,d,s,r}=l.adsr;const v=0.5*Math.min(1,ev.vel/127);
+      amp.gain.setValueAtTime(0,t);
+      amp.gain.linearRampToValueAtTime(v,t+Math.max(.001,a));
+      amp.gain.linearRampToValueAtTime(s*v,t+a+Math.max(.001,d));
+      amp.gain.setValueAtTime(s*v,t+dur-Math.max(.001,r));
+      amp.gain.linearRampToValueAtTime(0,t+dur);
+      let tgt=amp;
+      if(l.filt.type!=='none'){const f=offCtx.createBiquadFilter();f.type=l.filt.type;f.frequency.value=l.filt.freq;f.Q.value=l.filt.q;f.connect(amp);tgt=f;}
+      for(const ly of w.layers){
+        if(ly.type==='noise'){
+          const nb=offCtx.createBuffer(1,Math.ceil(offCtx.sampleRate*(dur+.3)),offCtx.sampleRate);
+          const nd=nb.getChannelData(0);for(let i=0;i<nd.length;i++)nd[i]=Math.random()*2-1;
+          const ng=offCtx.createGain();ng.gain.value=(ly.noise?.mix||0)*v;
+          const ns=offCtx.createBufferSource();ns.buffer=nb;ns.connect(ng);ng.connect(tgt);ns.start(t);ns.stop(t+dur+.1);
+          continue;
+        }
+        const osc=offCtx.createOscillator();
+        osc.type=['sine','square','sawtooth','triangle'].includes(ly.type)?ly.type:'sine';
+        osc.frequency.value=midiHz(ev.pitch);
+        if(ly.fm?.on&&ly.fm.depth>0){
+          const m=offCtx.createOscillator(),mg=offCtx.createGain();
+          m.frequency.value=midiHz(ev.pitch)*ly.fm.ratio;mg.gain.value=ly.fm.depth;
+          m.connect(mg);mg.connect(osc.frequency);m.start(t);m.stop(t+dur+.1);
+        }
+        osc.connect(tgt);osc.start(t);osc.stop(t+dur+.1);
+      }
+      const dest=trackId?getOffTrackGain(trackId).gain:offMasterGain;
+      // applyFX works with any AudioContext including OfflineAudioContext
+      if(trackFx&&trackFx.some(f=>f.on)){
+        applyFX(offCtx,amp,trackFx,dest);
+      } else {
+        amp.connect(dest);
+      }
+    }
+  }
+
+  D.tracks.forEach(tr=>{
+    if(tr.mute||tr.isMaster)return;
+    const ni=D.notes.findIndex(n=>n.id===tr.noteId);
+    if(ni>=0)scheduleOfflineNote(ni,tr.fx,tr.id);
+  });
+
+  try{
+    const buf=await offCtx.startRendering();
+    return buf;
+  }catch(e){
+    sph.call('ide.log',['[DAW] render error: '+e.message]);
+    return null;
+  }
+}
+
+// --- Export WAV ---
+async function exportWAV(){
+  sph.call('ide.log',['[DAW] rendering WAV (with FX)...']);
+  const buf=await renderOffline(44100);
+  if(!buf)return;
+  const blob=audioBufferToWav(buf);
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');
+  const now=new Date();
+  const ts=`${now.getFullYear()}${String(now.getMonth()+1).padStart(2,'0')}${String(now.getDate()).padStart(2,'0')}_${String(now.getHours()).padStart(2,'0')}${String(now.getMinutes()).padStart(2,'0')}`;
+  a.href=url;a.download=`daw_export_${ts}.wav`;a.click();
+  setTimeout(()=>URL.revokeObjectURL(url),10000);
+  const sec=buf.duration.toFixed(1);
+  const kb=Math.round(blob.size/1024);
+  sph.call('ide.log',[`[DAW] WAV exported (with FX): ${sec}s, ${kb}KB`]);
+// ═══════════════════════════════════════════════════════════════
+// TRACK AUDIO CACHE SYSTEM
+// トラックごとに音声をレンダリングしてURLを記憶・再生
+// ═══════════════════════════════════════════════════════════════
+
+// ── 個別トラックのオフラインレンダリング ──
+async function renderTrackOffline(trackId, sampleRate=44100){
+  const tr = D.tracks.find(t => t.id === trackId);
+  if (!tr || tr.isMaster) {
+    sph.call('ide.log', ['[DAW] Cannot render master or invalid track']);
+    return null;
+  }
+  
+  const n = D.notes.find(x => x.id === tr.noteId);
+  if (!n || !n.events.length) {
+    sph.call('ide.log', ['[DAW] No events in track']);
+    return null;
+  }
+  
+  const autos = D.automation[n.id] || [];
+  const barsSec = cellToSec(n.bars * 16, n.bpm, autos);
+  
+  // FX tail calculation
+  let maxDecay = 0;
+  for (const f of tr.fx) {
+    if (!f.on) continue;
+    if (f.type === 'reverb') maxDecay = Math.max(maxDecay, f.decay || 2);
+    if (f.type === 'echo') {
+      const fb = Math.max(0.01, Math.min(0.99, f.feedback || 0.4));
+      const nRep = Math.ceil(-3 / Math.log10(fb));
+      maxDecay = Math.max(maxDecay, (f.delay || 0.25) * nRep);
+    }
+  }
+  
+  const totalSec = barsSec + Math.min(maxDecay, 8);
+  const offCtx = new OfflineAudioContext(2, Math.ceil(totalSec * sampleRate), sampleRate);
+  
+  // Simplified master chain (no master FX, just volume/pan)
+  const offMasterGain = offCtx.createGain();
+  offMasterGain.gain.value = 1; // full volume for track export
+  offMasterGain.connect(offCtx.destination);
+  
+  // Track gain/pan/EQ in offline context
+  const g = offCtx.createGain();
+  const p = offCtx.createStereoPanner();
+  const lo = offCtx.createBiquadFilter();
+  lo.type = 'lowshelf';
+  lo.frequency.value = 300;
+  lo.gain.value = 0;
+  const md = offCtx.createBiquadFilter();
+  md.type = 'peaking';
+  md.frequency.value = 1000;
+  md.gain.value = 0;
+  const hi = offCtx.createBiquadFilter();
+  hi.type = 'highshelf';
+  hi.frequency.value = 4000;
+  hi.gain.value = 0;
+  
+  g.gain.value = tr.vol;
+  p.pan.value = tr.pan;
+  g.connect(p);
+  p.connect(lo);
+  lo.connect(md);
+  md.connect(hi);
+  hi.connect(offMasterGain);
+  
+  const startT = 0.05;
+  
+  // Apply track automation
+  const tAutos = autos.filter(a => a.trackId === trackId);
+  const nodeMap = {
+    volume: g.gain,
+    pan: p.pan,
+    lo: lo.gain,
+    mid: md.gain,
+    hi: hi.gain
+  };
+  
+  for (const pid of Object.keys(nodeMap)) {
+    const pts = tAutos.filter(a => a.param === pid).sort((a, b) => a.cell - b.cell);
+    if (!pts.length) continue;
+    const pd = AUTO_PARAMS.find(p => p.id === pid);
+    const node = nodeMap[pid];
+    let prevVal = pd ? pd.def : 0;
+    let prevT = startT;
+    node.setValueAtTime(prevVal, startT);
+    for (const pt of pts) {
+      const t = startT + cellToSec(pt.cell, n.bpm, autos);
+      node.setValueAtTime(prevVal, prevT);
+      node.linearRampToValueAtTime(pt.value, t);
+      prevVal = pt.value;
+      prevT = t;
+    }
+  }
+  
+  // Schedule only events for this track
+  for (const ev of n.events) {
+    if (ev.trackId && ev.trackId !== trackId) continue;
+    
+    const w = D.waves.find(w => w.id === ev.waveId) || D.waves[0];
+    const t = startT + cellToSec(ev.start, n.bpm, autos);
+    const dur = Math.max(0.01, cellToSec(ev.start + ev.dur, n.bpm, autos) - cellToSec(ev.start, n.bpm, autos));
+    
+    // Create oscillators and envelope
+    const amp = offCtx.createGain();
+    const l = w.layers[0];
+    const { a, d, s, r } = l.adsr;
+    const v = 0.5 * Math.min(1, ev.vel / 127);
+    
+    amp.gain.setValueAtTime(0, t);
+    amp.gain.linearRampToValueAtTime(v, t + Math.max(.001, a));
+    amp.gain.linearRampToValueAtTime(s * v, t + a + Math.max(.001, d));
+    amp.gain.setValueAtTime(s * v, t + dur - Math.max(.001, r));
+    amp.gain.linearRampToValueAtTime(0, t + dur);
+    
+    let tgt = amp;
+    if (l.filt.type !== 'none') {
+      const f = offCtx.createBiquadFilter();
+      f.type = l.filt.type;
+      f.frequency.value = l.filt.freq;
+      f.Q.value = l.filt.q;
+      f.connect(amp);
+      tgt = f;
+    }
+    
+    for (const ly of w.layers) {
+      if (ly.type === 'noise') {
+        const nb = offCtx.createBuffer(1, Math.ceil(offCtx.sampleRate * (dur + .3)), offCtx.sampleRate);
+        const nd = nb.getChannelData(0);
+        for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+        const ng = offCtx.createGain();
+        ng.gain.value = (ly.noise?.mix || 0) * v;
+        const ns = offCtx.createBufferSource();
+        ns.buffer = nb;
+        ns.connect(ng);
+        ng.connect(tgt);
+        ns.start(t);
+        ns.stop(t + dur + .1);
+        continue;
+      }
+      
+      const osc = offCtx.createOscillator();
+      osc.type = ['sine', 'square', 'sawtooth', 'triangle'].includes(ly.type) ? ly.type : 'sine';
+      osc.frequency.value = midiHz(ev.pitch);
+      
+      if (ly.fm?.on && ly.fm.depth > 0) {
+        const m = offCtx.createOscillator();
+        const mg = offCtx.createGain();
+        m.frequency.value = midiHz(ev.pitch) * ly.fm.ratio;
+        mg.gain.value = ly.fm.depth;
+        m.connect(mg);
+        mg.connect(osc.frequency);
+        m.start(t);
+        m.stop(t + dur + .1);
+      }
+      
+      osc.connect(tgt);
+      osc.start(t);
+      osc.stop(t + dur + .1);
+    }
+    
+    // Apply track FX
+    if (tr.fx && tr.fx.some(f => f.on)) {
+      applyFX(offCtx, amp, tr.fx, g);
+    } else {
+      amp.connect(g);
+    }
+  }
+  
+  try {
+    const buf = await offCtx.startRendering();
+    return buf;
+  } catch (e) {
+    sph.call('ide.log', ['[DAW] Track render error: ' + e.message]);
+    return null;
+  }
+}
+
+// ── トラックをキャッシュに保存 ──
+async function cacheTrack(trackId) {
+  const tr = D.tracks.find(t => t.id === trackId);
+  if (!tr || tr.isMaster) return;
+  
+  sph.call('ide.log', [`[DAW] Rendering track "${tr.name}"...`]);
+  
+  const buf = await renderTrackOffline(trackId, 44100);
+  if (!buf) return;
+  
+  // Convert to WAV blob
+  const blob = audioBufferToWav(buf);
+  const url = URL.createObjectURL(blob);
+  
+  // Clear old cache if exists
+  if (tr.audioCache?.url) {
+    URL.revokeObjectURL(tr.audioCache.url);
+  }
+  
+  // Stop any playing source
+  if (tr.cacheSource) {
+    try { tr.cacheSource.stop(); } catch (e) {}
+    tr.cacheSource = null;
+  }
+  
+  // Save to track
+  tr.audioCache = {
+    url: url,
+    buffer: buf,
+    duration: buf.duration,
+    timestamp: Date.now(),
+  };
+  
+  const sec = buf.duration.toFixed(1);
+  const kb = Math.round(blob.size / 1024);
+  sph.call('ide.log', [`[DAW] Track "${tr.name}" cached: ${sec}s, ${kb}KB`]);
+  
+  // Update UI
+  if (D._reopen) D._reopen();
+}
+
+// ── キャッシュから再生 ──
+function playCachedTrack(trackId) {
+  const tr = D.tracks.find(t => t.id === trackId);
+  if (!tr || !tr.audioCache) {
+    sph.call('ide.log', ['[DAW] No cache for this track. Render first.']);
+    return;
+  }
+  
+  const ctx = ac();
+  
+  // Stop previous playback
+  if (tr.cacheSource) {
+    try { tr.cacheSource.stop(); } catch (e) {}
+  }
+  
+  // Create new source
+  const src = ctx.createBufferSource();
+  src.buffer = tr.audioCache.buffer;
+  
+  // Connect to track gain (respects current vol/pan settings)
+  const tg = getTrackGain(trackId);
+  src.connect(tg.gain);
+  
+  src.onended = () => {
+    tr.cacheSource = null;
+  };
+  
+  tr.cacheSource = src;
+  src.start();
+  
+  sph.call('ide.log', [`[DAW] Playing cached track "${tr.name}"`]);
+}
+
+// ── キャッシュ停止 ──
+function stopCachedTrack(trackId) {
+  const tr = D.tracks.find(t => t.id === trackId);
+  if (!tr || !tr.cacheSource) return;
+  
+  try {
+    tr.cacheSource.stop();
+  } catch (e) {}
+  tr.cacheSource = null;
+  
+  sph.call('ide.log', [`[DAW] Stopped cached track "${tr.name}"`]);
+}
+
+// ── キャッシュクリア ──
+function clearTrackCache(trackId) {
+  const tr = D.tracks.find(t => t.id === trackId);
+  if (!tr || !tr.audioCache) return;
+  
+  if (tr.cacheSource) {
+    try { tr.cacheSource.stop(); } catch (e) {}
+    tr.cacheSource = null;
+  }
+  
+  if (tr.audioCache.url) {
+    URL.revokeObjectURL(tr.audioCache.url);
+  }
+  
+  tr.audioCache = null;
+  sph.call('ide.log', [`[DAW] Cleared cache for track "${tr.name}"`]);
+  
+  // Update UI
+  if (D._reopen) D._reopen();
+}
+
+// ── 全トラックをキャッシュ ──
+async function cacheAllTracks() {
+  sph.call('ide.log', ['[DAW] Caching all tracks...']);
+  
+  for (const tr of D.tracks) {
+    if (tr.isMaster || tr.mute) continue;
+    await cacheTrack(tr.id);
+  }
+  
+  sph.call('ide.log', ['[DAW] All tracks cached']);
+}
+
+// ── キャッシュダウンロード ──
+function downloadTrackCache(trackId) {
+  const tr = D.tracks.find(t => t.id === trackId);
+  if (!tr || !tr.audioCache) {
+    sph.call('ide.log', ['[DAW] No cache to download']);
+    return;
+  }
+  
+  const a = document.createElement('a');
+  const now = new Date();
+  const ts = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}_${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}`;
+  const safeName = tr.name.replace(/[^a-zA-Z0-9_-]/g, '_');
+  
+  a.href = tr.audioCache.url;
+  a.download = `${safeName}_${ts}.wav`;
+  a.click();
+  
+  sph.call('ide.log', [`[DAW] Downloaded track "${tr.name}"`]);
+}
+
+}
+
+// --- Export WebM (MediaRecorder realtime) ---
+// AudioBuffer の PCM を WebM/Opus に Offline エンコード (WebCodecs)
+// 非対応ブラウザは WAV にフォールバック
+async function exportWebM(){
+  sph.call('ide.log',['[DAW] rendering for WebM...']);
+  const buf=await renderOffline(44100);
+  if(!buf)return;
+  const ts=(()=>{const now=new Date();return`${now.getFullYear()}${String(now.getMonth()+1).padStart(2,'0')}${String(now.getDate()).padStart(2,'0')}_${String(now.getHours()).padStart(2,'0')}${String(now.getMinutes()).padStart(2,'0')}`;})();
+  const dlFile=(b,name)=>{const u=URL.createObjectURL(b);const a=document.createElement('a');a.href=u;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(u),10000);};
+
+  // WebCodecs AudioEncoder で Opus エンコード
+  if(typeof AudioEncoder!=='undefined'&&AudioEncoder.isConfigSupported){
+    try{
+      const sr=buf.sampleRate,nCh=buf.numberOfChannels,nFr=buf.length;
+      const support=await AudioEncoder.isConfigSupported({
+        codec:'opus',sampleRate:sr,numberOfChannels:nCh,bitrate:192000
+      });
+      if(support.supported){
+        const chunks=[];
+        let done=false;
+        const enc=new AudioEncoder({
+          output:(chunk,meta)=>{
+            const ab=new Uint8Array(chunk.byteLength);
+            chunk.copyTo(ab);
+            chunks.push({data:ab,ts:chunk.timestamp,type:chunk.type});
+          },
+          error:(e)=>{sph.call('ide.log',['[DAW] encoder error: '+e.message]);}
+        });
+        enc.configure({codec:'opus',sampleRate:sr,numberOfChannels:nCh,bitrate:192000});
+
+        // PCM を AudioData に変換して送り込む
+        // AudioData は Float32 planar 形式
+        const frameSize=4096;
+        const ch0=buf.getChannelData(0);
+        const ch1=nCh>1?buf.getChannelData(1):ch0;
+        for(let offset=0;offset<nFr;offset+=frameSize){
+          const len=Math.min(frameSize,nFr-offset);
+          // interleaved → planar は AudioData が処理
+          const pcm=new Float32Array(len*nCh);
+          for(let i=0;i<len;i++){
+            pcm[i*nCh]=ch0[offset+i];
+            if(nCh>1)pcm[i*nCh+1]=ch1[offset+i];
+          }
+          const audioData=new AudioData({
+            format:'f32-planar',
+            sampleRate:sr,
+            numberOfFrames:len,
+            numberOfChannels:nCh,
+            timestamp:Math.round(offset/sr*1e6),
+            data:nCh===1?ch0.slice(offset,offset+len):pcm,
+          });
+          // planar 形式で渡す
+          const planes=[];
+          for(let c=0;c<nCh;c++){
+            const plane=new Float32Array(len);
+            buf.copyFromChannel(plane,c,offset);
+            planes.push(plane);
+          }
+          const adPlanar=new AudioData({
+            format:'f32-planar',
+            sampleRate:sr,
+            numberOfFrames:len,
+            numberOfChannels:nCh,
+            timestamp:Math.round(offset/sr*1e6),
+            data:planes[0].buffer,
+          });
+          // 各チャンネルを個別に AudioData に渡す方法は非対応なので
+          // interleaved で渡す
+          audioData.close();
+          // f32-interleaved を使う
+          const interleaved=new Float32Array(len*nCh);
+          for(let i=0;i<len;i++){
+            for(let c=0;c<nCh;c++)
+              interleaved[i*nCh+c]=(c===0?ch0:ch1)[offset+i];
+          }
+          const ad=new AudioData({
+            format:'f32-interleaved',
+            sampleRate:sr,
+            numberOfFrames:len,
+            numberOfChannels:nCh,
+            timestamp:Math.round(offset/sr*1e6),
+            data:interleaved,
+          });
+          adPlanar.close();
+          enc.encode(ad);
+          ad.close();
+        }
+        await enc.flush();
+        enc.close();
+
+        // Opus chunks → WebM コンテナ (簡易 Ogg/WebM ラッパー)
+        // シンプルな実装: Opus を raw で Ogg に詰める
+        const opusBlob=_opusChunksToOgg(chunks,sr,nCh);
+        dlFile(opusBlob,`daw_export_${ts}.ogg`);
+        sph.call('ide.log',[`[DAW] Ogg/Opus saved: ${buf.duration.toFixed(1)}s, ${Math.round(opusBlob.size/1024)}KB`]);
+        return;
+      }
+    }catch(e){
+      sph.call('ide.log',['[DAW] AudioEncoder failed, falling back to WAV: '+e.message]);
+    }
+  }
+  // フォールバック: WAV 保存
+  sph.call('ide.log',['[DAW] WebCodecs not supported, saving as WAV']);
+  const wavBlob=audioBufferToWav(buf);
+  dlFile(wavBlob,`daw_export_${ts}.wav`);
+  sph.call('ide.log',[`[DAW] WAV fallback: ${buf.duration.toFixed(1)}s, ${Math.round(wavBlob.size/1024)}KB`]);
+}
+
+// 簡易 Ogg コンテナライター (Opus ページを詰めるだけ)
+function _opusChunksToOgg(chunks,sr,nCh){
+  // Ogg page 構造を最小実装
+  function crc32(data){
+    let c=0xffffffff;
+    const t=[0,0x77073096,0xee0e612c,0x990951ba,0x076dc419,0x706af48f,0xe963a535,0x9e6495a3,0x0edb8832,0x79dcb8a4,0xe0d5e91b,0x97d2d988,0x09b64c2b,0x7eb17cbf,0xe7b82d08,0x90bf1d0a];
+    for(let b of data){c=(c>>>4)^t[(c^b)&0xf];c=(c>>>4)^t[(c^(b>>4))&0xf];}
+    return c^0xffffffff;
+  }
+  function ogg(serial,seq,granule,pageType,packets){
+    const body=[];for(const p of packets)for(const b of p)body.push(b);
+    const segs=[];let rem=body.length;
+    while(rem>0){segs.push(Math.min(255,rem));rem-=Math.min(255,rem);}
+    if(segs.length&&segs[segs.length-1]===255)segs.push(0);
+    const hdr=new Uint8Array(27+segs.length);
+    const dv=new DataView(hdr.buffer);
+    hdr.set([0x4f,0x67,0x67,0x53,0,pageType],0);
+    dv.setBigInt64(6,BigInt(granule),true);
+    dv.setUint32(14,serial,true);dv.setUint32(18,seq,true);
+    dv.setUint32(22,0,true);hdr[26]=segs.length;hdr.set(segs,27);
+    const full=new Uint8Array(hdr.length+body.length);
+    full.set(hdr);full.set(body,hdr.length);
+    const crc=crc32(full);
+    new DataView(full.buffer).setUint32(22,crc,true);
+    return full;
+  }
+  const serial=0x12345678;
+  const pages=[];let seq=0;
+  // OpusHead
+  const head=new Uint8Array(19);
+  head.set([0x4f,0x70,0x75,0x73,0x48,0x65,0x61,0x64,1,nCh]);
+  new DataView(head.buffer).setUint16(10,3840,true);// preskip
+  new DataView(head.buffer).setUint32(12,sr,true);
+  pages.push(ogg(serial,seq++,0,2,[head]));
+  // OpusTags
+  const tags=new Uint8Array([0x4f,0x70,0x75,0x73,0x54,0x61,0x67,0x73,7,0,0,0,...new TextEncoder().encode('daw_ext'),0,0,0,0]);
+  pages.push(ogg(serial,seq++,0,0,[tags]));
+  // Audio pages
+  let gran=0;
+  for(const ch of chunks){
+    gran+=960;// 20ms @ 48kHz
+    pages.push(ogg(serial,seq++,gran,0,[ch.data]));
+  }
+  // EOS
+  pages.push(ogg(serial,seq++,gran,4,[]));
+  const total=pages.reduce((s,p)=>s+p.length,0);
+  const out=new Uint8Array(total);let off=0;
+  for(const p of pages){out.set(p,off);off+=p.length;}
+  return new Blob([out],{type:'audio/ogg;codecs=opus'});
+}
+
+function cv(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim();}
+function btn(l,oc,c){c=c||'dim';return `<button onclick="${oc}" style="font-family:var(--sph-font,monospace);font-size:9px;font-weight:700;padding:3px 8px;border-radius:3px;cursor:pointer;background:transparent;color:var(--sph-${c});border:1px solid var(--sph-${c})50;text-transform:uppercase;letter-spacing:1px">${l}</button>`;}
+function reopen(){sph.call('ide.frame.mount',['daw']);}
+
+// ── FX HTML helper ──────────────────────────────────────────────
+function fxHTML(fx,ti){
+  return fx.map((f,fi)=>{
+    const base=`window._D.tracks[${ti}].fx[${fi}]`;
+    let params='';
+    if(f.type==='reverb')params=`
+      <span style="font-size:9px;color:var(--sph-dim)">Wet</span>
+      <input type="range" min="0" max="1" step=".01" value="${f.wet}" oninput="${base}.wet=+this.value" style="width:60px;accent-color:var(--sph-accent)">
+      <span style="font-size:9px;color:var(--sph-dim)">Decay</span>
+      <input type="range" min=".1" max="6" step=".1" value="${f.decay}" oninput="${base}.decay=+this.value;window._D.masterGain=null" style="width:60px;accent-color:var(--sph-accent)">`;
+    else if(f.type==='echo')params=`
+      <span style="font-size:9px;color:var(--sph-dim)">Wet</span>
+      <input type="range" min="0" max="1" step=".01" value="${f.wet}" oninput="${base}.wet=+this.value" style="width:60px;accent-color:var(--sph-accent)">
+      <span style="font-size:9px;color:var(--sph-dim)">Delay</span>
+      <input type="range" min=".01" max="1" step=".01" value="${f.delay}" oninput="${base}.delay=+this.value" style="width:60px;accent-color:var(--sph-accent)">
+      <span style="font-size:9px;color:var(--sph-dim)">FB</span>
+      <input type="range" min="0" max=".95" step=".01" value="${f.feedback}" oninput="${base}.feedback=+this.value" style="width:50px;accent-color:var(--sph-accent)">`;
+    else if(f.type==='distortion')params=`
+      <span style="font-size:9px;color:var(--sph-dim)">Amount</span>
+      <input type="range" min="0" max="400" step="1" value="${f.amount}" oninput="${base}.amount=+this.value" style="width:80px;accent-color:var(--sph-accent)">`;
+    else if(f.type==='eq')params=`
+      <span style="font-size:9px;color:var(--sph-dim)">Lo</span>
+      <input type="range" min="-12" max="12" step=".5" value="${f.low}" oninput="${base}.low=+this.value;window._D.masterGain=null" style="width:50px;accent-color:var(--sph-accent)">
+      <span style="font-size:9px;color:var(--sph-dim)">Mid</span>
+      <input type="range" min="-12" max="12" step=".5" value="${f.mid}" oninput="${base}.mid=+this.value;window._D.masterGain=null" style="width:50px;accent-color:var(--sph-accent)">
+      <span style="font-size:9px;color:var(--sph-dim)">Hi</span>
+      <input type="range" min="-12" max="12" step=".5" value="${f.high}" oninput="${base}.high=+this.value;window._D.masterGain=null" style="width:50px;accent-color:var(--sph-accent)">`;
+    return`<div style="display:flex;align-items:center;gap:6px;padding:4px 0;flex-wrap:wrap">
+      <label style="display:flex;align-items:center;gap:3px;cursor:pointer;font-size:9px;color:var(--sph-dim);min-width:70px">
+        <input type="checkbox" ${f.on?'checked':''} onchange="${base}.on=this.checked;window._D.masterGain=null" style="accent-color:var(--sph-accent)">
+        <span style="font-weight:700;text-transform:uppercase">${f.type}</span>
+      </label>${params}
+    </div>`;
+  }).join('');
+}
+
+// ── TRACK HTML ──────────────────────────────────────────────────
+function trackHTML(){
+  // colors via trackColor()
+  return `<div style="padding:12px 14px;overflow-y:auto;height:100%;box-sizing:border-box">
+<div style="display:flex;gap:6px;margin-bottom:10px">
+  ${btn('+ Track','window._D._addTrack()','ok')}
+  ${btn('▶ Play All','window._D._playAll()','ok')}
+  ${btn('■ Stop','window._D._stop()')}
+  ${btn('💾 Cache All','_cacheAllTracks()','ok')}
+</div>
+${D.tracks.map((tr,i)=>{
+  const col=tr.isMaster?'#f5c842':trackColor(tr);
+  const wn=D.waves.find(w=>w.id===tr.waveId)?.name||'—';
+  const nn=D.notes.find(n=>n.id===tr.noteId)?.name||'—';
+  const isOpen=D._openTrk===i;
+  return`<div style="background:var(--sph-surface);border:1px solid ${isOpen?'var(--sph-accent)':'var(--sph-border)'};border-radius:5px;margin-bottom:8px">
+  <!-- Track header -->
+  <div style="display:flex;align-items:center;gap:8px;padding:8px 12px;cursor:pointer" onclick="window._D._toggleTrk(${i})">
+    ${!tr.isMaster?`<span title="Track color" style="display:inline-block;width:14px;height:14px;border-radius:3px;flex-shrink:0;background:${col};border:2px solid rgba(255,255,255,.2);cursor:pointer" onclick="event.stopPropagation();document.getElementById('daw-tc${i}').click()"></span>
+    <input type="color" id="daw-tc${i}" value="${col}" style="position:absolute;opacity:0;width:0;height:0;pointer-events:none" onchange="event.stopPropagation();window._D.tracks[${i}].color=this.value;window._D._reopen()">`
+    :'<span style="display:inline-block;width:14px;height:14px;border-radius:3px;flex-shrink:0;background:#f5c842;border:2px solid rgba(255,255,255,.2)"></span>'}
+    <input value="${tr.name}" onchange="window._D.tracks[${i}].name=this.value" onclick="event.stopPropagation()" style="font-family:inherit;font-size:11px;font-weight:700;background:transparent;border:none;color:var(--sph-text);width:90px">
+    ${tr.isMaster?'<span style="font-size:9px;color:#f5c842;border:1px solid #f5c84255;border-radius:3px;padding:1px 5px">MASTER</span>':
+      `<span style="font-size:9px;color:var(--sph-dim)">${wn} / ${nn}</span>`}
+    <div style="flex:1"></div>
+    <label style="display:flex;align-items:center;gap:3px;font-size:9px;color:var(--sph-dim);cursor:pointer" onclick="event.stopPropagation()">
+      <input type="checkbox" ${tr.mute?'checked':''} onchange="window._D.tracks[${i}].mute=this.checked" style="accent-color:var(--sph-err)">MUTE
+    </label>
+    ${!tr.isMaster?`
+      <button onclick="event.stopPropagation();_cacheTrack('${tr.id}')" title="${tr.audioCache?'Re-cache track':'Cache track for fast playback'}" style="font-family:var(--sph-font);font-size:9px;padding:3px 8px;border-radius:3px;cursor:pointer;background:${tr.audioCache?'var(--sph-ok)':'var(--sph-surface)'};color:${tr.audioCache?'#fff':'var(--sph-dim)'};border:1px solid ${tr.audioCache?'var(--sph-ok)':'var(--sph-border)'}">${tr.audioCache?'💾':'⚪'}Cache</button>
+      <button onclick="event.stopPropagation();${tr.cacheSource?`_stopCachedTrack('${tr.id}')`:`_playCachedTrack('${tr.id}')`}" title="${tr.audioCache?(tr.cacheSource?'Stop cached playback':'Play cached audio'):'Cache first'}" style="font-family:var(--sph-font);font-size:9px;padding:3px 8px;border-radius:3px;cursor:pointer;background:${tr.cacheSource?'var(--sph-err)':'var(--sph-accent)'};color:#fff;border:1px solid ${tr.cacheSource?'var(--sph-err)':'var(--sph-accent)'};${tr.audioCache?'':'opacity:0.5;pointer-events:none'}">${tr.cacheSource?'⏹':'▶'}</button>
+    `:''}
+    ${!tr.isMaster?btn('▶',`event.stopPropagation();window._D._playTrk(${i})`,'ok'):''}
+    ${!tr.isMaster?btn('✕',`event.stopPropagation();window._D._delTrk(${i})`,'err'):''}
+  </div>
+  <!-- Track body -->
+  <div style="display:${isOpen?'block':'none'};padding:10px 12px;border-top:1px solid var(--sph-border)">
+    <!-- Vol / Pan -->
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px">
+      <div style="display:flex;align-items:center;gap:6px">
+        <span style="font-size:9px;color:var(--sph-dim);text-transform:uppercase;letter-spacing:1px;width:28px">VOL</span>
+        <input type="range" min="0" max="1" step=".01" value="${tr.vol}"
+          oninput="window._D.tracks[${i}].vol=+this.value${tr.isMaster?';if(window._D.masterGain)window._D.masterGain.gain.value=+this.value':''}"
+          style="width:90px;accent-color:var(--sph-accent)">
+        <span id="dv${i}" style="font-size:9px;color:var(--sph-text);min-width:28px">${tr.vol.toFixed(2)}</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:6px">
+        <span style="font-size:9px;color:var(--sph-dim);text-transform:uppercase;letter-spacing:1px;width:28px">PAN</span>
+        <input type="range" min="-1" max="1" step=".01" value="${tr.pan}"
+          oninput="window._D.tracks[${i}].pan=+this.value${tr.isMaster?';if(window._D.masterPan)window._D.masterPan.pan.value=+this.value':''}"
+          style="width:90px;accent-color:var(--sph-accent)">
+        <span id="dp${i}" style="font-size:9px;color:var(--sph-text);min-width:32px">${tr.pan===0?'C':tr.pan>0?'R'+tr.pan.toFixed(2):'L'+Math.abs(tr.pan).toFixed(2)}</span>
+      </div>
+    </div>
+    <!-- Wave / Note (non-master) -->
+    ${!tr.isMaster?`<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+      <span style="font-size:9px;color:var(--sph-dim)">Wave</span>
+      <select onchange="window._D.tracks[${i}].waveId=this.value;window._D._reopen()" style="font-family:var(--sph-font,monospace);font-size:10px;background:var(--sph-surface2);color:var(--sph-text);border:1px solid var(--sph-border);border-radius:3px;padding:2px 6px">
+        ${D.waves.map(w=>`<option value="${w.id}"${w.id===tr.waveId?' selected':''}>${w.name}</option>`).join('')}
+      </select>
+      <span style="font-size:9px;color:var(--sph-dim)">Note</span>
+      <select onchange="window._D.tracks[${i}].noteId=this.value;window._D._reopen()" style="font-family:var(--sph-font,monospace);font-size:10px;background:var(--sph-surface2);color:var(--sph-text);border:1px solid var(--sph-border);border-radius:3px;padding:2px 6px">
+        ${D.notes.map(n=>`<option value="${n.id}"${n.id===tr.noteId?' selected':''}>${n.name}</option>`).join('')}
+      </select>
+      ${btn('Edit Note',`window._D.sn=window._D.notes.findIndex(n=>n.id===window._D.tracks[${i}].noteId);window._D.tab='note';window._D._reopen()`)}
+    </div>`:''}
+    <!-- FX -->
+    <div style="background:var(--sph-surface2);border:1px solid var(--sph-border);border-radius:4px;padding:8px">
+      <div style="font-size:9px;color:var(--sph-dim);letter-spacing:1px;text-transform:uppercase;margin-bottom:6px">EFFECTS</div>
+      ${fxHTML(tr.fx,i)}
+    </div>
+  </div>
+</div>`;
+}).join('')}
+</div>`;
+}
+
+// ── WAVE HTML ───────────────────────────────────────────────────
+function waveHTML(){
+  const wi=D.sw||0;const w=D.waves[wi]||D.waves[0];
+  const wt=['sine','square','sawtooth','triangle','noise'];
+  const ft=['none','lowpass','highpass','bandpass','notch'];
+  const filt=w.layers[0]?.filt||{type:'none',freq:2000,q:1};
+  return `<div style="height:100%;overflow:hidden">
+<div style="overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:12px;height:100%;box-sizing:border-box">
+  <div style="display:flex;align-items:center;gap:8px">
+    <input value="${w.name}" onchange="window._D.waves[${wi}].name=this.value" style="font-family:inherit;font-size:12px;font-weight:700;background:transparent;border:none;border-bottom:1px solid var(--sph-border);color:var(--sph-accent);padding:2px 4px;width:120px">
+    ${btn('✕ Del','window._D._delWave()','err')}
+    ${btn('▶ Preview','window._D._preview()','ok')}
+  </div>
+  <div style="background:var(--sph-surface);border:1px solid var(--sph-border);border-radius:4px;padding:10px">
+    <div style="font-size:9px;color:var(--sph-dim);letter-spacing:1px;text-transform:uppercase;margin-bottom:8px">LAYERS</div>
+    ${w.layers.map((ly,li)=>`<div style="border:1px solid var(--sph-border);border-radius:3px;padding:8px;margin-bottom:6px">
+      <div style="display:flex;gap:3px;flex-wrap:wrap;margin-bottom:5px">
+        <span style="font-size:9px;color:var(--sph-dim);align-self:center">L${li+1}</span>
+        ${wt.map(t=>`<button onclick="window._D.waves[${wi}].layers[${li}].type='${t}';window._D._reopen()" style="font-family:var(--sph-font,monospace);font-size:9px;padding:2px 6px;border-radius:3px;cursor:pointer;background:${ly.type===t?'var(--sph-accent)20':'transparent'};color:${ly.type===t?'var(--sph-accent)':'var(--sph-dim)'};border:1px solid ${ly.type===t?'var(--sph-accent)':'var(--sph-border)'}">${t}</button>`).join('')}
+        ${w.layers.length>1?btn('✕',`window._D._delLayer(${li})`,'err'):''}
+      </div>
+      <div style="display:flex;gap:6px;font-size:9px;color:var(--sph-dim);align-items:center;flex-wrap:wrap">
+        <span>Det</span><input type="range" min="-100" max="100" step="1" value="${ly.detune||0}" oninput="window._D.waves[${wi}].layers[${li}].detune=+this.value" style="width:55px;accent-color:var(--sph-accent)" title="Detune (cents)">
+        <label style="display:flex;align-items:center;gap:2px;cursor:pointer"><input type="checkbox" ${ly.fm?.on?'checked':''} onchange="window._D.waves[${wi}].layers[${li}].fm.on=this.checked" style="accent-color:var(--sph-accent)">FM</label>
+        R<input type="range" min=".1" max="16" step=".1" value="${ly.fm?.ratio||2}" oninput="window._D.waves[${wi}].layers[${li}].fm.ratio=+this.value" style="width:50px;accent-color:var(--sph-accent)">
+        D<input type="range" min="0" max="1000" step="1" value="${ly.fm?.depth||100}" oninput="window._D.waves[${wi}].layers[${li}].fm.depth=+this.value" style="width:50px;accent-color:var(--sph-accent)">
+      </div>
+      <div style="display:flex;gap:6px;font-size:9px;color:var(--sph-dim);align-items:center;flex-wrap:wrap;margin-top:4px">
+        <label style="display:flex;align-items:center;gap:2px;cursor:pointer"><input type="checkbox" ${ly.am?.on?'checked':''} onchange="window._D.waves[${wi}].layers[${li}].am.on=this.checked" style="accent-color:var(--sph-accent)">AM</label>
+        R<input type="range" min=".1" max="16" step=".1" value="${ly.am?.ratio||1}" oninput="window._D.waves[${wi}].layers[${li}].am.ratio=+this.value" style="width:50px;accent-color:var(--sph-accent)" title="AM ratio">
+        D<input type="range" min="0" max="100" step="1" value="${ly.am?.depth||100}" oninput="window._D.waves[${wi}].layers[${li}].am.depth=+this.value" style="width:50px;accent-color:var(--sph-accent)" title="AM depth (100=Ring)">
+      </div>
+      <div style="display:flex;gap:6px;font-size:9px;color:var(--sph-dim);align-items:center;flex-wrap:wrap;margin-top:4px">
+        <span>Noise</span>
+        <select onchange="window._D.waves[${wi}].layers[${li}].noise.type=this.value" style="font-family:var(--sph-font,monospace);font-size:9px;background:var(--sph-surface2);color:var(--sph-text);border:1px solid var(--sph-border);border-radius:3px;padding:1px 4px">
+          ${['white','pink','brown'].map(t=>`<option value="${t}"${(ly.noise?.type||'white')===t?' selected':''}>${t}</option>`).join('')}
+        </select>
+        Mix<input type="range" min="0" max="1" step=".01" value="${ly.noise?.mix||0}" oninput="window._D.waves[${wi}].layers[${li}].noise.mix=+this.value" style="width:50px;accent-color:var(--sph-accent)">
+        <span>Vel→G</span><input type="range" min="0" max="1" step=".01" value="${ly.velocityMapping?.gain??1}" oninput="window._D.waves[${wi}].layers[${li}].velocityMapping.gain=+this.value" style="width:45px;accent-color:var(--sph-accent)" title="Velocity→Gain mapping">
+        <span>Vel→F</span><input type="range" min="0" max="1" step=".01" value="${ly.velocityMapping?.filtFreq??0}" oninput="window._D.waves[${wi}].layers[${li}].velocityMapping.filtFreq=+this.value" style="width:45px;accent-color:var(--sph-accent)" title="Velocity→Filter cutoff">
+      </div>
+    </div>`).join('')}
+    ${btn('+ Layer','window._D._addLayer()')}
+  </div>
+  <div><div style="font-size:9px;color:var(--sph-dim);letter-spacing:1px;text-transform:uppercase;margin-bottom:6px">ADSR — drag points</div>
+    <canvas id="daw-adsr" width="440" height="100" style="width:100%;max-width:440px;height:100px;background:var(--sph-surface);border:1px solid var(--sph-border);border-radius:4px;cursor:crosshair;display:block"></canvas>
+  </div>
+  <div><div style="font-size:9px;color:var(--sph-dim);letter-spacing:1px;text-transform:uppercase;margin-bottom:6px">FILTER</div>
+    <div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px">
+      ${ft.map(t=>`<button onclick="window._D.waves[${wi}].layers[0].filt.type='${t}';window._D._reopen()" style="font-family:var(--sph-font,monospace);font-size:9px;padding:2px 7px;border-radius:3px;cursor:pointer;background:${filt.type===t?'var(--sph-accent)20':'transparent'};color:${filt.type===t?'var(--sph-accent)':'var(--sph-dim)'};border:1px solid ${filt.type===t?'var(--sph-accent)':'var(--sph-border)'}">${t}</button>`).join('')}
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;font-size:9px;color:var(--sph-dim);flex-wrap:wrap">
+      <span>Slope</span>
+      ${[-12,-24].map(s=>`<button onclick="window._D.waves[${wi}].layers[0].filt.slope=${s}" style="font-family:var(--sph-font,monospace);font-size:9px;padding:2px 7px;border-radius:3px;cursor:pointer;background:${(filt.slope||(-12))===s?'var(--sph-accent)20':'transparent'};color:${(filt.slope||(-12))===s?'var(--sph-accent)':'var(--sph-dim)'};border:1px solid ${(filt.slope||(-12))===s?'var(--sph-accent)':'var(--sph-border)'}">${s}dB</button>`).join('')}
+      <span style="margin-left:8px">Drive</span>
+      <input type="range" min="0" max="1" step=".01" value="${filt.drive||0}" oninput="window._D.waves[${wi}].layers[0].filt.drive=+this.value" style="width:70px;accent-color:var(--sph-accent)" title="Filter drive/saturation">
+    </div>
+    <canvas id="daw-filt" width="440" height="90" style="width:100%;max-width:440px;height:90px;background:var(--sph-surface);border:1px solid var(--sph-border);border-radius:4px;cursor:crosshair;display:block"></canvas>
+  </div>
+</div>`;
+}
+
+// ── NOTE HTML ────────────────────────────────────────────────────
+function noteHTML(){
+  const sn=D.sn||0;const note=D.notes[sn]||D.notes[0];
+  const _snt=D.snt??D.tracks.findIndex(t=>!t.isMaster);
+  return `<div style="display:flex;flex-direction:column;height:100%;overflow:hidden">
+<div style="display:flex;align-items:center;gap:5px;padding:4px 8px;border-bottom:1px solid var(--sph-border);flex-shrink:0;flex-wrap:nowrap">
+  <select onchange="window._D.sn=+this.value;window._D._reopen()" style="font-family:var(--sph-font,monospace);font-size:10px;background:var(--sph-surface2);color:var(--sph-text);border:1px solid var(--sph-border);border-radius:3px;padding:2px 5px;max-width:80px">
+    ${D.notes.map((n,i)=>`<option value="${i}"${i===sn?' selected':''}>${n.name}</option>`).join('')}
+  </select>
+  ${btn('+','window._D._addNote()','ok')}
+  <div style="flex:1"></div>
+  <select id="daw-ntrk" onchange="window._D.snt=+this.value;drawRoll&&drawRoll()" style="font-family:var(--sph-font,monospace);font-size:10px;background:var(--sph-surface2);color:var(--sph-text);border:1px solid var(--sph-border);border-radius:3px;padding:2px 5px;max-width:80px">
+    ${D.tracks.filter(t=>!t.isMaster).map(t=>{const i=D.tracks.indexOf(t);return`<option value="${i}"${i===_snt?' selected':''}>${t.name}</option>`;}).join('')}
+  </select>
+  <span style="display:inline-block;width:10px;height:10px;border-radius:2px;flex-shrink:0;background:${trackColor(D.tracks[_snt]||D.tracks[1]||D.tracks[0])}"></span>
+  <select id="daw-nwave" style="font-family:var(--sph-font,monospace);font-size:10px;background:var(--sph-surface2);color:var(--sph-text);border:1px solid var(--sph-border);border-radius:3px;padding:2px 4px;max-width:65px">
+    ${D.waves.map((w,i)=>`<option value="${i}">${w.name}</option>`).join('')}
+  </select>
+  <select id="daw-nlen" style="font-family:var(--sph-font,monospace);font-size:10px;background:var(--sph-surface2);color:var(--sph-text);border:1px solid var(--sph-border);border-radius:3px;padding:2px 4px;max-width:55px">
+    <option value="1">1/16</option><option value="2">1/8</option>
+    <option value="4" selected>1/4</option><option value="8">1/2</option>
+    <option value="16">1bar</option><option value="32">2bar</option>
+  </select>
+  <select id="daw-atrack" onchange="window._D.autoTrack=this.value;drawRoll&&drawRoll()" style="font-family:var(--sph-font,monospace);font-size:10px;background:var(--sph-surface2);color:var(--sph-text);border:1px solid var(--sph-border);border-radius:3px;padding:2px 4px;max-width:55px">
+    <option value="master">M</option>
+    ${D.tracks.filter(t=>!t.isMaster).map(t=>`<option value="${t.id}">${t.name.substring(0,5)}</option>`).join('')}
+  </select>
+  <select id="daw-aparam" onchange="window._D.autoParam=this.value;drawRoll&&drawRoll()" style="font-family:var(--sph-font,monospace);font-size:10px;background:var(--sph-surface2);color:var(--sph-text);border:1px solid var(--sph-border);border-radius:3px;padding:2px 4px;max-width:50px">
+    <option value="volume">VOL</option><option value="bpm">BPM</option><option value="pan">PAN</option>
+    <option value="lo">LO</option><option value="mid">MID</option><option value="hi">HI</option>
+  </select>
+  ${btn('▶','window._D._playNote()','ok')}
+  ${btn('✕','window._D._clrNote()','err')}
+  ${btn('A✕','window._D._clrAuto()','err')}
+</div>
+<div style="flex:1;overflow:auto;background:var(--sph-bg)">
+  <canvas id="daw-roll" style="display:block;cursor:crosshair"></canvas>
+</div></div>`;
+}
+
+// ── Sub Panel (frame-b: property inspector) ─────────────────────
+function subPanelHTML(){
+  const s=D.tab;
+  const sel=(id,val,opts,on)=>`<select id="${id}" onchange="${on}" style="font-family:var(--sph-font,monospace);font-size:10px;background:var(--sph-surface2);color:var(--sph-text);border:1px solid var(--sph-border);border-radius:3px;padding:2px 5px;width:100%">${opts.map(([v,l])=>`<option value="${v}"${v===val?' selected':''}>${l}</option>`).join('')}</select>`;
+  const num=(id,val,min,max,on,w)=>`<input type="number" id="${id}" value="${val}" min="${min}" max="${max}" onchange="${on}" style="font-family:var(--sph-font,monospace);font-size:10px;width:${w||50}px;background:var(--sph-surface2);color:var(--sph-text);border:1px solid var(--sph-border);border-radius:3px;padding:2px 4px;text-align:center">`;
+  const row=(label,ctrl)=>`<div style="display:flex;align-items:center;justify-content:space-between;gap:6px;margin-bottom:7px"><span style="font-size:9px;color:var(--sph-dim);white-space:nowrap">${label}</span>${ctrl}</div>`;
+  const sec=(title,body)=>`<div style="margin-bottom:10px"><div style="font-size:9px;color:var(--sph-dim);letter-spacing:1px;text-transform:uppercase;margin-bottom:5px;padding-bottom:3px;border-bottom:1px solid var(--sph-border)">${title}</div>${body}</div>`;
+  const bb=(l,oc,c)=>btn(l,oc,c);
+
+  // ── TRACK tab: selected track inspector ──────────────────────
+  if(s==='track'){
+    const oi=D._openTrk;
+    if(oi==null){
+      return`<div style="padding:14px 12px;color:var(--sph-dim);font-size:9px">Click a track to inspect</div>`;
+    }
+    const tr=D.tracks[oi];if(!tr)return'';
+    const col=tr.isMaster?'#f5c842':trackColor(tr);
+    return`<div style="padding:12px;overflow-y:auto;height:100%;box-sizing:border-box">
+${sec('Track',`<div style="display:flex;gap:6px;align-items:center;margin-bottom:7px">
+  <span style="display:inline-block;width:14px;height:14px;border-radius:3px;background:${col};border:2px solid rgba(255,255,255,.2);flex-shrink:0;cursor:pointer" onclick="document.getElementById('fb-tc').click()"></span>
+  <input type="color" id="fb-tc" value="${col}" style="position:absolute;opacity:0;width:0;height:0" onchange="window._D.tracks[${oi}].color=this.value;window._D._reopen()">
+  <input value="${tr.name}" onchange="window._D.tracks[${oi}].name=this.value" style="font-family:inherit;font-size:11px;font-weight:700;background:transparent;border:none;border-bottom:1px solid var(--sph-border);color:var(--sph-accent);padding:2px 4px;flex:1;min-width:0">
+</div>`)}
+${sec('Mix',`
+${row('Volume',`<div style="display:flex;align-items:center;gap:4px;flex:1"><input type="range" min="0" max="1" step=".01" value="${tr.vol}" oninput="window._D.tracks[${oi}].vol=+this.value${tr.isMaster?';if(window._D.masterGain)window._D.masterGain.gain.value=+this.value':''};document.getElementById('fb-v${oi}').textContent=(+this.value).toFixed(2)" style="flex:1;accent-color:var(--sph-accent)"><span id="fb-v${oi}" style="font-size:9px;color:var(--sph-text);min-width:30px;text-align:right">${tr.vol.toFixed(2)}</span></div>`)}
+${row('Pan',`<div style="display:flex;align-items:center;gap:4px;flex:1"><input type="range" min="-1" max="1" step=".01" value="${tr.pan}" oninput="window._D.tracks[${oi}].pan=+this.value${tr.isMaster?';if(window._D.masterPan)window._D.masterPan.pan.value=+this.value':''};document.getElementById('fb-p${oi}').textContent=+this.value===0?'C':+this.value>0?'R'+(+this.value).toFixed(2):'L'+Math.abs(+this.value).toFixed(2)" style="flex:1;accent-color:var(--sph-accent)"><span id="fb-p${oi}" style="font-size:9px;color:var(--sph-text);min-width:30px;text-align:right">${tr.pan===0?'C':tr.pan>0?'R'+tr.pan.toFixed(2):'L'+Math.abs(tr.pan).toFixed(2)}</span></div>`)}
+<label style="display:flex;align-items:center;gap:4px;font-size:9px;color:var(--sph-dim);cursor:pointer"><input type="checkbox" ${tr.mute?'checked':''} onchange="window._D.tracks[${oi}].mute=this.checked" style="accent-color:var(--sph-err)">MUTE</label>`)}
+${!tr.isMaster?sec('Route',`
+${row('Wave',sel('fb-wave',tr.waveId,D.waves.map(w=>[w.id,w.name]),`window._D.tracks[${oi}].waveId=this.value;window._D._reopen()`))}
+${row('Note',sel('fb-note',tr.noteId,D.notes.map(n=>[n.id,n.name]),`window._D.tracks[${oi}].noteId=this.value;window._D._reopen()`))}
+<div style="display:flex;gap:4px;margin-top:4px">${bb('Edit Note',`window._D.sn=window._D.notes.findIndex(n=>n.id===window._D.tracks[${oi}].noteId);window._D.tab='note';window._D._reopen()`)}${bb('▶',`window._D._playTrk(${oi})`,'ok')}${bb('✕ Del',`window._D._delTrk(${oi})`,'err')}</div>`):''}
+${sec('FX',fxHTML(tr.fx,oi))}
+</div>`;
+  }
+
+  // ── NOTE tab: note properties + drawing + automation ─────────
+  if(s==='note'){
+    const sn=D.sn||0;const note=D.notes[sn]||D.notes[0];
+    const snt=D.snt??D.tracks.findIndex(t=>!t.isMaster);
+    const atrk=D.tracks[snt]||null;
+    const atrkColor=atrk?trackColor(atrk):'#4c8ef5';
+    const autoTid=D.autoTrack||'master';
+    const autoTrkName=autoTid==='master'?'Master':(D.tracks.find(t=>t.id===autoTid)?.name||autoTid);
+    const autoColor=autoTid==='master'?'#f5c842':trackColor(D.tracks.find(t=>t.id===autoTid)||D.tracks[1]);
+    return`<div style="padding:12px;overflow-y:auto;height:100%;box-sizing:border-box">
+${sec('Note',`
+${row('Pattern',sel('fb-note',sn,D.notes.map((n,i)=>[i,n.name]),`window._D.sn=+this.value;window._D._reopen()`))}
+<div style="display:flex;gap:4px;margin-bottom:7px">${bb('+ Note','window._D._addNote()','ok')}${bb('▶ Play','window._D._playNote()','ok')}${bb('CLR','window._D._clrNote()','err')}</div>
+${row('BPM',num('fb-bpm',note.bpm,40,300,`window._D.notes[${sn}].bpm=+this.value`,52))}
+${row('Bars',num('fb-bars',note.bars,1,64,`window._D.notes[${sn}].bars=Math.max(1,Math.min(64,+this.value));window._D._reopen()`,52))}`)}
+${sec('Drawing',`
+<div style="display:flex;align-items:center;gap:6px;margin-bottom:7px">
+  <span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:${atrkColor};flex-shrink:0"></span>
+  ${sel('fb-ntrk',snt,D.tracks.filter(t=>!t.isMaster).map(t=>[D.tracks.indexOf(t),t.name]),`window._D.snt=+this.value;drawRoll&&drawRoll();document.getElementById('daw-ntrk')&&(document.getElementById('daw-ntrk').value=this.value)`)}
+</div>
+${row('Wave',sel('fb-nwave',null,D.waves.map((w,i)=>[i,w.name]),`document.getElementById('daw-nwave')&&(document.getElementById('daw-nwave').value=this.value)`))}
+${row('Length',`<select id="fb-nlen" onchange="document.getElementById('daw-nlen')&&(document.getElementById('daw-nlen').value=this.value)" style="font-family:var(--sph-font,monospace);font-size:10px;background:var(--sph-surface2);color:var(--sph-text);border:1px solid var(--sph-border);border-radius:3px;padding:2px 5px;width:100%"><option value="1">1/16</option><option value="2">1/8</option><option value="4" selected>1/4</option><option value="8">1/2</option><option value="16">1 bar</option><option value="32">2 bars</option></select>`)}`)}
+${sec('Automation',`
+<div style="display:flex;align-items:center;gap:6px;margin-bottom:7px">
+  <span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:${autoColor};flex-shrink:0"></span>
+  ${sel('fb-atrack',autoTid,[['master','Master'],...D.tracks.filter(t=>!t.isMaster).map(t=>[t.id,t.name])],`window._D.autoTrack=this.value;drawRoll&&drawRoll();document.getElementById('daw-atrack')&&(document.getElementById('daw-atrack').value=this.value)`)}
+</div>
+${row('Param',`<select id="fb-aparam" onchange="window._D.autoParam=this.value;drawRoll&&drawRoll();document.getElementById('daw-aparam')&&(document.getElementById('daw-aparam').value=this.value)" style="font-family:var(--sph-font,monospace);font-size:10px;background:var(--sph-surface2);color:var(--sph-text);border:1px solid var(--sph-border);border-radius:3px;padding:2px 5px;width:100%"><option value="volume">Volume</option><option value="bpm">BPM</option><option value="pan">Pan</option><option value="lo">EQ Lo</option><option value="mid">EQ Mid</option><option value="hi">EQ Hi</option></select>`)}
+${bb('CLR Auto','window._D._clrAuto()','err')}`)}
+</div>`;
+  }
+
+  // ── WAVE tab: wave list (moved from inline left-pane) ─────────
+  if(s==='wave'){
+    const wi=D.sw||0;
+    return`<div style="height:100%;display:flex;flex-direction:column;overflow:hidden">
+<div style="padding:6px 10px;font-size:9px;color:var(--sph-dim);letter-spacing:1px;text-transform:uppercase;border-bottom:1px solid var(--sph-border);flex-shrink:0">WAVES</div>
+<div style="padding:6px 10px;border-bottom:1px solid var(--sph-border);display:flex;gap:6px;flex-shrink:0">
+  ${bb('+ Wave','window._D._addWave()','ok')}
+  ${bb('✕ Del','window._D._delWave()','err')}
+  ${bb('▶ Preview','window._D._preview()','ok')}
+</div>
+<div style="flex:1;overflow-y:auto">
+${D.waves.map((wv,i)=>`<div onclick="window._D.sw=${i};window._D._reopen()" style="padding:7px 10px;cursor:pointer;background:${i===wi?'var(--sph-surface2)':'transparent'};border-left:3px solid ${i===wi?'var(--sph-accent)':'transparent'}">
+  <div style="font-size:10px;font-weight:700;color:${i===wi?'var(--sph-accent)':'var(--sph-text)'}">${wv.name}</div>
+  <div style="font-size:9px;color:var(--sph-dim)">${wv.layers.map(l=>l.type).join('+')}${wv.chain?.length?' ⊕':''}</div>
+</div>`).join('')}
+</div></div>`;
+  }
+  // ── EXPORT section (all tabs) ──────────────────────────────
+  return`<div style="padding:12px;overflow-y:auto;height:100%;box-sizing:border-box">
+${sec('Export',`
+<div style="font-size:9px;color:var(--sph-dim);margin-bottom:10px;line-height:1.6">
+  Unmuted tracks · Bars×BPM length<br>
+  Reverb/Echo tail auto-added
+</div>
+<div style="display:flex;flex-direction:column;gap:8px">
+  <div>
+    <div style="font-size:9px;color:var(--sph-dim);margin-bottom:4px">WAV — OfflineAudioContext, with FX</div>
+    ${bb('↓ WAV','window._D._exportWAV()','acc')}
+  </div>
+  <div>
+    <div style="font-size:9px;color:var(--sph-dim);margin-bottom:4px">WebM/Ogg — Opus (Chrome/Edge) or WAV fallback</div>
+    ${bb('↓ WebM','window._D._exportWebM()')}
+  </div>
+</div>
+`)}
+</div>`;
+}
+
+// ── Panel ────────────────────────────────────────────────────────
+function panelHTML(){
+  const tb=(n,l)=>`<button onclick="window._D.tab='${n}';window._D._reopen()" style="font-family:var(--sph-font,monospace);font-size:10px;font-weight:700;padding:6px 16px;border:none;border-bottom:2px solid ${D.tab===n?'var(--sph-accent)':'transparent'};background:transparent;color:${D.tab===n?'var(--sph-accent)':'var(--sph-dim)'};cursor:pointer;text-transform:uppercase;letter-spacing:1px">${l}</button>`;
+  return `<div id="daw-root" class="sph-panel" style="height:100%;display:flex;flex-direction:column;overflow:hidden">
+  <div style="display:flex;align-items:center;gap:4px;padding:6px 14px;border-bottom:1px solid var(--sph-border);flex-shrink:0;background:var(--sph-surface)">
+    <span style="font-size:11px;letter-spacing:3px;color:var(--sph-accent)">◆ DAW</span>
+    ${tb('track','Tracks')}${tb('wave','Waves')}${tb('note','Notes')}
+    <div style="flex:1"></div>
+    ${btn('↓ Save','window._D._save()','ok')}
+    ${btn('↑ Load','window._D._load()')}
+    ${btn('← Back',"sph.call('ide.frame.unmount')")}
+  </div>
+  <div id="daw-body" style="flex:1;overflow:hidden">
+    ${D.tab==='track'?trackHTML():D.tab==='wave'?waveHTML():noteHTML()}
+  </div>
+</div>`;
+}
+
+// ── After mount ──────────────────────────────────────────────────
+function afterMount(){
+  if(D.tab==='wave'){drawADSR();drawFilt();setupADSR();setupFilt();}
+  else if(D.tab==='note'){
+    // sync param selector to D.autoParam
+    const at=document.getElementById('daw-atrack');
+    if(at)at.value=D.autoTrack||'master';
+    const ap=document.getElementById('daw-aparam');
+    if(ap)ap.value=D.autoParam||'volume';
+    // sync frame-b selectors too
+    const fat=document.getElementById('fb-atrack');
+    if(fat)fat.value=D.autoTrack||'master';
+    const fap=document.getElementById('fb-aparam');
+    if(fap)fap.value=D.autoParam||'volume';
+    const fnt=document.getElementById('fb-ntrk');
+    if(fnt)fnt.value=D.snt??D.tracks.findIndex(t=>!t.isMaster);
+    const ffmt=document.getElementById('fb-fmt');
+    if(ffmt)ffmt.value=D.exportFormat||'both';
+    drawRoll();
+    const c=document.getElementById('daw-roll');
+    if(c){c.onmousedown=rollDown;c.oncontextmenu=e=>{e.preventDefault();rollErase(e);};}
+  }
+}
+
+// ── Piano Roll ───────────────────────────────────────────────────
+const PMIN=24,PMAX=84,CW=24,CH=14,PW=52,HH=32;
+// Automation lane height per param row (stacked above piano roll)
+const ALH=36;  // height of automation lane
+// Param definitions: id, label, color, min, max, default, unit
+const AUTO_PARAMS=[
+  {id:'volume', label:'VOL',  color:'#2de881', min:0,   max:1,   def:1,   unit:'',   interp:'lerp'},
+  {id:'bpm',    label:'BPM',  color:'#f5c842', min:40,  max:240, def:120, unit:'',   interp:'step'},
+  {id:'pan',    label:'PAN',  color:'#22d3ee', min:-1,  max:1,   def:0,   unit:'',   interp:'lerp'},
+  {id:'lo',     label:'LO',   color:'#c084fc', min:-12, max:12,  def:0,   unit:'dB', interp:'lerp'},
+  {id:'mid',    label:'MID',  color:'#fb923c', min:-12, max:12,  def:0,   unit:'dB', interp:'lerp'},
+  {id:'hi',     label:'HI',   color:'#f05575', min:-12, max:12,  def:0,   unit:'dB', interp:'lerp'},
+];
+function autoParamDef(id){return AUTO_PARAMS.find(p=>p.id===id)||AUTO_PARAMS[0];}
+// normalize value 0→1 within param range
+function autoNorm(pd,v){return (v-pd.min)/(pd.max-pd.min);}
+// denormalize 0→1 to param range
+function autoDenorm(pd,n){return pd.min+n*(pd.max-pd.min);}
+const COLORS=['#4c8ef5','#2de881','#f5c842','#f05575','#c084fc','#22d3ee','#fb923c'];
+const TRACK_PALETTE=['#4c8ef5','#2de881','#f5c842','#f05575','#c084fc','#22d3ee','#fb923c','#e879f9','#34d399','#f97316','#60a5fa','#a78bfa'];
+function trackColor(tr){return tr&&tr.color?tr.color:TRACK_PALETTE[(D.tracks.indexOf(tr)+TRACK_PALETTE.length)%TRACK_PALETTE.length]||'#4c8ef5';}
+function drawRoll(){
+  const c=document.getElementById('daw-roll');if(!c)return;
+  const note=D.notes[D.sn||0];if(!note)return;
+  const cells=note.bars*16,W=PW+cells*CW;
+  const AH=ALH;  // automation lane height
+  const H=HH+AH+(PMAX-PMIN+1)*CH;  // total: header + auto lane + piano roll
+  c.width=W;c.height=H;
+  const rollY=HH+AH;  // y where piano roll starts
+  const ctx=c.getContext('2d');
+  const BLACK=[1,3,6,8,10];
+  const bg=cv('--sph-bg')||'#06090f',surf=cv('--sph-surface')||'#0d1520';
+  const surf2=cv('--sph-surface2')||'#111d2a',border=cv('--sph-border')||'#1a2a3a';
+  const accent=cv('--sph-accent')||'#4c8ef5',dim=cv('--sph-dim')||'#5a7a9a';
+  for(let p=PMAX;p>=PMIN;p--){
+    const row=PMAX-p,y=rollY+row*CH;
+    ctx.fillStyle=BLACK.includes(p%12)?surf2:bg;ctx.fillRect(PW,y,cells*CW,CH);
+    if(p%12===0){ctx.fillStyle=surf;ctx.fillRect(PW,y,cells*CW,1);}
+    ctx.strokeStyle=border+'55';ctx.lineWidth=.5;ctx.beginPath();ctx.moveTo(PW,y);ctx.lineTo(W,y);ctx.stroke();
+  }
+  for(let b=0;b<=cells;b++){
+    const x=PW+b*CW,isBar=b%16===0,isBeat=b%4===0;
+    ctx.strokeStyle=isBar?accent:isBeat?dim:border+'44';ctx.lineWidth=isBar?1.5:isBeat?.8:.4;
+    ctx.beginPath();ctx.moveTo(x,rollY);ctx.lineTo(x,H);ctx.stroke();
+  }
+  ctx.fillStyle=surf;ctx.fillRect(0,0,W,HH);
+  ctx.strokeStyle=border;ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(0,HH);ctx.lineTo(W,HH);ctx.stroke();
+  // draw automation lane separator
+  ctx.strokeStyle=border;ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(0,rollY);ctx.lineTo(W,rollY);ctx.stroke();
+  ctx.fillStyle=dim;ctx.font='bold 9px monospace';ctx.textBaseline='middle';
+  for(let b=0;b<cells;b+=4){const bar=Math.floor(b/16)+1,beat=Math.floor((b%16)/4)+1;ctx.fillText(beat===1?''+bar:''+beat,PW+b*CW+3,HH/2);}
+  // Track color legend (right side of header)
+  const sntL=D.snt??D.tracks.findIndex(t=>!t.isMaster);
+  const activeTrkL=D.tracks[sntL]||null;
+  const legendTrks=D.tracks.filter(t=>!t.isMaster&&t.noteId===note.id);
+  let lx=W-6;
+  ctx.font='bold 8px monospace';ctx.textBaseline='middle';
+  for(let li=legendTrks.length-1;li>=0;li--){
+    const lt=legendTrks[li],lc=trackColor(lt),isAct=lt===activeTrkL;
+    const tw=ctx.measureText(lt.name).width;
+    const bw=tw+16;lx-=bw;
+    // badge background
+    ctx.fillStyle=isAct?lc:lc+'66';
+    if(ctx.roundRect){ctx.beginPath();ctx.roundRect(lx,HH/2-7,bw,14,3);ctx.fill();}
+    else{ctx.fillRect(lx,HH/2-7,bw,14);}
+    // badge text
+    ctx.fillStyle=isAct?'rgba(0,0,0,.75)':'rgba(255,255,255,.55)';
+    ctx.fillText(lt.name,lx+8,HH/2);
+    lx-=4;
+  }
+
+  for(let p=PMAX;p>=PMIN;p--){
+    const row=PMAX-p,y=rollY+row*CH;
+    ctx.fillStyle=BLACK.includes(p%12)?'#1a1a2a':'#d8d8d8';ctx.fillRect(1,y+1,PW-3,CH-1);
+    if(p%12===0){ctx.fillStyle='#777';ctx.font='8px monospace';ctx.textBaseline='middle';ctx.fillText('C'+(Math.floor(p/12)-1),2,y+CH/2);}
+  }
+  // Draw all tracks linked to this note — non-active first, active on top
+  const snt=D.snt??D.tracks.findIndex(t=>!t.isMaster);
+  const activeTrk=D.tracks[snt]||null;
+  const linkedTracks=D.tracks.filter(t=>!t.isMaster&&t.noteId===note.id);
+  // active drawn last so it appears on top
+  const drawOrder=[...linkedTracks.filter(t=>t!==activeTrk),...(activeTrk&&linkedTracks.includes(activeTrk)?[activeTrk]:[])];
+  // ── Automation lane (between header and piano roll) ──────────
+  {
+    const noteId=note.id;
+    const autos=(D.automation[noteId]||[]);
+    const pd=autoParamDef(D.autoParam);
+    const atid=D.autoTrack||'master';
+    // lane color: master=yellow, track=trackColor
+    const laneColor=atid==='master'?'#f5c842':trackColor(D.tracks.find(t=>t.id===atid)||D.tracks[1]);
+    const laneY=HH, laneH=AH;
+    // lane background
+    ctx.fillStyle=surf;ctx.fillRect(0,laneY,W,laneH);
+    ctx.fillStyle=bg;ctx.fillRect(PW,laneY,cells*CW,laneH);
+    // track label in gutter (left)
+    const trkLabel=atid==='master'?'M':(D.tracks.find(t=>t.id===atid)?.name||atid).substring(0,3);
+    ctx.fillStyle=laneColor;ctx.font='bold 8px monospace';ctx.textBaseline='top';
+    ctx.fillText(trkLabel,2,laneY+2);
+    // param label
+    ctx.fillStyle=laneColor;ctx.font='bold 9px monospace';ctx.textBaseline='middle';
+    ctx.fillText(pd.label,4,laneY+laneH/2);
+    ctx.fillStyle=dim;ctx.font='7px monospace';
+    ctx.fillText(pd.max+(pd.unit||''),4,laneY+4);
+    ctx.fillText(pd.min+(pd.unit||''),4,laneY+laneH-4);
+    // midline (for params with 0 in middle, like pan/lo/mid/hi)
+    if(pd.min<0&&pd.max>0){
+      const midN=autoNorm(pd,0);
+      const midPx=laneY+laneH-(midN*laneH);
+      ctx.strokeStyle=border+'88';ctx.lineWidth=.5;
+      ctx.setLineDash([3,3]);ctx.beginPath();
+      ctx.moveTo(PW,midPx);ctx.lineTo(W,midPx);ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    // bar lines in lane
+    for(let b=0;b<=cells;b++){
+      const x=PW+b*CW,isBar=b%16===0,isBeat=b%4===0;
+      ctx.strokeStyle=isBar?accent+'88':isBeat?dim+'44':border+'22';
+      ctx.lineWidth=isBar?1:.5;
+      ctx.beginPath();ctx.moveTo(x,laneY);ctx.lineTo(x,laneY+laneH);ctx.stroke();
+    }
+    // collect points for this param, sorted by cell
+    const pts=autos.filter(a=>a.param===pd.id&&(a.trackId||'master')===atid).sort((a,b)=>a.cell-b.cell);
+    // draw automation curve: lerp=直線補間, step=階段
+    if(pts.length>0){
+      const isStep=(pd.interp==='step');
+      const defN=autoNorm(pd,pd.def);
+      // fill area under curve
+      ctx.fillStyle=laneColor+'18';
+      ctx.beginPath();
+      ctx.moveTo(PW,laneY+laneH-(defN*laneH));
+      let prevN=defN;
+      for(const pt of pts){
+        const px=PW+pt.cell*CW,pn=autoNorm(pd,pt.value);
+        if(isStep){ctx.lineTo(px,laneY+laneH-(prevN*laneH));ctx.lineTo(px,laneY+laneH-(pn*laneH));}
+        else       {ctx.lineTo(px,laneY+laneH-(pn*laneH));}
+        prevN=pn;
+      }
+      ctx.lineTo(W,laneY+laneH-(prevN*laneH));
+      ctx.lineTo(W,laneY+laneH);ctx.lineTo(PW,laneY+laneH);ctx.closePath();ctx.fill();
+      // draw line
+      ctx.strokeStyle=laneColor+'cc';ctx.lineWidth=1.5;ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.moveTo(PW,laneY+laneH-(defN*laneH));
+      prevN=defN;
+      for(const pt of pts){
+        const px=PW+pt.cell*CW,pn=autoNorm(pd,pt.value);
+        if(isStep){ctx.lineTo(px,laneY+laneH-(prevN*laneH));ctx.lineTo(px,laneY+laneH-(pn*laneH));}
+        else       {ctx.lineTo(px,laneY+laneH-(pn*laneH));}
+        prevN=pn;
+      }
+      ctx.lineTo(W,laneY+laneH-(prevN*laneH));
+      ctx.stroke();
+      // draw point markers + value labels
+      for(const pt of pts){
+        const px=PW+pt.cell*CW,pn=autoNorm(pd,pt.value),py=laneY+laneH-(pn*laneH);
+        // marker circle
+        ctx.fillStyle=laneColor;
+        ctx.beginPath();ctx.arc(px,py,4,0,Math.PI*2);ctx.fill();
+        ctx.strokeStyle=bg;ctx.lineWidth=1.5;
+        ctx.beginPath();ctx.arc(px,py,4,0,Math.PI*2);ctx.stroke();
+        // value label
+        const vStr=pd.id==='bpm'?Math.round(pt.value)+'':+pt.value.toFixed(2)+'';
+        ctx.fillStyle='rgba(255,255,255,.85)';ctx.font='bold 7px monospace';ctx.textBaseline='bottom';
+        ctx.fillText(vStr,px+5,py-1);
+      }
+    }
+  }
+  // ── end automation lane ──────────────────────────────────────
+
+  // fallback: events without trackId → first linked track
+  const fallbackTrk=linkedTracks[0]||null;
+  for(const tr of drawOrder){
+    const isActive=tr===activeTrk;
+    const tcolor=trackColor(tr);
+    const noteAlpha=isActive?'':'88';
+    // draw only events belonging to this track
+    const trEvents=note.events.filter(ev=>ev.trackId===tr.id||((!ev.trackId||ev.trackId===null)&&tr===fallbackTrk));
+    for(const ev of trEvents){
+      const row=PMAX-ev.pitch;if(row<0||row>PMAX-PMIN)continue;
+      const x=PW+ev.start*CW,y=rollY+row*CH+1,nw=Math.max(CW-1,ev.dur*CW-1);
+      ctx.fillStyle=tcolor+noteAlpha;
+      if(ctx.roundRect){ctx.beginPath();ctx.roundRect(x,y,nw,CH-2,2);ctx.fill();}else ctx.fillRect(x,y,nw,CH-2);
+      if(nw>20){
+        ctx.fillStyle=isActive?'rgba(255,255,255,.85)':'rgba(255,255,255,.4)';
+        ctx.font=(isActive?'bold ':'')+'8px monospace';ctx.textBaseline='middle';
+        ctx.fillText(pname(ev.pitch),x+3,y+CH/2-1);
+      }
+      // velocity bar
+      ctx.fillStyle=tcolor+(isActive?'aa':'44');
+      ctx.fillRect(x,y+CH-4,nw*(ev.vel/127),2);
+    }
+  }
+}
+function rollDown(e){
+  if(e.button!==0)return;
+  const c=document.getElementById('daw-roll');if(!c)return;
+  if(!c.width)drawRoll();
+  const r=c.getBoundingClientRect();if(!r.width)return;
+  const cx=(e.clientX-r.left)*c.width/r.width,cy=(e.clientY-r.top)*c.height/r.height;
+  if(cy<HH)return;
+  const note=D.notes[D.sn||0];if(!note)return;
+  const cell=Math.floor((cx-PW)/CW);
+  if(cell<0||cell>=note.bars*16)return;
+  const rollY=HH+ALH;
+
+  // ── Automation lane click (HH ~ rollY) ──
+  if(cy>=HH&&cy<rollY){
+    const pd=autoParamDef(D.autoParam);
+    // normalize y to value: top=max, bottom=min
+    const n=Math.max(0,Math.min(1,1-(cy-HH)/ALH));
+    const value=+autoDenorm(pd,n).toFixed(pd.id==='bpm'?0:2);
+    const nid=note.id;
+    if(!D.automation[nid])D.automation[nid]=[];
+    // remove existing point at same cell+param, then add new
+    const _atid=D.autoTrack||'master';
+    D.automation[nid]=D.automation[nid].filter(a=>!(a.param===pd.id&&a.cell===cell&&(a.trackId||'master')===_atid));
+    D.automation[nid].push({cell,param:pd.id,value,trackId:_atid});
+    drawRoll();
+    return;
+  }
+
+  // ── Piano roll click (rollY and below) ──
+  const row=Math.floor((cy-rollY)/CH);
+  const pitch=PMAX-row;
+  const dur=+(document.getElementById('daw-nlen')?.value||4);
+  const _snt=D.snt??D.tracks.findIndex(t=>!t.isMaster);
+  const _atrk=D.tracks[_snt]||null;
+  const wave=(_atrk&&!_atrk.isMaster&&D.waves.find(w=>w.id===_atrk.waveId))
+    ||(D.waves[+(document.getElementById('daw-nwave')?.value||0)])||D.waves[0];
+  const _trkId=_atrk?_atrk.id:null;
+  note.events=note.events.filter(ev=>!(ev.pitch===pitch&&ev.start<cell+dur&&ev.start+ev.dur>cell));
+  note.events.push({waveId:wave.id,trackId:_trkId,pitch,start:cell,dur,vel:100});
+  playWave(wave,midiHz(pitch),ac().currentTime+.02,Math.min(.4,dur*.1),1,[]);
+  drawRoll();
+}
+function rollErase(e){
+  const c=document.getElementById('daw-roll');if(!c||!c.width)return;
+  const r=c.getBoundingClientRect();if(!r.width)return;
+  const cx=(e.clientX-r.left)*c.width/r.width,cy=(e.clientY-r.top)*c.height/r.height;
+  const note=D.notes[D.sn||0];if(!note)return;
+  const cell=Math.floor((cx-PW)/CW);
+  const rollY=HH+ALH;
+
+  if(cy>=HH&&cy<rollY){
+    // erase automation point near click cell
+    const pd=autoParamDef(D.autoParam);
+    const nid=note.id;
+    if(D.automation[nid]){
+      const _etid=D.autoTrack||'master';
+    D.automation[nid]=D.automation[nid].filter(a=>!(a.param===pd.id&&Math.abs(a.cell-cell)<=1&&(a.trackId||'master')===_etid));
+      drawRoll();
+    }
+    return;
+  }
+
+  const row=Math.floor((cy-rollY)/CH),pitch=PMAX-row;
+  const _esnt=D.snt??D.tracks.findIndex(t=>!t.isMaster);
+  const _etrk=D.tracks[_esnt]||null;
+  const idx=note.events.findIndex(ev=>ev.pitch===pitch&&cell>=ev.start&&cell<ev.start+ev.dur&&(ev.trackId===(_etrk?.id)||!ev.trackId));
+  if(idx>=0){note.events.splice(idx,1);drawRoll();}
+}
+
+// ── ADSR ────────────────────────────────────────────────────────
+let _ad=null;
+function drawADSR(){
+  const c=document.getElementById('daw-adsr');if(!c)return;
+  const ctx=c.getContext('2d');const W=c.width,H=c.height,P=12;
+  ctx.clearRect(0,0,W,H);ctx.fillStyle=cv('--sph-surface')||'#0d1520';ctx.fillRect(0,0,W,H);
+  const l=D.waves[D.sw||0]?.layers[0];if(!l)return;
+  const{a,d,s,r}=l.adsr,total=Math.max(.6,a+d+.4+r);
+  const tx=t=>P+t/total*(W-P*2),ly=v=>H-P-v*(H-P*2);
+  ctx.strokeStyle=(cv('--sph-border')||'#1a2a3a')+'55';ctx.lineWidth=.5;
+  for(let i=0;i<=4;i++){const y=P+i*(H-P*2)/4;ctx.beginPath();ctx.moveTo(P,y);ctx.lineTo(W-P,y);ctx.stroke();}
+  const pts=[[tx(0),ly(0)],[tx(a),ly(1)],[tx(a+d),ly(s)],[tx(a+d+.4),ly(s)],[tx(a+d+.4+r),ly(0)]];
+  ctx.strokeStyle=cv('--sph-accent')||'#4c8ef5';ctx.lineWidth=2;
+  ctx.beginPath();pts.forEach(([x,y],i)=>i?ctx.lineTo(x,y):ctx.moveTo(x,y));ctx.stroke();
+  ctx.fillStyle=(cv('--sph-accent')||'#4c8ef5')+'22';
+  ctx.beginPath();pts.forEach(([x,y],i)=>i?ctx.lineTo(x,y):ctx.moveTo(x,y));
+  ctx.lineTo(W-P,ly(0));ctx.lineTo(P,ly(0));ctx.closePath();ctx.fill();
+  [[pts[1],'A'],[pts[2],'D'],[pts[3],'S'],[pts[4],'R']].forEach(([[x,y],l])=>{
+    ctx.fillStyle=cv('--sph-accent')||'#4c8ef5';ctx.beginPath();ctx.arc(x,y,5,0,Math.PI*2);ctx.fill();
+    ctx.fillStyle=cv('--sph-text')||'#ccc';ctx.font='bold 9px monospace';ctx.textBaseline='top';ctx.fillText(l,x+6,y-3);
+  });
+  ctx.fillStyle=cv('--sph-dim')||'#5a7a9a';ctx.font='9px monospace';ctx.textBaseline='bottom';
+  ctx.fillText(`A:${l.adsr.a.toFixed(3)} D:${l.adsr.d.toFixed(3)} S:${l.adsr.s.toFixed(2)} R:${l.adsr.r.toFixed(3)}`,P,H-1);
+}
+function setupADSR(){
+  const c=document.getElementById('daw-adsr');if(!c)return;
+  c.onmousedown=e=>{
+    const rect=c.getBoundingClientRect();
+    const mx=(e.clientX-rect.left)*c.width/rect.width,my=(e.clientY-rect.top)*c.height/rect.height;
+    const l=D.waves[D.sw||0]?.layers[0];if(!l)return;
+    const{a,d,s,r}=l.adsr,P=12,W=c.width,H=c.height,total=Math.max(.6,a+d+.4+r);
+    const tx=t=>P+t/total*(W-P*2),ly=v=>H-P-v*(H-P*2);
+    const chk=(px,py,k)=>Math.abs(mx-px)<10&&Math.abs(my-py)<10?k:null;
+    const k=chk(tx(a),ly(1),'a')||chk(tx(a+d),ly(s),'d_s')||chk(tx(a+d+.4),ly(s),'s')||chk(tx(a+d+.4+r),ly(0),'r');
+    if(k)_ad={k,x0:mx,y0:my,a,d,s,r,total,W:W-P*2,H:H-P*2};
+  };
+}
+// ── Filter ───────────────────────────────────────────────────────
+let _fd=null;
+function drawFilt(){
+  const c=document.getElementById('daw-filt');if(!c)return;
+  const ctx=c.getContext('2d');const W=c.width,H=c.height;
+  ctx.clearRect(0,0,W,H);ctx.fillStyle=cv('--sph-surface')||'#0d1520';ctx.fillRect(0,0,W,H);
+  const filt=D.waves[D.sw||0]?.layers[0]?.filt;if(!filt)return;
+  const fX=f=>10+Math.log10(f/20)/Math.log10(20000/20)*(W-20),dbY=db=>H/2-db*(H*.38)/24;
+  ctx.strokeStyle=(cv('--sph-border')||'#1a2a3a')+'55';ctx.lineWidth=.5;
+  [100,1000,10000].forEach(f=>{const x=fX(f);ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke();});
+  ctx.beginPath();ctx.moveTo(0,H/2);ctx.lineTo(W,H/2);ctx.stroke();
+  ctx.fillStyle=cv('--sph-dim')||'#5a7a9a';ctx.font='8px monospace';ctx.textBaseline='bottom';
+  ctx.fillText('100',fX(100)-8,H-1);ctx.fillText('1k',fX(1000)-6,H-1);ctx.fillText('10k',fX(10000)-10,H-1);
+  if(filt.type==='none'){
+    ctx.strokeStyle=(cv('--sph-ok')||'#2de881')+'88';ctx.lineWidth=1.5;
+    ctx.beginPath();ctx.moveTo(10,H/2);ctx.lineTo(W-10,H/2);ctx.stroke();
+    ctx.fillStyle=cv('--sph-dim')||'#5a7a9a';ctx.font='10px monospace';ctx.textBaseline='middle';ctx.textAlign='center';ctx.fillText('No filter',W/2,H/2-10);ctx.textAlign='left';return;
+  }
+  const fc=filt.freq,Q=filt.q;
+  ctx.strokeStyle=cv('--sph-accent')||'#4c8ef5';ctx.lineWidth=2;ctx.beginPath();let first=true;
+  for(let px=0;px<W;px++){
+    const f=20*Math.pow(1000,px/W),ratio=f/fc;let mag=1;
+    if(filt.type==='lowpass')mag=1/Math.sqrt(1+Math.pow(ratio,4)*(1-2/Q/Q)+ratio*ratio/Q/Q);
+    else if(filt.type==='highpass'){const ri=fc/f;mag=1/Math.sqrt(1+Math.pow(ri,4)*(1-2/Q/Q)+ri*ri/Q/Q);}
+    else if(filt.type==='bandpass'){const bw=ratio-1/ratio;mag=(1/Q)/Math.sqrt(bw*bw+1/Q/Q);}
+    else if(filt.type==='notch'){const bw=ratio-1/ratio;mag=Math.abs(bw)/Math.sqrt(bw*bw+1/Q/Q);}
+    const y=dbY(20*Math.log10(Math.max(.00001,mag)));
+    if(first){ctx.moveTo(px,y);first=false;}else ctx.lineTo(px,y);
+  }
+  ctx.stroke();
+  ctx.fillStyle=(cv('--sph-accent')||'#4c8ef5')+'22';ctx.lineTo(W,H/2);ctx.lineTo(0,H/2);ctx.closePath();ctx.fill();
+  const cxx=fX(fc);
+  ctx.fillStyle=cv('--sph-accent')||'#4c8ef5';ctx.beginPath();ctx.arc(cxx,H/2,5,0,Math.PI*2);ctx.fill();
+  ctx.fillStyle=cv('--sph-text')||'#ccc';ctx.font='9px monospace';ctx.textBaseline='middle';
+  ctx.fillText(fc>=1000?`${(fc/1000).toFixed(1)}kHz`:`${fc}Hz`,cxx+8,H/2);ctx.fillText(`Q:${Q.toFixed(1)}`,cxx+8,H/2+13);
+}
+function setupFilt(){
+  const c=document.getElementById('daw-filt');if(!c)return;
+  c.onmousedown=e=>{
+    const rect=c.getBoundingClientRect();
+    const mx=(e.clientX-rect.left)*c.width/rect.width,my=(e.clientY-rect.top)*c.height/rect.height;
+    const filt=D.waves[D.sw||0]?.layers[0]?.filt;if(!filt||filt.type==='none')return;
+    const fX=f=>10+Math.log10(f/20)/Math.log10(20000/20)*(c.width-20);
+    _fd={x0:mx,y0:my,q0:filt.q,near:Math.abs(mx-fX(filt.freq))<14};
+  };
+}
+document.addEventListener('mousemove',e=>{
+  if(_ad){
+    const c=document.getElementById('daw-adsr');if(!c)return;
+    const rect=c.getBoundingClientRect();
+    const mx=(e.clientX-rect.left)*c.width/rect.width,my=(e.clientY-rect.top)*c.height/rect.height;
+    const dx=(mx-_ad.x0)/_ad.W*_ad.total,dy=(my-_ad.y0)/_ad.H;
+    const cl=(v,lo,hi)=>Math.max(lo,Math.min(hi,v));
+    const l=D.waves[D.sw||0]?.layers[0];if(!l)return;
+    if(_ad.k==='a')l.adsr.a=cl(_ad.a+dx,.001,2);
+    else if(_ad.k==='d_s'){l.adsr.d=cl(_ad.d+dx,.001,2);l.adsr.s=cl(_ad.s-dy,0,1);}
+    else if(_ad.k==='s')l.adsr.s=cl(_ad.s-dy,0,1);
+    else if(_ad.k==='r')l.adsr.r=cl(_ad.r+dx,.001,4);
+    drawADSR();
+  }
+  if(_fd){
+    const c=document.getElementById('daw-filt');if(!c)return;
+    const rect=c.getBoundingClientRect();
+    const mx=(e.clientX-rect.left)*c.width/rect.width,my=(e.clientY-rect.top)*c.height/rect.height;
+    const filt=D.waves[D.sw||0]?.layers[0]?.filt;if(!filt)return;
+    if(_fd.near){const t=Math.max(.001,Math.min(1,(mx-10)/(c.width-20)));filt.freq=Math.round(20*Math.pow(1000,t));}
+    else filt.q=Math.max(.1,Math.min(20,_fd.q0+(_fd.y0-my)/4));
+    drawFilt();
+  }
+});
+document.addEventListener('mouseup',()=>{_ad=null;_fd=null;});
+// frame-mounted handled via on:{} in sph.mount below
+
+// ── Public API ───────────────────────────────────────────────────
+Object.assign(D,{
+  _reopen:reopen,
+  _save:save,
+  _load(){if(load())reopen();},
+  _addTrack(){
+    D.tracks.push({id:'t'+Date.now(),name:'Track '+(D.tracks.length),
+      waveId:D.waves[0].id,noteId:D.notes[0].id,vol:.8,pan:0,mute:false,
+      audioCache:null,cacheSource:null,
+      fx:[{type:'reverb',on:false,wet:.3,decay:2},
+          {type:'echo',on:false,wet:.3,delay:.25,feedback:.4},
+          {type:'distortion',on:false,amount:50}]});
+    reopen();
+  },
+  _delTrk(i){
+    if(!D.tracks[i].isMaster){
+      const tr=D.tracks[i];
+      // キャッシュのクリーンアップ
+      if(tr.cacheSource){try{tr.cacheSource.stop();}catch(e){}}
+      if(tr.audioCache?.url){URL.revokeObjectURL(tr.audioCache.url);}
+      D.tracks.splice(i,1);
+      reopen();
+    }
+  },
+  _playTrk(i){
+    const tr=D.tracks[i];if(!tr||tr.mute||tr.isMaster)return;
+    const ni=D.notes.findIndex(n=>n.id===tr.noteId);
+    if(ni>=0)playNote(ni,tr.fx);
+  },
+  _playAll(){
+    D.masterGain=null;
+    D.tracks.forEach(tr=>{
+      if(tr.mute||tr.isMaster)return;
+      const ni=D.notes.findIndex(n=>n.id===tr.noteId);
+      if(ni>=0)playNote(ni,tr.fx,tr.id);
+    });
+  },
+  _toggleTrk(i){D._openTrk=D._openTrk===i?null:i;reopen();},
+  _stop(){if(D.ctx){D.ctx.suspend();setTimeout(()=>D.ctx.resume(),100);}D.masterGain=null;D.trackGains={};}  ,
+  _exportWAV:()=>exportWAV(),
+  _doExport:()=>{
+    if(D.exportFormat==='wav') exportWAV();
+    else exportWebM();  // 'webm' or 'both' → rec+convert
+  },
+  _exportWebM:()=>exportWebM(),
+  _exportWebMStop:()=>{if(D._recStop)D._recStop();},
+  _addWave(){D.waves.push({id:'w'+Date.now(),name:'Wave '+(D.waves.length+1),layers:[{type:'sine',detune:0,am:{on:false,ratio:1,depth:100},fm:{on:false,ratio:2,depth:100},noise:{mix:0,type:'white'},adsr:{a:.01,d:.1,s:.7,r:.3},filt:{type:'none',slope:-12,freq:2000,q:1,drive:0},velocityMapping:{gain:1.0,filtFreq:0}}],chain:[]});D.sw=D.waves.length-1;reopen();},
+  _delWave(){if(D.waves.length>1){D.waves.splice(D.sw||0,1);D.sw=Math.max(0,(D.sw||0)-1);reopen();}},
+  _addLayer(){const w=D.waves[D.sw||0];if(w){w.layers.push({type:'sine',detune:0,am:{on:false,ratio:1,depth:100},fm:{on:false,ratio:2,depth:100},noise:{mix:0,type:'white'},adsr:{a:.01,d:.1,s:.7,r:.3},filt:{type:'none',slope:-12,freq:2000,q:1,drive:0},velocityMapping:{gain:1.0,filtFreq:0}});reopen();}},
+  _delLayer(li){const w=D.waves[D.sw||0];if(w&&w.layers.length>1){w.layers.splice(li,1);reopen();}},
+  _preview(){const w=D.waves[D.sw||0];if(w)playWave(w,440,ac().currentTime+.05,.5,1,[]);},
+  _addNote(){D.notes.push({id:'n'+Date.now(),name:'Note '+(D.notes.length+1),bpm:120,bars:4,events:[]});D.sn=D.notes.length-1;reopen();},
+  _playNote(){
+    const _psnt=D.snt??D.tracks.findIndex(t=>!t.isMaster);
+    const _ptr=D.tracks[_psnt]||null;
+    playNote(D.sn||0,_ptr?.fx||[],_ptr?.id||null);
+  },
+  _clrNote(){const n=D.notes[D.sn||0];if(n){n.events=[];drawRoll();}},
+  _clrAuto(){
+    const n=D.notes[D.sn||0];if(!n)return;
+    const tid=D.autoTrack||'master';
+    if(D.automation[n.id])
+      D.automation[n.id]=D.automation[n.id].filter(a=>
+        !(a.param===D.autoParam&&(a.trackId||'master')===tid));
+    drawRoll();
+  },
+});
+
+// ── MML Parser ───────────────────────────────────────────────────
+function parseMML(mml){
+  // Returns [{pitch(midi|null=rest), dur(seconds)}]
+  const NOTE={C:0,D:2,E:4,F:5,G:7,A:9,B:11};
+  let bpm=120,defLen=4,oct=4;
+  const events=[];
+  let i=0;const s=mml.toUpperCase().replace(/\s+/g,'');
+  function beatSec(){return 60/bpm;}
+  function durSec(len,dot){const base=beatSec()*4/len;return dot?base*1.5:base;}
+  while(i<s.length){
+    const ch=s[i];
+    if(ch==='T'){i++;let v='';while(i<s.length&&/\d/.test(s[i]))v+=s[i++];bpm=+v||120;}
+    else if(ch==='L'){i++;let v='';while(i<s.length&&/\d/.test(s[i]))v+=s[i++];defLen=+v||4;}
+    else if(ch==='O'){i++;
+      if(s[i]==='+'){oct=Math.min(8,oct+1);i++;}
+      else if(s[i]==='-'){oct=Math.max(0,oct-1);i++;}
+      else{let v='';while(i<s.length&&/\d/.test(s[i]))v+=s[i++];oct=+v||4;}
+    }
+    else if(ch==='<'){oct=Math.max(0,oct-1);i++;}
+    else if(ch==='>'){oct=Math.min(8,oct+1);i++;}
+    else if(ch in NOTE||ch==='R'){
+      i++;
+      let sharp=0;
+      if(i<s.length&&s[i]==='+'){sharp=1;i++;}
+      else if(i<s.length&&s[i]==='-'){sharp=-1;i++;}
+      let lenStr='';while(i<s.length&&/\d/.test(s[i]))lenStr+=s[i++];
+      const len=+lenStr||defLen;
+      let dot=false;if(i<s.length&&s[i]==='.'){{dot=true;i++;}}
+      const pitch=ch==='R'?null:(oct+1)*12+NOTE[ch]+sharp;
+      events.push({pitch,dur:durSec(len,dot),bpm});
+    }
+    else i++;
+  }
+  return events;
+}
+
+function playMML(mml,waveName){
+  const wave=(waveName?D.waves.find(w=>w.name===waveName):null)||D.waves[0];
+  const events=parseMML(mml);
+  const ctx=ac();let t=ctx.currentTime+.05;
+  for(const ev of events){
+    if(ev.pitch!==null)playWave(wave,midiHz(ev.pitch),t,Math.max(.05,ev.dur-.02),1,[]);
+    t+=ev.dur;
+  }
+}
+
+function playSeq(events,bpm,waveName){
+  // events: [{pitch(midi), dur(cells), vel}]
+  const wave=(waveName?D.waves.find(w=>w.name===waveName):null)||D.waves[0];
+  const cs=(60/(bpm||120))/4;
+  const ctx=ac();const now=ctx.currentTime+.05;
+  for(const ev of events){
+    if(ev.pitch!=null)
+      playWave(wave,midiHz(ev.pitch),now+ev.start*cs,ev.dur*cs,ev.vel/127||1,[]);
+  }
+}
+
+// ── Mount ───────────────────────────────────────────────────────
+sph.mount('daw','DAW','🎹',{
+  layout: {frame:'H', split:0.72},
+  panel:   ()=>panelHTML(),
+  subPanel:()=>subPanelHTML(),
+  on:{
+    'frame-mounted': ({id})=>{
+      if(id==='daw')requestAnimationFrame(()=>requestAnimationFrame(afterMount));
+    },
+  },
+  api:{
+    play:          ()=>D._playAll(),
+    'export.wav':  ()=>exportWAV(),
+    'export.webm': ()=>exportWebM(),
+    'export.stop': ()=>{if(D._recStop)D._recStop();},
+    stop:          ()=>D._stop(),
+    save:          ()=>save(),
+    // Track cache API
+    'cache.track':    (trackName)=>{const tr=D.tracks.find(t=>t.name===trackName);if(tr)cacheTrack(tr.id);},
+    'cache.play':     (trackName)=>{const tr=D.tracks.find(t=>t.name===trackName);if(tr)playCachedTrack(tr.id);},
+    'cache.stop':     (trackName)=>{const tr=D.tracks.find(t=>t.name===trackName);if(tr)stopCachedTrack(tr.id);},
+    'cache.clear':    (trackName)=>{const tr=D.tracks.find(t=>t.name===trackName);if(tr)clearTrackCache(tr.id);},
+    'cache.download': (trackName)=>{const tr=D.tracks.find(t=>t.name===trackName);if(tr)downloadTrackCache(tr.id);},
+    'cache.all':      ()=>cacheAllTracks(),
+    'play.note':   (pitchName,durCells,waveName)=>{
+      const NOTE={C:0,D:2,E:4,F:5,G:7,A:9,B:11};
+      const m=String(pitchName).toUpperCase().match(/^([A-G])([#B+\-]?)(\d+)$/);
+      if(!m)return;
+      const pc=NOTE[m[1]]+(m[2]==='#'||m[2]==='+'?1:m[2]==='B'||m[2]==='-'?-1:0);
+      const midi=(+m[3]+1)*12+pc;
+      const wave=(waveName?D.waves.find(w=>w.name===waveName):null)||D.waves[0];
+      playWave(wave,midiHz(midi),ac().currentTime+.02,((durCells||4)*(60/120))/4,1,[]);
+    },
+    'play.mml':    (mml,waveName)=>playMML(String(mml),waveName),
+    'play.seq':    (events,bpm,waveName)=>playSeq(events,bpm,waveName),
+    'play.pattern':(noteName,waveName)=>{
+      const ni=D.notes.findIndex(n=>n.name===noteName);if(ni<0)return;
+      const note=D.notes[ni];
+      const wave=(waveName?D.waves.find(w=>w.name===waveName):null)||null;
+      const ctx=ac(),now=ctx.currentTime+.1,cs=(60/note.bpm)/4;
+      for(const ev of note.events){
+        const w=wave||(D.waves.find(w=>w.id===ev.waveId)||D.waves[0]);
+        playWave(w,midiHz(ev.pitch),now+ev.start*cs,ev.dur*cs,ev.vel/127,[],ev.trackId||null);
+      }
+    },
+    'track.add':   (name,waveName,noteName)=>{
+      const wid=_findW(waveName||0)?.id||D.waves[0].id;
+      const nid=_findN(noteName||0)?.id||D.notes[0].id;
+      D.tracks.push({id:'t'+Date.now(),name:String(name||'Track '+(D.tracks.length)),
+        waveId:wid,noteId:nid,color:TRACK_PALETTE[D.tracks.length%TRACK_PALETTE.length],
+        vol:.8,pan:0,mute:false,audioCache:null,cacheSource:null,fx:_defFX()});
+      return D.tracks[D.tracks.length-1].id;
+    },
+    'track.list':  ()=>D.tracks.map((t,i)=>({index:i,name:t.name,color:trackColor(t),
+      wave:D.waves.find(w=>w.id===t.waveId)?.name,
+      note:D.notes.find(n=>n.id===t.noteId)?.name,
+      vol:t.vol,pan:t.pan,mute:t.mute})),
+    'track.vol':   (name,vol)=>{const t=_findT(name);if(t)t.vol=Math.max(0,Math.min(1,+vol));},
+    'track.pan':   (name,pan)=>{const t=_findT(name);if(t)t.pan=Math.max(-1,Math.min(1,+pan));},
+    'track.mute':  (name,mute)=>{const t=_findT(name);if(t)t.mute=!!mute;},
+    'track.color': (name,color)=>{const t=_findT(name);if(t){t.color=String(color);reopen();}},
+    'track.wave':  (name,waveName)=>{const t=_findT(name);const w=_findW(waveName);if(t&&w)t.waveId=w.id;},
+    'track.note':  (name,noteName)=>{const t=_findT(name);const n=_findN(noteName);if(t&&n)t.noteId=n.id;},
+    'wave.add':    (name,type)=>{
+      const t=['sine','square','sawtooth','triangle','noise'].includes(type)?type:'sine';
+      D.waves.push({id:'w'+Date.now(),name:String(name||'Wave '+(D.waves.length+1)),
+        layers:[{type:t,fm:{on:false,ratio:2,depth:100},noise:{mix:0},
+                 adsr:{a:.01,d:.1,s:.7,r:.3},filt:{type:'none',freq:2000,q:1}}],chain:[]});
+      return D.waves[D.waves.length-1].id;
+    },
+    'wave.list':   ()=>D.waves.map((w,i)=>({index:i,name:w.name,type:w.layers[0]?.type})),
+    'wave.adsr':   (name,a,d,s,r)=>{
+      const w=_findW(name);if(!w)return;const l=w.layers[0];if(!l)return;
+      if(a!=null)l.adsr.a=Math.max(.001,+a);if(d!=null)l.adsr.d=Math.max(.001,+d);
+      if(s!=null)l.adsr.s=Math.max(0,Math.min(1,+s));if(r!=null)l.adsr.r=Math.max(.001,+r);
+    },
+    'wave.type':   (name,type)=>{const w=_findW(name);if(w&&w.layers[0])w.layers[0].type=type;},
+    'wave.detune': (name,cents)=>{const w=_findW(name);if(w&&w.layers[0])w.layers[0].detune=+cents;},
+    'wave.velmap': (name,gain,filtFreq)=>{
+      const w=_findW(name);if(!w)return;const l=w.layers[0];if(!l)return;
+      if(!l.velocityMapping)l.velocityMapping={gain:1,filtFreq:0};
+      if(gain!=null)l.velocityMapping.gain=Math.max(0,Math.min(1,+gain));
+      if(filtFreq!=null)l.velocityMapping.filtFreq=Math.max(0,Math.min(1,+filtFreq));
+    },
+    'wave.filt.slope': (name,slope)=>{const w=_findW(name);if(w&&w.layers[0])w.layers[0].filt.slope=[-12,-24].includes(+slope)?+slope:-12;},
+    'wave.filt.drive': (name,drive)=>{const w=_findW(name);if(w&&w.layers[0])w.layers[0].filt.drive=Math.max(0,Math.min(1,+drive));},
+    'wave.filt':   (name,type,freq,q)=>{
+      const w=_findW(name);if(!w)return;const l=w.layers[0];if(!l)return;
+      if(type)l.filt.type=type;if(freq!=null)l.filt.freq=+freq;if(q!=null)l.filt.q=+q;
+    },
+    'wave.am':     (name,on,ratio,depth)=>{
+      const w=_findW(name);if(!w)return;const l=w.layers[0];if(!l)return;
+      if(!l.am)l.am={on:false,ratio:1,depth:100};
+      if(on!=null)l.am.on=!!on;if(ratio!=null)l.am.ratio=+ratio;if(depth!=null)l.am.depth=+depth;
+    },
+    'wave.fm':     (name,on,ratio,depth)=>{
+      const w=_findW(name);if(!w)return;const l=w.layers[0];if(!l)return;
+      if(on!=null)l.fm.on=!!on;if(ratio!=null)l.fm.ratio=+ratio;if(depth!=null)l.fm.depth=+depth;
+    },
+    'wave.noise':  (name,mix,type)=>{const w=_findW(name);if(w&&w.layers[0]){w.layers[0].noise.mix=Math.max(0,Math.min(1,+mix));if(type)w.layers[0].noise.type=['white','pink','brown'].includes(type)?type:'white';}},
+    'note.add':    (name,bpm,bars)=>{
+      D.notes.push({id:'n'+Date.now(),name:String(name||'Note '+(D.notes.length+1)),bpm:+bpm||120,bars:+bars||4,events:[]});
+      return D.notes[D.notes.length-1].id;
+    },
+    'note.list':   ()=>D.notes.map((n,i)=>({index:i,name:n.name,bpm:n.bpm,bars:n.bars,events:n.events.length})),
+    'note.put':    (noteName,pitch,start,dur,vel)=>{
+      const note=_findN(noteName);if(!note)return;
+      let midi=+pitch;
+      if(isNaN(midi)){
+        const NOTE={C:0,D:2,E:4,F:5,G:7,A:9,B:11};
+        const pm=String(pitch).toUpperCase().match(/^([A-G])([#B+\-]?)(\d+)$/);
+        if(pm)midi=(+pm[3]+1)*12+NOTE[pm[1]]+(pm[2]==='#'||pm[2]==='+'?1:pm[2]==='B'||pm[2]==='-'?-1:0);
+        else return;
+      }
+      const s=+start||0,d=+dur||4,v=+vel||100;
+      note.events=note.events.filter(ev=>!(ev.pitch===midi&&ev.start<s+d&&ev.start+ev.dur>s));
+      note.events.push({waveId:note._waveId||D.waves[0].id,trackId:note._trackId||null,pitch:midi,start:s,dur:d,vel:v});
+    },
+    'note.set_wave':(noteName,waveName)=>{
+      const note=_findN(noteName);const wave=_findW(waveName);
+      if(note&&wave)note._waveId=wave.id;
+    },
+    'note.clear':  (name)=>{const n=_findN(name);if(n)n.events=[];},
+    'note.bpm':    (name,bpm)=>{const n=_findN(name);if(n)n.bpm=+bpm;},
+    'note.bars':   (name,bars)=>{const n=_findN(name);if(n)n.bars=Math.max(1,Math.min(64,+bars));},
+    // automation API
+    'automation.set': (noteName,cell,param,value,trackName)=>{
+      const n=_findN(noteName);if(!n)return;
+      const tid=trackName?(D.tracks.find(t=>t.name===trackName)?.id||'master'):'master';
+      if(!D.automation[n.id])D.automation[n.id]=[];
+      D.automation[n.id]=D.automation[n.id].filter(a=>!(a.param===param&&a.cell===+cell&&(a.trackId||'master')===tid));
+      D.automation[n.id].push({cell:+cell,param:String(param),value:+value,trackId:tid});
+    },
+    'automation.clear': (noteName,param,trackName)=>{
+      const n=_findN(noteName);if(!n)return;
+      if(!D.automation[n.id])return;
+      const tid=trackName?(D.tracks.find(t=>t.name===trackName)?.id||'master'):'master';
+      if(param)D.automation[n.id]=D.automation[n.id].filter(a=>
+        !(a.param===param&&(trackName?(a.trackId||'master')===tid:true)));
+      else if(trackName)D.automation[n.id]=D.automation[n.id].filter(a=>(a.trackId||'master')!==tid);
+      else D.automation[n.id]=[];
+    },
+    'automation.list': (noteName)=>{
+      const n=_findN(noteName);if(!n)return[];
+      return(D.automation[n.id]||[]).sort((a,b)=>a.cell-b.cell);
+    },
+  },
+// ═══════════════════════════════════════════════════════════════
+// TRACK CACHE UI EXTENSION
+// トラックリストにキャッシュボタンを追加
+// ═══════════════════════════════════════════════════════════════
+
+// トラックリストのレンダリング部分に追加する修正
+
+// 元の _trRow 関数を拡張（trackId, name, color, mute, solo の後に追加）
+function _trRowWithCache(trackId, name, color, mute, solo) {
+  const tr = D.tracks.find(t => t.id === trackId);
+  const hasCache = tr && tr.audioCache;
+  const isPlaying = tr && tr.cacheSource;
+  
+  const muteIcon = mute ? '🔇' : '🔊';
+  const cacheIcon = hasCache ? '💾' : '⚪';
+  const playIcon = isPlaying ? '⏹' : '▶';
+  
+  const cacheButtons = tr && !tr.isMaster ? `
+    <div style="display:flex;gap:4px;align-items:center;margin-left:auto">
+      <button 
+        onclick="_cacheTrack('${trackId}')" 
+        style="font-family:var(--sph-font);font-size:9px;padding:2px 8px;border-radius:3px;cursor:pointer;background:${hasCache ? 'var(--sph-ok)' : 'var(--sph-surface)'};color:${hasCache ? '#fff' : 'var(--sph-dim)'};border:1px solid ${hasCache ? 'var(--sph-ok)' : 'var(--sph-border)'};white-space:nowrap"
+        title="Render and cache this track">
+        ${cacheIcon} Cache
+      </button>
+      <button 
+        onclick="${isPlaying ? `_stopCachedTrack('${trackId}')` : `_playCachedTrack('${trackId}')`}" 
+        style="font-family:var(--sph-font);font-size:9px;padding:2px 8px;border-radius:3px;cursor:pointer;background:${isPlaying ? 'var(--sph-err)' : 'var(--sph-accent)'};color:#fff;border:1px solid ${isPlaying ? 'var(--sph-err)' : 'var(--sph-accent)'};white-space:nowrap;${hasCache ? '' : 'opacity:0.5;pointer-events:none'}"
+        title="${hasCache ? (isPlaying ? 'Stop playback' : 'Play cached audio') : 'Cache track first'}">
+        ${playIcon}
+      </button>
+      <button 
+        onclick="_downloadTrackCache('${trackId}')" 
+        style="font-family:var(--sph-font);font-size:9px;padding:2px 8px;border-radius:3px;cursor:pointer;background:var(--sph-surface);color:var(--sph-dim);border:1px solid var(--sph-border);white-space:nowrap;${hasCache ? '' : 'opacity:0.5;pointer-events:none'}"
+        title="${hasCache ? 'Download cached audio' : 'Cache track first'}">
+        ↓
+      </button>
+      <button 
+        onclick="_clearTrackCache('${trackId}')" 
+        style="font-family:var(--sph-font);font-size:9px;padding:2px 8px;border-radius:3px;cursor:pointer;background:var(--sph-surface);color:var(--sph-dim);border:1px solid var(--sph-border);white-space:nowrap;${hasCache ? '' : 'opacity:0.5;pointer-events:none'}"
+        title="${hasCache ? 'Clear cache' : 'No cache'}">
+        ✕
+      </button>
+    </div>
+  ` : '';
+  
+  // 元のトラック行HTMLに cacheButtons を追加
+  return `
+    <div class="tr-row ${trackId === D._openTrk ? 'active' : ''}" 
+         style="border-left:3px solid ${color || '#444'};padding-left:8px;margin-bottom:4px;background:var(--sph-surface);border-radius:4px;display:flex;align-items:center;gap:8px;padding:6px 8px">
+      <div style="flex:1;cursor:pointer" onclick="_openTrack('${trackId}')">
+        <span style="font-weight:700;font-size:11px">${name}</span>
+        ${hasCache ? `<span style="font-size:8px;color:var(--sph-ok);margin-left:6px">${tr.audioCache.duration.toFixed(1)}s</span>` : ''}
+      </div>
+      ${cacheButtons}
+      <button onclick="_toggleMute('${trackId}')" 
+              style="font-size:14px;background:none;border:none;cursor:pointer;opacity:${mute ? 0.5 : 1}"
+              title="${mute ? 'Unmute' : 'Mute'}">
+        ${muteIcon}
+      </button>
+    </div>
+  `;
+}
+
+// グローバルヘルパー関数（window に登録）
+window._cacheTrack = (id) => cacheTrack(id);
+window._playCachedTrack = (id) => playCachedTrack(id);
+window._stopCachedTrack = (id) => stopCachedTrack(id);
+window._clearTrackCache = (id) => clearTrackCache(id);
+window._downloadTrackCache = (id) => downloadTrackCache(id);
+window._cacheAllTracks = () => cacheAllTracks();
+
+// トップバーに「Cache All」ボタンを追加
+// 元の UI の適切な場所に以下を挿入:
+/*
+<button onclick="_cacheAllTracks()" 
+        style="font-family:var(--sph-font);font-size:9px;font-weight:700;padding:3px 10px;border-radius:3px;cursor:pointer;background:var(--sph-ok);color:#fff;border:1px solid var(--sph-ok);text-transform:uppercase;letter-spacing:1px">
+  💾 Cache All
+</button>
+*/
+
+  commands:[
+    {name:'daw.play',           desc:'Play all tracks'},
+    {name:'daw.export.wav',     desc:'Export as WAV (OfflineAudioContext, high quality)'},
+    {name:'daw.export.webm',    desc:'Record realtime (FX included) then auto-convert to WAV'},
+    {name:'daw.export.stop',    desc:'Stop recording and download as WAV (with FX)'},
+    {name:'daw.stop',           desc:'Stop playback'},
+    {name:'daw.save',           desc:'Save state to localStorage'},
+    {name:'daw.cache.track',    desc:'Render and cache track audio',    args:'trackName'},
+    {name:'daw.cache.play',     desc:'Play cached track audio',         args:'trackName'},
+    {name:'daw.cache.stop',     desc:'Stop cached track playback',      args:'trackName'},
+    {name:'daw.cache.clear',    desc:'Clear track audio cache',         args:'trackName'},
+    {name:'daw.cache.download', desc:'Download cached track as WAV',    args:'trackName'},
+    {name:'daw.cache.all',      desc:'Cache all tracks at once'},
+    {name:'daw.play.note',      desc:'Play single note',       args:'pitch("C4"), dur(4), wave?'},
+    {name:'daw.play.mml',       desc:'Play MML string',        args:'mml("T120 L4 o4 CDEFG"), wave?'},
+    {name:'daw.play.seq',       desc:'Play event array',       args:'events, bpm, wave?'},
+    {name:'daw.play.pattern',   desc:'Play Note pattern',      args:'noteName, wave?'},
+    {name:'daw.track.add',      desc:'Add track',              args:'name, waveName?, noteName?'},
+    {name:'daw.track.list',     desc:'List tracks (with color)'},
+    {name:'daw.track.vol',      desc:'Set track volume',       args:'name, vol(0-1)'},
+    {name:'daw.track.pan',      desc:'Set track pan',          args:'name, pan(-1 to 1)'},
+    {name:'daw.track.mute',     desc:'Mute/unmute track',      args:'name, bool'},
+    {name:'daw.track.color',    desc:'Set track color',        args:'name, #hexcolor'},
+    {name:'daw.track.wave',     desc:'Set track wave',         args:'name, waveName'},
+    {name:'daw.track.note',     desc:'Set track note',         args:'name, noteName'},
+    {name:'daw.wave.add',       desc:'Add wave',               args:'name, type(sine|square|sawtooth|triangle|noise)'},
+    {name:'daw.wave.list',      desc:'List waves'},
+    {name:'daw.wave.adsr',      desc:'Set ADSR',               args:'name, a, d, s, r'},
+    {name:'daw.wave.type',      desc:'Set wave type',          args:'name, type'},
+    {name:'daw.wave.filt',      desc:'Set filter',             args:'name, type, freq, q'},
+    {name:'daw.wave.am',        desc:'Set AM/Ring modulation', args:'name, on, ratio, depth(100=Ring)'},
+    {name:'daw.wave.fm',        desc:'Set FM modulation',      args:'name, on, ratio, depth'},
+    {name:'daw.wave.detune',    desc:'Set detune (cents)',      args:'name, cents'},
+    {name:'daw.wave.velmap',    desc:'Velocity mapping',       args:'name, gain(0-1), filtFreq(0-1)'},
+    {name:'daw.wave.filt.slope',desc:'Filter slope',           args:'name, -12|-24'},
+    {name:'daw.wave.filt.drive',desc:'Filter drive/sat',       args:'name, drive(0-1)'},
+    {name:'daw.wave.noise',     desc:'Set noise mix',          args:'name, mix(0-1)'},
+    {name:'daw.note.add',       desc:'Add note pattern',       args:'name, bpm, bars'},
+    {name:'daw.note.list',      desc:'List note patterns'},
+    {name:'daw.note.put',       desc:'Place note in pattern',  args:'noteName, pitch("C4"|midi), start, dur, vel?'},
+    {name:'daw.note.set_wave',  desc:'Set default wave for note.put', args:'noteName, waveName'},
+    {name:'daw.note.clear',     desc:'Clear note pattern',     args:'name'},
+    {name:'daw.note.bpm',       desc:'Set pattern BPM',        args:'name, bpm'},
+    {name:'daw.note.bars',      desc:'Set pattern bars',       args:'name, bars'},
+    {name:'daw.automation.set',  desc:'Set automation point (master or per-track)', args:'noteName, cell, param(volume|bpm|pan|lo|mid|hi), value, trackName?(omit=master)'},
+    {name:'daw.automation.clear',desc:'Clear automation',      args:'noteName, param?, trackName?(omit=all)'},
+    {name:'daw.automation.list', desc:'List automation points',args:'noteName'},
+  ],
+});
+// cleanup on audio context close (sph.mount auto-handles registry cleanup)
+window.addEventListener('beforeunload',()=>{if(D.ctx)D.ctx.close();});
+})();
+</script>
+</body></html>
