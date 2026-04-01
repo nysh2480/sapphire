@@ -1,0 +1,145 @@
+<!-- 
+  UI_MML EXT v1.0
+  [B] Base: UI解析・生成ロジック
+  [A] Action: 動的GUIレンダリング
+-->
+
+<script type="sph/meta" data-ext-id="ui_mml">
+{
+  "cat": "B",
+  "version": "1.0",
+  "label": "UI GENERATOR",
+  "icon": "🎨",
+  "consumes": ["media_core", "media_definition"],
+  "produces": ["ui_dom"],
+  "signals": ["ui:interaction", "ui:rebuilt"]
+}
+</script>
+
+<script type="sph/doc" data-ext-id="ui_mml">
+{
+  "title": "UI_MML Specification",
+  "bnf": "@UI id { label: string, elements: [ { type: string, name: string, target: string, ... } ] }",
+  "elements": {
+    "slider": { "params": ["min", "max", "step", "unit"] },
+    "button": { "params": ["action", "variant"] },
+    "select": { "params": ["options"] },
+    "group":  { "params": ["label", "elements"] }
+  },
+  "ai_prompt": "Create a @UI block to control the parameters. Use 'slider' for numbers and 'button' for actions. Target format: '@id.property.path'."
+}
+</script>
+
+<script type="sph/ext" data-ext-id="ui_mml">
+(function(){
+  'use strict';
+
+  // ── 内部状態 ──
+  let _currentUIDefs = [];
+
+  // ── B: レンダリングコア ──
+  const Renderer = {
+    // 個別エレメントの生成
+    element: (el) => {
+      const id = `ui-${Math.random().toString(36).slice(2, 9)}`;
+      
+      switch(el.type) {
+        case 'slider':
+          // 値の変更をシステム全体に同期させるAPIコールを注入
+          const onInput = `sph.call('ui_mml.handle_input', ['${el.target}', this.value])`;
+          return sph.ui.row(el.name, 
+            sph.ui.slider(id, el.min || 0, el.max || 1, el.val || el.min || 0, '')
+            .replace('oninput="', `oninput="${onInput}; `)
+          );
+
+        case 'button':
+          const action = el.action || 'ide.log';
+          const variant = el.variant || 'acc';
+          return `<div style="margin: 4px 0;">${sph.ui.btn(el.name, `sph.call('${action}')`, variant)}</div>`;
+
+        case 'select':
+          const options = (el.options || []).map(o => `<option value="${o}">${o}</option>`).join('');
+          return sph.ui.row(el.name, `
+            <select class="sph-input" style="flex:1" onchange="sph.call('ui_mml.handle_input', ['${el.target}', this.value])">
+              ${options}
+            </select>
+          `);
+
+        case 'group':
+          const children = (el.elements || []).map(child => Renderer.element(child)).join('');
+          return `<div class="sph-section" style="border-style: dashed; margin-top:8px;">
+                    <div class="sph-label" style="font-size:8px; opacity:0.7;">${el.label}</div>
+                    ${children}
+                  </div>`;
+        
+        default:
+          return `<div class="sph-meta">Unknown type: ${el.type}</div>`;
+      }
+    },
+
+    // パネル全体の構築
+    build: (uiDefs) => {
+      if (!uiDefs || uiDefs.length === 0) return '';
+      
+      return uiDefs.map(def => {
+        const content = (def.elements || []).map(el => Renderer.element(el)).join('');
+        return `
+          <div class="sph-section" id="ui-block-${def.id}">
+            <div class="sph-ph" style="margin-bottom:8px; border-bottom: 1px solid var(--sph-border);">
+              <span class="sph-label" style="color:var(--sph-accent)">◆ ${def.label || def.id}</span>
+            </div>
+            ${content}
+          </div>
+        `;
+      }).join('');
+    }
+  };
+
+  // ── API公開 ──
+  sph.mount('ui_mml', 'UI_MML', '🎨', {
+    api: {
+      // MML_COREからパース済みのUI定義を受け取ってHTMLを返す
+      render: (uiDefs) => {
+        _currentUIDefs = uiDefs;
+        const html = Renderer.build(uiDefs);
+        sph.emit('ui:rebuilt', { count: uiDefs.length });
+        return html;
+      },
+
+      // UI操作時のハンドラ（双方向同期の起点）
+      handle_input: (targetPath, value) => {
+        // 1. 実際のエンジン（Audio/Video等）へ値を反映
+        // targetPath例: "@bass.filter.freq"
+        sph.call('media_core.update_param', [targetPath, value]);
+        
+        // 2. 必要に応じてシグナルを発火
+        sph.emit('ui:interaction', { target: targetPath, value: value });
+      },
+
+      // AI用プロンプトの取得
+      get_prompt: () => {
+        return sph.get('ui_mml.commands').find(c => c.name === 'ui_mml.get_prompt').desc;
+      }
+    },
+
+    on: {
+      'ide-ready': () => {
+        sph.call('abcd.register', ['ui_mml', 'B']);
+      }
+    }
+  });
+})();
+</script>
+
+<!-- 
+  UI_MML 使用ライブラリ 
+  DSLから動的にUIを書き換えるためのヘルパー
+-->
+<script type="sph/lib" data-tab-name="ui_helper">
+; lib ui_helper
+
+!ui_add_slider [$_ui_id, $_name, $_target, #_min, #_max]
+  ; DSLから動的にUI定義を追加する（将来用）
+  sys.print "Dynamic UI addition not yet implemented in core"
+  RET 0
+</script>
