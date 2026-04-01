@@ -1,0 +1,148 @@
+<!-- ⬡ VIDEO_ENGINE_EXT (B-Layer) -->
+<script type="sph/meta" data-ext-id="video_engine">
+{
+  "cat": "B",
+  "version": "3.0",
+  "label": "VIDEO ENGINE",
+  "icon": "🎬",
+  "consumes": ["media_definition", "media_core"],
+  "produces": ["video_stream"],
+  "signals": ["video:frame_rendered", "video:source_ready"]
+}
+</script>
+
+<script type="sph/doc" data-ext-id="video_engine">
+{
+  "title": "VIDEO_ENGINE Rendering Spec",
+  "coordinates": "Normalized 0.0 to 1.0 (Top-Left to Bottom-Right)",
+  "filters": ["sepia", "blur", "brightness", "contrast", "grayscale", "hue-rotate"],
+  "layers": "Ascending order (Layer 0 is back)"
+}
+</script>
+
+<script type="sph/ext" data-ext-id="video_engine">
+(function(){
+  'use strict';
+
+  let _canvas = null;
+  let _ctx = null;
+  let _sources = new Map(); // id -> HTMLImageElement | HTMLVideoElement
+
+  // ── B: フィルタ変換ロジック ──
+  const _getFilterString = (filterDef) => {
+    if (!filterDef) return 'none';
+    const { type, intensity, unit } = filterDef;
+    const val = intensity ?? 1;
+    const u = unit ?? (type === 'blur' ? 'px' : type === 'hue-rotate' ? 'deg' : '');
+    
+    // MMLの型名をCSSフィルタ名にマッピング
+    const map = {
+      'sepia': `sepia(${val})`,
+      'blur': `blur(${val}${u})`,
+      'brightness': `brightness(${val})`,
+      'contrast': `contrast(${val})`,
+      'grayscale': `grayscale(${val})`,
+      'hue-rotate': `hue-rotate(${val}${u})`
+    };
+    return map[type] || 'none';
+  };
+
+  // ── B: 描画コア ──
+  const _render = () => {
+    if (!_ctx || !_canvas) return;
+
+    const state = sph.call('media_core.get_state');
+    const { waves, notes, videos, timeline } = state;
+
+    // 背景クリア
+    _ctx.fillStyle = '#000';
+    _ctx.fillRect(0, 0, _canvas.width, _canvas.height);
+
+    // トラック（レイヤー）順に描画
+    // videosオブジェクトからtypeがVTのものを抽出してソート
+    const tracks = Object.values(videos)
+      .filter(v => v.type === 'VT' || v.layer !== undefined)
+      .sort((a, b) => (a.layer || 0) - (b.layer || 0));
+
+    tracks.forEach(track => {
+      // トラックに含まれるクリップ(VC)を描画
+      const clipId = track.clip || track.refs?.[0];
+      const clip = videos[clipId];
+      if (!clip) return;
+
+      const src = _sources.get(clip.src);
+      if (!src) return;
+
+      _ctx.save();
+
+      // フィルタ適用
+      if (clip.filter) {
+        _ctx.filter = _getFilterString(clip.filter);
+      }
+
+      // トランスフォーム (0.0-1.0 -> Pixel)
+      const t = clip.transform || { x: 0, y: 0, scale: 1 };
+      const x = (t.x || 0) * _canvas.width;
+      const y = (t.y || 0) * _canvas.height;
+      const sw = _canvas.width * (t.scale || 1);
+      const sh = _canvas.height * (t.scale || 1);
+
+      // アルファ
+      _ctx.globalAlpha = clip.alpha ?? 1.0;
+
+      // 描画
+      _ctx.drawImage(src, x, y, sw, sh);
+
+      _ctx.restore();
+    });
+
+    sph.emit('video:frame_rendered', { timestamp: Date.now() });
+  };
+
+  // ── API公開 ──
+  sph.mount('video_engine', 'VIDEO', '🎬', {
+    api: {
+      // 描画先キャンバスの設定
+      attach: (canvasId) => {
+        _canvas = document.getElementById(canvasId);
+        if (_canvas) {
+          _ctx = _canvas.getContext('2d');
+          sph.call('ide.log', ['[VIDEO] Engine attached to canvas: ' + canvasId]);
+        }
+      },
+
+      // ソース（画像・カメラ）の登録
+      set_source: async (id, type, url) => {
+        if (type === 'camera') {
+          const video = document.createElement('video');
+          video.autoplay = true;
+          video.srcObject = await navigator.mediaDevices.getUserMedia({ video: true });
+          _sources.set(id, video);
+        } else {
+          const img = new Image();
+          img.src = url;
+          await img.decode();
+          _sources.set(id, img);
+        }
+        sph.emit('video:source_ready', { id });
+      },
+
+      // 手動レンダリング実行
+      render: () => _render()
+    },
+    on: {
+      'ide-ready': () => {
+        sph.call('abcd.register', ['video_engine', 'B']);
+      },
+      // タイムラインの刻みに合わせて再描画
+      'timeline:tick': () => {
+        _render();
+      },
+      // MMLが更新されたらソースを自動準備（将来的な拡張用）
+      'mml:parsed': (state) => {
+        // state.assets を見て自動ロードするロジックをここに追加可能
+      }
+    }
+  });
+})();
+</script>
