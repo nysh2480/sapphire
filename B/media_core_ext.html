@@ -1,0 +1,150 @@
+<!-- ⬡ MEDIA_CORE_EXT (B-Layer) -->
+<script type="sph/meta" data-ext-id="media_core">
+{
+  "cat": "B",
+  "version": "3.0",
+  "label": "MEDIA CORE",
+  "icon": "🧠",
+  "consumes": ["media_definition"],
+  "produces": ["mml_ast", "ui_dom"],
+  "signals": ["mml:parsed", "mml:state_changed"]
+}
+</script>
+
+<script type="sph/doc" data-ext-id="media_core">
+{
+  "title": "MEDIA_CORE AST Specification",
+  "description": "MMLをパースした後の内部データ構造。各エンジンはこのJSONを参照して動作します。",
+  "ast_example": {
+    "waves": { "@bass": { "layers": [...], "adsr": {...} } },
+    "notes": { "@melody": { "events": [...] } },
+    "timeline": [ { "bar": 1, "beat": 1, "actions": [...] } ]
+  }
+}
+</script>
+
+<script type="sph/ext" data-ext-id="media_core">
+(function(){
+  'use strict';
+
+  // ── 内部状態 (Single Source of Truth) ──
+  let _state = {
+    config: { bpm: 120, res: '1080p' },
+    assets: {},
+    waves: {},
+    notes: {},
+    tracks: { audio: {}, video: {} },
+    timeline: [],
+    ui: [] // UI_MML定義
+  };
+
+  // ── B: パーサーロジック ──
+  const Parser = {
+    // コメント削除と正規化
+    preprocess: (src) => src.replace(/\/\/[^\n]*/g, '').trim(),
+
+    // ブロック抽出 (@Name ID { body })
+    extractBlocks: (src) => {
+      const blocks = [];
+      const re = /@(\w+)\s+([\w@]+)?\s*\{([^}]+)\}/g;
+      let m;
+      while ((m = re.exec(src)) !== null) {
+        blocks.push({ type: m[1], id: m[2] || m[1], body: m[3].trim() });
+      }
+      return blocks;
+    },
+
+    // パラメータ解析 (key: val, ...)
+    parseParams: (body) => {
+      const params = {};
+      const lines = body.split(/,|\n/);
+      lines.forEach(line => {
+        const [k, v] = line.split(':').map(s => s.trim());
+        if (k && v) params[k] = Parser.parseValue(v);
+      });
+      return params;
+    },
+
+    // 値の型変換
+    parseValue: (v) => {
+      if (v.startsWith('[') && v.endsWith(']')) {
+        return v.slice(1, -1).split(',').map(s => Parser.parseValue(s.trim()));
+      }
+      if (v.startsWith('"')) return v.replace(/"/g, '');
+      if (!isNaN(v)) return parseFloat(v);
+      if (v === 'true') return true;
+      if (v === 'false') return false;
+      return v; // 文字列またはID参照
+    }
+  };
+
+  // ── B: UI生成ロジック (UI_MML -> HTML) ──
+  const UIGenerator = {
+    render: (uiList) => {
+      return uiList.map(def => {
+        let html = `<div class="sph-section"><div class="sph-label">${def.label || 'Control'}</div>`;
+        if (def.elements) {
+          def.elements.forEach(el => {
+            if (el.type === 'slider') {
+              html += sph.ui.row(el.name, sph.ui.slider(el.id, el.min, el.max, el.val, el.api));
+            } else if (el.type === 'button') {
+              html += sph.ui.btn(el.name, el.onclick, el.variant);
+            }
+          });
+        }
+        html += `</div>`;
+        return html;
+      }).join('');
+    }
+  };
+
+  // ── API公開 ──
+  sph.mount('media_core', 'MEDIA CORE', '🧠', {
+    api: {
+      // MMLテキストをパースして状態を更新
+      apply_mml: (src) => {
+        const cleanSrc = Parser.preprocess(src);
+        const blocks = Parser.extractBlocks(cleanSrc);
+        
+        // 状態のリセット（またはマージ）
+        _state.waves = {}; _state.notes = {}; _state.ui = [];
+
+        blocks.forEach(b => {
+          const params = Parser.parseParams(b.body);
+          if (b.type === 'Wave') _state.waves[b.id] = params;
+          if (b.type === 'Note') _state.notes[b.id] = params;
+          if (b.type === 'UI')   _state.ui.push({ id: b.id, ...params });
+          if (b.type === 'Config') _state.config = params;
+        });
+
+        // タイムライン解析 (#1:1 { ... })
+        _state.timeline = [];
+        const tlRe = /#(\d+):(\d+)\s*\{([^}]+)\}/g;
+        let m;
+        while ((m = tlRe.exec(cleanSrc)) !== null) {
+          _state.timeline.push({ bar: parseInt(m[1]), beat: parseInt(m[2]), raw: m[3].trim() });
+        }
+
+        sph.emit('mml:parsed', _state);
+        sph.call('ide.log', [`[CORE] Parsed: ${blocks.length} blocks`]);
+        return _state;
+      },
+
+      get_state: () => JSON.parse(JSON.stringify(_state)),
+
+      // UI_MMLからHTMLを生成
+      build_gui: () => UIGenerator.render(_state.ui),
+
+      // 特定のパラメータを更新（UIからのフィードバック用）
+      update_param: (path, value) => {
+        // 例: path = "waves.@bass.filter.freq"
+        // 内部状態を書き換え、必要ならシグナルを発火
+        sph.emit('mml:state_changed', { path, value });
+      }
+    },
+    on: {
+      'ide-ready': () => sph.call('abcd.register', ['media_core', 'B'])
+    }
+  });
+})();
+</script>
