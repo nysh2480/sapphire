@@ -1,0 +1,127 @@
+<!-- ⬡ MEDIA_STUDIO_EXT (A-Layer) -->
+<script type="sph/meta" data-ext-id="media_studio">
+{
+  "cat": "A",
+  "version": "3.0",
+  "label": "MEDIA STUDIO",
+  "icon": "🎬",
+  "consumes": ["media_core", "audio_engine", "media_definition"],
+  "produces": ["project_file"],
+  "signals": ["studio:ready", "studio:play", "studio:stop"]
+}
+</script>
+
+<script type="sph/sec" id="studio-ui">
+<div class="em-wrap" style="padding:16px; display:flex; flex-direction:column; height:100%; gap:12px;">
+  <!-- Toolbar -->
+  <div class="sph-ph">
+    <span class="sph-head">◆ MEDIA STUDIO v3.0</span>
+    <div style="display:flex; gap:6px;">
+      <button class="sph-btn sph-btn-ok" onclick="sph.call('media_studio.play')">▶ PLAY</button>
+      <button class="sph-btn" onclick="sph.call('media_studio.stop')">■ STOP</button>
+    </div>
+  </div>
+
+  <div style="display:grid; grid-template-columns: 1fr 1fr; gap:16px; flex:1; min-height:0;">
+    <!-- Left: AI Command & MML Editor -->
+    <div style="display:flex; flex-direction:column; gap:8px;">
+      <div class="sph-label">AI MML INJECTION</div>
+      <textarea id="studio-mml-editor" class="sph-input" 
+        style="flex:1; font-family:var(--sph-font); font-size:10px; line-height:1.5; resize:none;"
+        placeholder="// Paste AI generated MEDIA_MML here..."></textarea>
+      <div style="display:flex; gap:6px;">
+        <button class="sph-btn sph-btn-acc" style="flex:1" onclick="sph.call('media_studio.apply')">APPLY & SYNC UI</button>
+        <button class="sph-btn" onclick="sph.call('media_studio.copy_prompt')">📋 AI PROMPT</button>
+      </div>
+    </div>
+
+    <!-- Right: Dynamic GUI & Preview -->
+    <div style="display:flex; flex-direction:column; gap:8px; overflow-y:auto;">
+      <div class="sph-label">DYNAMIC CONTROL PANEL</div>
+      <div id="studio-gui-mount" style="display:flex; flex-direction:column; gap:8px;">
+        <div class="sph-meta" style="padding:20px; text-align:center; border:1px dashed var(--sph-border);">
+          Apply MML to generate controls
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</script>
+
+<script type="sph/ext" data-ext-id="media_studio">
+(function(){
+  'use strict';
+
+  // ── A: UI更新ロジック ──
+  const refreshStudioUI = () => {
+    const mount = document.getElementById('studio-gui-mount');
+    if (!mount) return;
+
+    // media_core から UI_MML に基づくHTMLを取得
+    const guiHtml = sph.call('media_core.build_gui');
+    if (guiHtml) {
+      mount.innerHTML = guiHtml;
+    }
+  };
+
+  // ── API公開 ──
+  sph.mount('media_studio', 'STUDIO', '🎬', {
+    panel: () => document.getElementById('studio-ui').innerHTML,
+    
+    api: {
+      // エディタの内容をシステムに適用
+      apply: async () => {
+        const editor = document.getElementById('studio-mml-editor');
+        if (!editor) return;
+        
+        const src = editor.value;
+        // 1. Coreでパース
+        await sph.call('media_core.apply_mml', [src]);
+        
+        // 2. UIを再生成
+        refreshStudioUI();
+        
+        sph.call('ide.log', ['[STUDIO] MML Applied. UI Synced.']);
+      },
+
+      // 再生（デモとして最初のNoteを鳴らす）
+      play: () => {
+        const state = sph.call('media_core.get_state');
+        const firstNoteId = Object.keys(state.notes)[0];
+        if (firstNoteId) {
+          // 簡易再生: Note内のイベントを順次実行（本来はTimeline_Managerの仕事）
+          sph.call('audio_engine.play_note', [state.notes[firstNoteId].wave || '@bass', 60, 0.8, 1.0]);
+          sph.call('ide.log', [`[STUDIO] Previewing: ${firstNoteId}`]);
+        }
+      },
+
+      stop: () => {
+        sph.call('audio_engine.stop_all');
+      },
+
+      // AI用プロンプトをクリップボードへ
+      copy_prompt: () => {
+        const prompt = sph.call('media_definition.get_system_prompt');
+        navigator.clipboard.writeText(prompt);
+        sph.call('ide.log', ['[STUDIO] AI System Prompt copied to clipboard.']);
+      }
+    },
+
+    on: {
+      'ide-ready': () => {
+        sph.call('abcd.register', ['media_studio', 'A']);
+      },
+      'frame-mounted': ({id}) => {
+        if (id === 'media_studio') {
+          // 初期状態があれば反映
+          refreshStudioUI();
+        }
+      },
+      // Core側で状態が変わったらUIを自動更新
+      'mml:parsed': () => {
+        refreshStudioUI();
+      }
+    }
+  });
+})();
+</script>
