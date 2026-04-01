@@ -1,0 +1,820 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="sph-ext" content="compute">
+<title>COMPUTE EXT - SAB Command Packet Runtime</title>
+</head>
+<body>
+
+<!-- ABCD: [B] Base — WASM execution layer -->
+<script type="sph/meta" data-ext-id="compute">
+{
+  "cat":      "B",
+  "version":  "2.0",
+  "label":    "COMPUTE ENGINE",
+  "icon":     "[C]",
+  "consumes": ["bridge"],
+  "produces": ["compute_result"],
+  "signals":  ["compute:ready", "compute:done", "compute:error", "compute:timeout"]
+}
+</script>
+
+<script type="sph/ext" data-ext-id="compute">
+(function(){
+'use strict';
+
+// ═══════════════════════════════════════════════════════════════════════
+// SAB Command Packet Layout (Int32Array, 16 words = 64 bytes per channel)
+//
+//  [0]  STATE       0=IDLE 1=CMD_PENDING 2=EXECUTING 3=DONE 4=ERROR 5=ABORT
+//  [1]  CMD         0=NOP  1=EXEC        2=INIT_WASM  3=KILL
+//  [2]  METHOD_ID   integer index into worker's method table
+//  [3]  ARGC        number of args in ARGS slots
+//  [4]  ARG0        argument 0 (i32)
+//  [5]  ARG1        argument 1 (i32)
+//  [6]  ARG2        argument 2 (i32)
+//  [7]  ARG3        argument 3 (i32)
+//  [8]  RESULT0     return value word 0 (i32)
+//  [9]  RESULT1     return value word 1 (i32, for f64 hi/lo)
+//  [10] RESULT_TYPE 0=void 1=i32 2=f64_pair 3=data_ptr
+//  [11] ERROR_CODE  non-zero if STATE==ERROR
+//  [12] TIMEOUT_MS  watchdog timeout in ms (written by Main before CMD_PENDING)
+//  [13] TASK_SEQ    monotonic task counter (for debug/trace)
+//  [14] DATA_OFFSET byte offset into shared data buffer for this task
+//  [15] DATA_LEN    byte length of payload in shared data buffer
+//
+//  Shared Data Buffer: separately allocated SAB, mapped as WASM linear memory.
+//  Zero-copy: main thread and worker both hold a view onto the same bytes.
+// ═══════════════════════════════════════════════════════════════════════
+
+const S = Object.freeze({
+  IDLE:        0,
+  CMD_PENDING: 1,
+  EXECUTING:   2,
+  DONE:        3,
+  ERROR:       4,
+  ABORT:       5,
+});
+
+const C = Object.freeze({
+  NOP:       0,
+  EXEC:      1,
+  INIT_WASM: 2,
+  KILL:      3,
+});
+
+const RT = Object.freeze({ VOID: 0, I32: 1, F64: 2, PTR: 3 });
+
+// Word offsets (multiply by 4 for byte offset)
+const W = Object.freeze({
+  STATE:       0,
+  CMD:         1,
+  METHOD_ID:   2,
+  ARGC:        3,
+  ARG0:        4,
+  ARG1:        5,
+  ARG2:        6,
+  ARG3:        7,
+  RESULT0:     8,
+  RESULT1:     9,
+  RESULT_TYPE: 10,
+  ERROR_CODE:  11,
+  TIMEOUT_MS:  12,
+  TASK_SEQ:    13,
+  DATA_OFFSET: 14,
+  DATA_LEN:    15,
+});
+const CMD_BUF_WORDS = 16;
+const CMD_BUF_BYTES = CMD_BUF_WORDS * 4;
+
+// ── Worker source (stringified, loaded via Blob URL) ──────────────────
+// No postMessage for data after INIT. All signalling via Atomics on SAB.
+const WORKER_SRC = `
+'use strict';
+
+// Mirror the same constants
+const S  = {IDLE:0,CMD_PENDING:1,EXECUTING:2,DONE:3,ERROR:4,ABORT:5};
+const C  = {NOP:0,EXEC:1,INIT_WASM:2,KILL:3};
+const W  = {STATE:0,CMD:1,METHOD_ID:2,ARGC:3,
+            ARG0:4,ARG1:5,ARG2:6,ARG3:7,
+            RESULT0:8,RESULT1:9,RESULT_TYPE:10,ERROR_CODE:11,
+            TIMEOUT_MS:12,TASK_SEQ:13,DATA_OFFSET:14,DATA_LEN:15};
+
+let _cmd   = null;  // Int32Array over cmdSAB
+let _data  = null;  // Uint8Array  over dataSAB (shared WASM linear memory)
+let _inst  = null;  // WebAssembly.Instance
+let _methods = [];  // string[] — method name by index (built during INIT_WASM)
+let _seq   = 0;
+
+// One-time init: receive SABs and WASM binary via a single postMessage
+self.onmessage = async (e) => {
+  const { cmdSAB, dataSAB, wasmBinary, methodNames } = e.data;
+
+  _cmd  = new Int32Array(cmdSAB);
+  _data = new Uint8Array(dataSAB);
+  _methods = methodNames || [];
+
+  // Compile and instantiate WASM; import memory is the shared data SAB.
+  // Caller must export 'memory' or we wrap dataSAB as imported memory.
+  let mem;
+  if (dataSAB.byteLength > 0) {
+    // Provide the SAB as WASM imported memory (requires WASM built with --import-memory)
+    const pages = Math.ceil(dataSAB.byteLength / 65536);
+    mem = new WebAssembly.Memory({ initial: pages, maximum: pages, shared: true });
+    // Copy existing bytes into the memory backing (first page = shared buffer)
+    new Uint8Array(mem.buffer).set(_data);
+  }
+
+  const imports = {};
+  if (mem) imports.env = { memory: mem };
+
+  try {
+    const mod  = await WebAssembly.compile(wasmBinary);
+    _inst = await WebAssembly.instantiate(mod, imports);
+    // If WASM exports its own memory, point _data at it
+    if (_inst.exports.memory) {
+      _data = new Uint8Array(_inst.exports.memory.buffer);
+    }
+    // Signal ready by writing DONE into slot 0 of cmd with CMD=INIT_WASM
+    Atomics.store(_cmd, W.STATE, S.DONE);
+    Atomics.notify(_cmd, W.STATE, 1);
+  } catch (err) {
+    Atomics.store(_cmd, W.ERROR_CODE, 0xDEAD);
+    Atomics.store(_cmd, W.STATE, S.ERROR);
+    Atomics.notify(_cmd, W.STATE, 1);
+    return;
+  }
+
+  // Drop the onmessage handler — no more postMessage after init
+  self.onmessage = null;
+
+  // Enter the command loop (Atomics.wait blocks the worker thread efficiently)
+  _loop();
+};
+
+function _loop() {
+  while (true) {
+    // Wait for CMD_PENDING (block until state != IDLE or != EXECUTING)
+    const waitRes = Atomics.wait(_cmd, W.STATE, S.IDLE);
+    // waitRes: 'ok' | 'not-equal' | 'timed-out'
+
+    const state = Atomics.load(_cmd, W.STATE);
+
+    if (state === S.ABORT || state === S.ERROR) {
+      // Shutdown signal
+      break;
+    }
+
+    if (state !== S.CMD_PENDING) continue;
+
+    const cmd = Atomics.load(_cmd, W.CMD);
+    if (cmd === C.KILL) break;
+    if (cmd !== C.EXEC) {
+      // Unknown command, reset to IDLE
+      Atomics.store(_cmd, W.STATE, S.IDLE);
+      Atomics.notify(_cmd, W.STATE, 1);
+      continue;
+    }
+
+    // Mark executing
+    Atomics.store(_cmd, W.STATE, S.EXECUTING);
+
+    const methodId = Atomics.load(_cmd, W.METHOD_ID);
+    const argc     = Atomics.load(_cmd, W.ARGC);
+    const args     = [];
+    const argWords = [W.ARG0, W.ARG1, W.ARG2, W.ARG3];
+    for (let i = 0; i < Math.min(argc, 4); i++) {
+      args.push(Atomics.load(_cmd, argWords[i]));
+    }
+
+    const name = _methods[methodId];
+    const fn   = name && _inst ? _inst.exports[name] : null;
+
+    if (!fn) {
+      Atomics.store(_cmd, W.ERROR_CODE, 0x404);
+      Atomics.store(_cmd, W.STATE, S.ERROR);
+      Atomics.notify(_cmd, W.STATE, 1);
+      continue;
+    }
+
+    try {
+      const r = fn(...args);
+      // Write result
+      if (typeof r === 'number') {
+        // Detect i32 vs f64
+        if (Number.isInteger(r) && r >= -2147483648 && r <= 2147483647) {
+          Atomics.store(_cmd, W.RESULT0, r);
+          Atomics.store(_cmd, W.RESULT_TYPE, 1); // I32
+        } else {
+          // Pack f64 as two i32 words (hi/lo of Float64)
+          const buf = new ArrayBuffer(8);
+          new Float64Array(buf)[0] = r;
+          const view = new Int32Array(buf);
+          Atomics.store(_cmd, W.RESULT0, view[0]);
+          Atomics.store(_cmd, W.RESULT1, view[1]);
+          Atomics.store(_cmd, W.RESULT_TYPE, 2); // F64
+        }
+      } else if (r === undefined || r === null) {
+        Atomics.store(_cmd, W.RESULT_TYPE, 0); // VOID
+      } else {
+        // Pointer / offset returned by WASM
+        Atomics.store(_cmd, W.RESULT0, r | 0);
+        Atomics.store(_cmd, W.RESULT_TYPE, 3); // PTR
+      }
+      Atomics.store(_cmd, W.ERROR_CODE, 0);
+      Atomics.store(_cmd, W.STATE, S.DONE);
+      Atomics.notify(_cmd, W.STATE, 1);
+    } catch (err) {
+      Atomics.store(_cmd, W.ERROR_CODE, 0xBAD);
+      Atomics.store(_cmd, W.STATE, S.ERROR);
+      Atomics.notify(_cmd, W.STATE, 1);
+    }
+  }
+}
+`;
+
+// ── Channel record ────────────────────────────────────────────────────
+// { worker, cmd(Int32Array), data(Uint8Array), cmdSAB, dataSAB,
+//   methods: Map<name,id>, seq: number, ready: bool }
+const _channels = new Map();
+
+let _globalSeq = 0;
+
+// ── Helpers ───────────────────────────────────────────────────────────
+
+function _sabAvail() {
+  return typeof SharedArrayBuffer !== 'undefined' && typeof Atomics !== 'undefined';
+}
+
+function _createChannel(id, dataSizeBytes) {
+  const cmdSAB  = new SharedArrayBuffer(CMD_BUF_BYTES);
+  const dataSAB = new SharedArrayBuffer(Math.max(dataSizeBytes, 65536)); // min 64KB
+  const cmd  = new Int32Array(cmdSAB);
+  const data = new Uint8Array(dataSAB);
+  // Start IDLE
+  Atomics.store(cmd, W.STATE, S.IDLE);
+  return { id, cmdSAB, dataSAB, cmd, data,
+           methods: new Map(), seq: 0, ready: false, worker: null };
+}
+
+function _readResult(cmd) {
+  const rtype = Atomics.load(cmd, W.RESULT_TYPE);
+  if (rtype === RT.VOID) return null;
+  if (rtype === RT.I32)  return Atomics.load(cmd, W.RESULT0);
+  if (rtype === RT.PTR)  return Atomics.load(cmd, W.RESULT0);
+  if (rtype === RT.F64) {
+    const buf  = new ArrayBuffer(8);
+    const view = new Int32Array(buf);
+    view[0] = Atomics.load(cmd, W.RESULT0);
+    view[1] = Atomics.load(cmd, W.RESULT1);
+    return new Float64Array(buf)[0];
+  }
+  return null;
+}
+
+// ── Panel UI ─────────────────────────────────────────────────────────
+function _renderPanel() {
+  const el = document.getElementById('compute-list');
+  if (!el) return;
+  if (!_channels.size) {
+    el.innerHTML = '<div class="sph-meta" style="padding:12px">No workers initialised.</div>';
+    return;
+  }
+  el.innerHTML = [..._channels.entries()].map(([id, ch]) => {
+    const state  = _sabAvail() ? Atomics.load(ch.cmd, W.STATE) : -1;
+    const labels = ['IDLE','PENDING','EXEC','DONE','ERROR','ABORT'];
+    const stateLabel = labels[state] ?? '?';
+    const stateColor = [
+      'var(--sph-dim)','var(--sph-warn)','var(--sph-accent)',
+      'var(--sph-ok)','var(--sph-err)','var(--sph-err)',
+    ][state] ?? 'var(--sph-dim)';
+    const methods = [...ch.methods.keys()].join(', ') || '—';
+    return `<div style="padding:8px 0;border-bottom:1px solid var(--sph-border)22">
+      <div style="display:flex;align-items:center;gap:10px">
+        <span style="font-weight:700;font-size:var(--sph-sz-md)">${id}</span>
+        <span style="font-size:9px;font-weight:700;color:${stateColor}">${stateLabel}</span>
+        <span style="margin-left:auto;font-size:9px;color:var(--sph-dim)">${ch.ready?'READY':'INIT...'}</span>
+      </div>
+      <div style="font-size:9px;color:var(--sph-dim);margin-top:3px">
+        methods: ${methods}
+      </div>
+      <div style="font-size:9px;color:var(--sph-dim)">
+        cmd SAB: ${ch.cmdSAB.byteLength}B &nbsp;|&nbsp;
+        data SAB: ${(ch.dataSAB.byteLength/1024).toFixed(0)}KB &nbsp;|&nbsp;
+        tasks: ${ch.seq}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// ── sph.mount ─────────────────────────────────────────────────────────
+sph.mount('compute', 'COMPUTE', '[C]', {
+  panel: () => sph.ui.panel('compute',
+    sph.ui.section('Workers',
+      '<div id="compute-list" style="font-family:var(--sph-font)"></div>'+
+      '<div style="margin-top:8px;display:flex;gap:6px">'+
+      '<button class="sph-btn" onclick="sph.call(\'compute.refresh\')">&#8635; Refresh</button>'+
+      '</div>'
+    )+
+    sph.ui.section('SAB Support',
+      '<div id="compute-sab-info" class="sph-meta" style="font-size:9px"></div>'
+    )
+  ),
+
+  commands: [
+    {name:'compute.setup',   desc:'Init SAB+Worker channel',
+     args:'id:string, dataSizeBytes?:number, wasmBinary?:ArrayBuffer, methodNames?:string[] -> id'},
+    {name:'compute.exec',    desc:'Execute WASM fn via SAB packet (zero postMessage)',
+     args:'id:string, method:string, args?:number[], timeoutMs?:number -> number|null'},
+    {name:'compute.kill',    desc:'Terminate worker and free SAB',      args:'id:string'},
+    {name:'compute.read',    desc:'Read bytes from shared data buffer', args:'id, offset, len -> Uint8Array'},
+    {name:'compute.write',   desc:'Write bytes into shared data buffer',args:'id, offset, Uint8Array|number[]'},
+    {name:'compute.state',   desc:'Read current SAB state word',        args:'id -> 0..5'},
+    {name:'compute.refresh', desc:'Refresh panel'},
+    {name:'compute.list',    desc:'List channel IDs',                   args:'-> string[]'},
+    // ABCD standard interface
+    {name:'compute.describe',desc:'ABCD metadata'},
+    {name:'compute.consume', desc:'Receive control data from another EXT', args:'data, fromId'},
+    {name:'compute.produce', desc:'Export channel summary'},
+  ],
+
+  api: {
+    // ── setup: allocate SABs, spawn Worker, INIT handshake ────────────
+    setup: async (id, dataSizeBytes, wasmBinary, methodNames) => {
+      id = id || 'default';
+
+      if (!_sabAvail()) {
+        sph.call('ide.log', ['[COMPUTE] SharedArrayBuffer unavailable — check COOP/COEP headers']);
+        sph.emit('compute:error', { id, message: 'SAB_UNAVAILABLE' });
+        return null;
+      }
+
+      if (_channels.has(id)) return id; // already initialised
+
+      const ch = _createChannel(id, dataSizeBytes || 65536);
+
+      // Build method name → id map
+      const names = methodNames || [];
+      names.forEach((n, i) => ch.methods.set(n, i));
+
+      // Spawn worker from Blob URL (one-time postMessage for init packet)
+      const blob   = new Blob([WORKER_SRC], { type: 'application/javascript' });
+      const blobUrl = URL.createObjectURL(blob);
+      const worker  = new Worker(blobUrl);
+      URL.revokeObjectURL(blobUrl);
+      ch.worker = worker;
+
+      // Worker errors (uncaught, outside our protocol)
+      worker.onerror = (e) => {
+        sph.call('ide.log', ['[COMPUTE] Worker onerror: ' + e.message]);
+        sph.emit('compute:error', { id, message: e.message });
+        const c = _channels.get(id);
+        if (c) { Atomics.store(c.cmd, W.STATE, S.ERROR); }
+      };
+
+      _channels.set(id, ch);
+
+      // Send the one and only postMessage (SABs + optional WASM binary)
+      const initMsg = {
+        cmdSAB:      ch.cmdSAB,
+        dataSAB:     ch.dataSAB,
+        wasmBinary:  wasmBinary  || new ArrayBuffer(0),
+        methodNames: names,
+      };
+      // Transferable: transfer wasmBinary ownership (zero-copy)
+      const transferList = wasmBinary ? [wasmBinary] : [];
+      worker.postMessage(initMsg, transferList);
+
+      // Wait for DONE state (worker signals readiness via Atomics)
+      const timeout = sph._reg.get('sph.ext.timeout') || 10000;
+      try {
+        await _waitForState(ch.cmd, S.DONE, timeout);
+        ch.ready = true;
+        // Reset to IDLE for normal operation
+        Atomics.store(ch.cmd, W.STATE, S.IDLE);
+        Atomics.notify(ch.cmd, W.STATE, 1);
+        sph.emit('compute:ready', { id });
+        sph.call('ide.log', ['[COMPUTE] Channel ready: ' + id]);
+      } catch (e) {
+        sph.call('ide.log', ['[COMPUTE] Init timeout: ' + id]);
+        sph.emit('compute:error', { id, message: 'INIT_TIMEOUT' });
+        worker.terminate();
+        _channels.delete(id);
+        return null;
+      }
+
+      _renderPanel();
+      return id;
+    },
+
+    // ── exec: write SAB packet, signal Worker, wait via Atomics ───────
+    // Zero postMessage after init. All coordination through SAB.
+    exec: async (id, method, args, timeoutMs) => {
+      id = id || 'default';
+      const ch = _channels.get(id);
+      if (!ch || !ch.ready) {
+        sph.emit('error', {code:'E010', args:['compute.'+id], severity:'warn', phase:'ext.call'});
+        return null;
+      }
+
+      const methodId = ch.methods.get(method);
+      if (methodId === undefined) {
+        sph.call('ide.log', ['[COMPUTE] Unknown method: ' + method + ' on ' + id]);
+        sph.emit('error', {code:'E010', args:['compute.method.'+method], severity:'warn', phase:'ext.call'});
+        return null;
+      }
+
+      // Ensure channel is IDLE before issuing new command
+      const idleWait = sph._reg.get('sph.ext.timeout') || 5000;
+      const curState = Atomics.load(ch.cmd, W.STATE);
+      if (curState !== S.IDLE) {
+        try {
+          await _waitForState(ch.cmd, S.IDLE, idleWait);
+        } catch (_) {
+          sph.call('ide.log', ['[COMPUTE] Channel busy, could not acquire: ' + id]);
+          return null;
+        }
+      }
+
+      const limit  = timeoutMs || sph._reg.get('sph.ext.timeout') || 5000;
+      const seq    = ++ch.seq;
+      const argArr = Array.isArray(args) ? args : [];
+
+      // ── Write command packet atomically ────────────────────────────
+      // 1. Write all fields while STATE is still IDLE (worker is blocked)
+      Atomics.store(ch.cmd, W.CMD,        C.EXEC);
+      Atomics.store(ch.cmd, W.METHOD_ID,  methodId);
+      Atomics.store(ch.cmd, W.ARGC,       Math.min(argArr.length, 4));
+      Atomics.store(ch.cmd, W.ARG0,       (argArr[0] | 0) || 0);
+      Atomics.store(ch.cmd, W.ARG1,       (argArr[1] | 0) || 0);
+      Atomics.store(ch.cmd, W.ARG2,       (argArr[2] | 0) || 0);
+      Atomics.store(ch.cmd, W.ARG3,       (argArr[3] | 0) || 0);
+      Atomics.store(ch.cmd, W.TIMEOUT_MS, limit);
+      Atomics.store(ch.cmd, W.TASK_SEQ,   seq);
+      Atomics.store(ch.cmd, W.ERROR_CODE, 0);
+      Atomics.store(ch.cmd, W.RESULT0,    0);
+      Atomics.store(ch.cmd, W.RESULT1,    0);
+
+      // 2. Flip STATE → CMD_PENDING (this is the single atomic signal to worker)
+      Atomics.store(ch.cmd, W.STATE, S.CMD_PENDING);
+      Atomics.notify(ch.cmd, W.STATE, 1); // wake the waiting worker
+
+      // ── Wait for DONE or ERROR (Main uses waitAsync, non-blocking) ──
+      try {
+        await _waitForStateDone(ch.cmd, limit + 100); // +100ms grace
+
+        const state = Atomics.load(ch.cmd, W.STATE);
+
+        if (state === S.ERROR) {
+          const ec = Atomics.load(ch.cmd, W.ERROR_CODE);
+          const msg = 'WASM_ERROR:0x' + ec.toString(16).toUpperCase();
+          sph.call('ide.log', ['[COMPUTE] ' + msg + ' method=' + method]);
+          sph.emit('compute:error', { id, method, errorCode: ec });
+          sph.emit('error', {code:'E011', args:['compute.'+method, msg], severity:'error', phase:'ext.call'});
+          Atomics.store(ch.cmd, W.STATE, S.IDLE);
+          Atomics.notify(ch.cmd, W.STATE, 1);
+          return null;
+        }
+
+        const result = _readResult(ch.cmd);
+
+        // Reset to IDLE
+        Atomics.store(ch.cmd, W.STATE, S.IDLE);
+        Atomics.notify(ch.cmd, W.STATE, 1);
+
+        sph.emit('compute:done', { id, method, seq, result });
+        return result;
+
+      } catch (e) {
+        // Timeout — abort and terminate the runaway worker
+        Atomics.store(ch.cmd, W.STATE, S.ABORT);
+        Atomics.notify(ch.cmd, W.STATE, 1);
+        ch.worker.terminate();
+        ch.ready = false;
+        _channels.delete(id);
+        sph.call('ide.log', ['[COMPUTE] TIMEOUT: ' + method + ' on ' + id + ' (>' + limit + 'ms) → worker killed']);
+        sph.emit('compute:timeout', { id, method, limitMs: limit });
+        sph.emit('error', {code:'E012', args:['compute.'+method, limit], severity:'error', phase:'ext.call'});
+        _renderPanel();
+        return null;
+      }
+    },
+
+    // ── kill: abort + terminate ────────────────────────────────────────
+    kill: (id) => {
+      const ch = _channels.get(id);
+      if (!ch) return;
+      Atomics.store(ch.cmd, W.STATE, S.ABORT);
+      Atomics.notify(ch.cmd, W.STATE, 1);
+      ch.worker.terminate();
+      _channels.delete(id);
+      sph.call('ide.log', ['[COMPUTE] Killed: ' + id]);
+      _renderPanel();
+    },
+
+    // ── read: copy bytes from shared data SAB → Uint8Array ────────────
+    read: (id, offset, len) => {
+      const ch = _channels.get(id);
+      if (!ch) return null;
+      const view = new Uint8Array(ch.dataSAB, offset || 0, len || ch.dataSAB.byteLength);
+      return new Uint8Array(view); // snapshot copy
+    },
+
+    // ── write: copy bytes into shared data SAB ────────────────────────
+    write: (id, offset, bytes) => {
+      const ch = _channels.get(id);
+      if (!ch) return false;
+      const src = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+      new Uint8Array(ch.dataSAB, offset || 0, src.length).set(src);
+      return true;
+    },
+
+    // ── state: read raw STATE word ────────────────────────────────────
+    state: (id) => {
+      const ch = _channels.get(id);
+      if (!ch) return -1;
+      return Atomics.load(ch.cmd, W.STATE);
+    },
+
+    list:    () => [..._channels.keys()],
+    refresh: () => { _renderPanel(); },
+
+    // ABCD standard interface
+    consume: (data, from) => {
+      if (!data) return;
+      if (data.kill)  sph.call('compute.kill',  [data.kill]);
+      if (data.abort) {
+        const ch = _channels.get(data.abort);
+        if (ch) { Atomics.store(ch.cmd, W.STATE, S.ABORT); Atomics.notify(ch.cmd, W.STATE, 1); }
+      }
+    },
+    produce:  () => ({
+      channels:  [..._channels.keys()],
+      ready:     [..._channels.entries()].filter(([,c])=>c.ready).map(([k])=>k),
+      sabAvail:  _sabAvail(),
+    }),
+    describe: () => ({
+      cat: 'B', version: '2.0',
+      consumes: ['bridge'], produces: ['compute_result'],
+      signals: ['compute:ready','compute:done','compute:error','compute:timeout'],
+    }),
+  },
+
+  on: {
+    'ide-ready': () => {
+      sph.call('abcd.register', ['compute', 'B']);
+    },
+    'frame-mounted': ({id}) => {
+      if (id !== 'compute') return;
+      _renderPanel();
+      // SAB availability info
+      const el = document.getElementById('compute-sab-info');
+      if (el) {
+        const sabOk = typeof SharedArrayBuffer !== 'undefined';
+        const atmOk = typeof Atomics !== 'undefined';
+        el.innerHTML =
+          'SharedArrayBuffer: <b style="color:'+( sabOk?'var(--sph-ok)':'var(--sph-err)')+'">'+
+          (sabOk?'available':'UNAVAILABLE (needs COOP/COEP headers)')+'</b><br>'+
+          'Atomics: <b style="color:'+( atmOk?'var(--sph-ok)':'var(--sph-err)')+'">'+
+          (atmOk?'available':'UNAVAILABLE')+'</b>';
+      }
+    },
+  },
+});
+
+// ── Internal helpers ──────────────────────────────────────────────────
+
+// waitForState: poll via Atomics.waitAsync until target state is reached
+// Returns a Promise that resolves when cmd[STATE] === targetState,
+// or rejects after timeoutMs.
+function _waitForState(cmd, targetState, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + timeoutMs;
+    function check() {
+      const cur = Atomics.load(cmd, W.STATE);
+      if (cur === targetState) { resolve(); return; }
+      if (cur === S.ERROR)     { reject(new Error('SAB_ERROR')); return; }
+      if (Date.now() >= deadline) { reject(new Error('SAB_TIMEOUT')); return; }
+      // Atomics.waitAsync is non-blocking: returns a Promise
+      if (typeof Atomics.waitAsync === 'function') {
+        Atomics.waitAsync(cmd, W.STATE, cur, 50).value.then(check);
+      } else {
+        setTimeout(check, 4); // fallback: 4ms poll (Safari)
+      }
+    }
+    check();
+  });
+}
+
+// waitForStateDone: wait for DONE(3) or ERROR(4), reject on timeout
+function _waitForStateDone(cmd, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + timeoutMs;
+    function check() {
+      const cur = Atomics.load(cmd, W.STATE);
+      if (cur === S.DONE || cur === S.ERROR) { resolve(); return; }
+      if (Date.now() >= deadline) { reject(new Error('SAB_TIMEOUT')); return; }
+      if (typeof Atomics.waitAsync === 'function') {
+        Atomics.waitAsync(cmd, W.STATE, cur, 50).value.then(check);
+      } else {
+        setTimeout(check, 4);
+      }
+    }
+    check();
+  });
+}
+
+})();
+</script>
+
+<!-- DSL Library -->
+<script type="sph/tab" data-tab-name="compute_lib" data-tab-type="lib">
+; lib compute_lib
+; High-level DSL patterns for safe WASM orchestration via SAB channels.
+
+; --- Robust channel initialisation ---
+; Calls compute.setup and halts if it fails.
+!compute_init [$_id, #_size]
+  $result = compute.setup $_id #_size
+  if $result == "" {
+    sys.print "[FATAL] compute.setup failed for" $_id
+    sys.stop
+  }
+  -> $result
+
+; --- Guarded WASM execution ---
+; Dispatches a method with up to 2 i32 args. Halts the DSL on failure.
+!compute_run [#_out] [$_ch, $_method, #_a, #_b]
+  #_out = compute.exec $_ch $_method [#_a, #_b]
+  if #_out == null {
+    sys.print "[FATAL] Compute pipeline broken:" $_method
+    sys.stop
+  }
+  -> #_out
+
+; --- Write a block of i32 values into shared data buffer ---
+!compute_write_i32 [$_ch, #_offset, #_val]
+  bridge.buf.write $_ch #_offset #_val
+  -> 1
+
+; --- Abort an in-progress task without killing the worker ---
+!compute_abort [$_ch]
+  $_ = compute.exec $_ch "__abort__" []
+  -> 1
+
+; --- Full teardown ---
+!compute_teardown [$_ch]
+  compute.kill $_ch
+  sys.print "[COMPUTE] Teardown complete:" $_ch
+  sys.stop
+</script>
+
+<!-- API Reference (sph/doc) -->
+<script type="sph/doc" data-doc-ext="compute">
+{
+  "title": "COMPUTE — SAB Command Packet Runtime",
+  "icon": "[C]",
+  "description": "WASM execution layer using SharedArrayBuffer command packets. All signalling after init is via Atomics — no postMessage for data or control flow. ABCD [B] Base category.",
+  "version": "2.0",
+  "api": [
+    {
+      "method": "compute.setup",
+      "args": "id, dataSizeBytes?, wasmBinary?, methodNames?",
+      "returns": "Promise<string|null>",
+      "description": "Allocates cmdSAB (64B) + dataSAB, spawns Worker, sends the single init postMessage. Waits for Worker readiness via Atomics. Returns channel id on success, null on failure."
+    },
+    {
+      "method": "compute.exec",
+      "args": "id, method, args?, timeoutMs?",
+      "returns": "Promise<number|null>",
+      "description": "Writes SAB command packet (method id + args), flips STATE→CMD_PENDING, notifies Worker, then awaits DONE/ERROR via Atomics.waitAsync. Zero postMessage. Returns i32 or f64 result, null on error/timeout."
+    },
+    {
+      "method": "compute.kill",
+      "args": "id",
+      "returns": "void",
+      "description": "Sets STATE=ABORT, notifies Worker, then calls worker.terminate(). Frees the channel."
+    },
+    {
+      "method": "compute.read",
+      "args": "id, offset?, len?",
+      "returns": "Uint8Array",
+      "description": "Snapshot copy of bytes from the shared data SAB. Use for reading WASM output after exec."
+    },
+    {
+      "method": "compute.write",
+      "args": "id, offset?, bytes",
+      "returns": "boolean",
+      "description": "Write bytes into shared data SAB before exec. Directly modifies WASM linear memory with zero copy."
+    },
+    {
+      "method": "compute.state",
+      "args": "id",
+      "returns": "number",
+      "description": "Read raw STATE word (0=IDLE 1=PENDING 2=EXEC 3=DONE 4=ERROR 5=ABORT)."
+    },
+    {
+      "method": "compute.list",
+      "args": "",
+      "returns": "string[]",
+      "description": "List all active channel IDs."
+    },
+    {
+      "method": "compute.consume",
+      "args": "data, fromId",
+      "returns": "void",
+      "description": "ABCD standard interface. Accepts {kill:id} or {abort:id} from other EXTs."
+    },
+    {
+      "method": "compute.produce",
+      "args": "",
+      "returns": "{channels, ready, sabAvail}",
+      "description": "ABCD standard interface. Exports channel summary."
+    }
+  ]
+}
+</script>
+
+<!-- Detailed Section (sph/sec) -->
+<script type="sph/sec" data-sec-ext="compute" data-sec-title="SAB Architecture">
+<h2>COMPUTE v2.0 — SAB Command Packet Architecture</h2>
+
+<p>All control flow and data transfer after the initial <code>setup</code> handshake
+runs exclusively through <strong>SharedArrayBuffer + Atomics</strong>.
+No <code>postMessage</code> is used for execution or results.</p>
+
+<h3>SAB Command Buffer Layout</h3>
+<p>Each channel owns a 64-byte <code>cmdSAB</code> (16 × Int32) that acts as the command register file:</p>
+<table>
+  <thead><tr><th>Word</th><th>Field</th><th>Values</th></tr></thead>
+  <tbody>
+    <tr><td>[0]</td><td>STATE</td><td>0=IDLE 1=PENDING 2=EXEC 3=DONE 4=ERROR 5=ABORT</td></tr>
+    <tr><td>[1]</td><td>CMD</td><td>0=NOP 1=EXEC 2=INIT_WASM 3=KILL</td></tr>
+    <tr><td>[2]</td><td>METHOD_ID</td><td>integer index into worker method table</td></tr>
+    <tr><td>[3]</td><td>ARGC</td><td>0–4</td></tr>
+    <tr><td>[4–7]</td><td>ARG0–ARG3</td><td>i32 arguments</td></tr>
+    <tr><td>[8–9]</td><td>RESULT0/1</td><td>i32 or f64 hi/lo</td></tr>
+    <tr><td>[10]</td><td>RESULT_TYPE</td><td>0=void 1=i32 2=f64 3=ptr</td></tr>
+    <tr><td>[11]</td><td>ERROR_CODE</td><td>0=ok, non-zero=error</td></tr>
+    <tr><td>[12]</td><td>TIMEOUT_MS</td><td>watchdog value written by Main</td></tr>
+    <tr><td>[13]</td><td>TASK_SEQ</td><td>monotonic counter per channel</td></tr>
+    <tr><td>[14–15]</td><td>DATA_OFFSET/LEN</td><td>byte range in dataSAB for this task</td></tr>
+  </tbody>
+</table>
+
+<h3>State Machine</h3>
+<pre>
+  Main side                          Worker side
+  ─────────────────────────────────────────────
+  write fields (STATE=IDLE)          Atomics.wait(STATE, IDLE) blocks
+  Atomics.store(STATE, PENDING)  ──► woken up
+  Atomics.notify(STATE, 1)          Atomics.store(STATE, EXECUTING)
+                                     WASM fn executes
+  Atomics.waitAsync(STATE, PENDING)  write RESULT0/1, RESULT_TYPE
+  .then(check) polling loop     ◄── Atomics.store(STATE, DONE)
+  reads RESULT, resets to IDLE       Atomics.notify(STATE, 1)
+                                     returns to Atomics.wait(STATE, IDLE)
+</pre>
+
+<h3>postMessage Usage (exactly once per channel)</h3>
+<p>The single <code>postMessage</code> in <code>compute.setup</code> transfers:</p>
+<ul>
+  <li><strong>cmdSAB</strong> — the 64-byte command register file</li>
+  <li><strong>dataSAB</strong> — the shared linear memory for WASM I/O</li>
+  <li><strong>wasmBinary</strong> — transferable ArrayBuffer (ownership moves to Worker, zero-copy)</li>
+  <li><strong>methodNames</strong> — string[] mapping names to integer IDs</li>
+</ul>
+<p>After this, <code>self.onmessage = null</code> is set in the Worker. The message channel is closed.</p>
+
+<h3>Data Flow (zero-copy)</h3>
+<p>The <code>dataSAB</code> is simultaneously accessible by both Main and Worker as
+<code>Uint8Array(dataSAB)</code>. Writing to it from either side is immediately
+visible on the other with no serialisation cost. Use <code>compute.write</code>
+to prepare input data and <code>compute.read</code> to retrieve output after exec.</p>
+
+<h3>WASM Memory Integration</h3>
+<p>If the WASM module is compiled with <code>--import-memory</code>, the Worker
+provides the dataSAB as a <code>WebAssembly.Memory({shared:true})</code>.
+This makes WASM linear memory and the shared data buffer the same allocation.</p>
+
+<h3>Timeout and Zombie Prevention</h3>
+<p>Main sets <code>TIMEOUT_MS</code> in the command packet. If <code>Atomics.waitAsync</code>
+polling does not see DONE within <code>TIMEOUT_MS + 100ms</code>, Main stores
+<code>STATE=ABORT</code>, calls <code>worker.terminate()</code>, and removes the channel.
+The WASM thread is physically removed from memory — infinite loops in native code cannot escape this guard.</p>
+
+<h3>Browser Requirements</h3>
+<table>
+  <thead><tr><th>Feature</th><th>Requirement</th><th>Fallback</th></tr></thead>
+  <tbody>
+    <tr><td>SharedArrayBuffer</td><td>COOP+COEP headers or file:// with flag</td><td>SAB_UNAVAILABLE error</td></tr>
+    <tr><td>Atomics.waitAsync</td><td>Chrome 87+, Firefox 79+</td><td>4ms setTimeout poll</td></tr>
+    <tr><td>Atomics.wait (Worker)</td><td>All modern browsers in Worker context</td><td>—</td></tr>
+    <tr><td>WebAssembly.compile</td><td>All modern browsers</td><td>—</td></tr>
+  </tbody>
+</table>
+</script>
+
+</body>
+</html>
