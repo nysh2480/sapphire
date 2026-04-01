@@ -1,0 +1,381 @@
+<!-- ═══ D層 (Definition) - Domain-Specific Guarantees ═══ -->
+<script type="sph/meta" data-ext-id="definition">
+{
+  "cat": "D",
+  "version": "1.0",
+  "label": "MEDIA DEFINITIONS",
+  "icon": "\U0001F4D0",
+  "guarantees": [
+    "sample_accuracy",
+    "vsync_alignment",
+    "coordinate_normalization",
+    "memory_reservation"
+  ]
+}
+</script>
+
+<script type="sph/definition">
+(function(){
+'use strict';
+
+// ═════════════════════════════════════════════════════════════════
+// AUDIO規約 (Sample-Accurate Processing)
+// ═════════════════════════════════════════════════════════════════
+
+window.AUDIO_DEFINITION = Object.freeze({
+  // サンプルレート
+  SAMPLE_RATE: 44100,
+  
+  // ADSRエンベロープ正規化
+  ADSR: {
+    MIN: 0.0,
+    MAX: 1.0,
+    RESOLUTION: 0.001,  // 1ms精度
+    DEFAULT: { a: 0.01, d: 0.1, s: 0.7, r: 0.2 }
+  },
+  
+  // パラメータ範囲
+  VOLUME: { MIN: 0.0, MAX: 1.0, DEFAULT: 0.8 },
+  PAN: { MIN: -1.0, MAX: 1.0, DEFAULT: 0.0 },
+  VELOCITY: { MIN: 0, MAX: 127, DEFAULT: 100 },
+  
+  // バッファ設定
+  BUFFER_SIZE: 2048,
+  MAX_TRACKS: 32,
+  MAX_EVENTS_PER_TRACK: 10000,
+  
+  // MIDI音程範囲
+  PITCH: { MIN: 0, MAX: 127, DEFAULT: 60 },  // C4 = 60
+  
+  // エフェクト
+  FX_TYPES: ['reverb', 'echo', 'distortion', 'eq', 'compressor'],
+  
+  // 時間単位変換
+  beatToSamples: (beats, bpm) => {
+    const secondsPerBeat = 60 / bpm;
+    return Math.floor(beats * secondsPerBeat * AUDIO_DEFINITION.SAMPLE_RATE);
+  },
+  
+  // ベロシティ正規化
+  normalizeVelocity: (vel) => {
+    return Math.max(0, Math.min(127, vel)) / 127;
+  },
+  
+  // ADSR検証
+  validateADSR: (adsr) => {
+    const v = (val) => Math.max(0.001, Math.min(10, val));
+    return {
+      a: v(adsr.a || AUDIO_DEFINITION.ADSR.DEFAULT.a),
+      d: v(adsr.d || AUDIO_DEFINITION.ADSR.DEFAULT.d),
+      s: Math.max(0, Math.min(1, adsr.s || AUDIO_DEFINITION.ADSR.DEFAULT.s)),
+      r: v(adsr.r || AUDIO_DEFINITION.ADSR.DEFAULT.r)
+    };
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════
+// VIDEO規約 (V-Sync Aligned Rendering)
+// ═════════════════════════════════════════════════════════════════
+
+window.VIDEO_DEFINITION = Object.freeze({
+  // V-Sync同期
+  VSYNC: true,
+  TARGET_FPS: 60,
+  FRAME_TIME_MS: 1000 / 60,  // 16.67ms
+  
+  // 座標正規化 (0.0-1.0)
+  COORDINATES: {
+    X: { MIN: 0.0, MAX: 1.0 },
+    Y: { MIN: 0.0, MAX: 1.0 },
+    SCALE: { MIN: 0.0, MAX: 10.0, DEFAULT: 1.0 }
+  },
+  
+  // 解像度プリセット
+  RESOLUTIONS: {
+    '480p': { width: 854, height: 480 },
+    '720p': { width: 1280, height: 720 },
+    '1080p': { width: 1920, height: 1080 },
+    '4K': { width: 3840, height: 2160 }
+  },
+  
+  // GPU設定
+  GPU: {
+    TEXTURE_MEMORY: '512MB',
+    MAX_LAYERS: 16,
+    PIXEL_FORMAT: 'RGBA8'
+  },
+  
+  // フィルタータイプ
+  FILTERS: [
+    'passthrough',
+    'sepia',
+    'blur',
+    'brightness',
+    'contrast',
+    'saturation',
+    'hue',
+    'grayscale',
+    'invert'
+  ],
+  
+  // レイヤー順序
+  LAYER_ORDER: 'ascending',  // 0が最背面
+  
+  // 座標正規化 → ピクセル変換
+  normalizeToPixel: (normalized, dimension) => {
+    return Math.floor(normalized * dimension);
+  },
+  
+  // ピクセル → 座標正規化
+  pixelToNormalized: (pixel, dimension) => {
+    return pixel / dimension;
+  },
+  
+  // トランスフォーム検証
+  validateTransform: (transform, resolution) => {
+    const res = VIDEO_DEFINITION.RESOLUTIONS[resolution] || VIDEO_DEFINITION.RESOLUTIONS['1080p'];
+    return {
+      x: Math.max(0, Math.min(1, transform.x || 0)),
+      y: Math.max(0, Math.min(1, transform.y || 0)),
+      scale: Math.max(0.1, Math.min(10, transform.scale || 1))
+    };
+  },
+  
+  // フィルター検証
+  validateFilter: (filterName) => {
+    return VIDEO_DEFINITION.FILTERS.includes(filterName) ? filterName : 'passthrough';
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════
+// TIMELINE規約 (Sample-Accurate Synchronization)
+// ═════════════════════════════════════════════════════════════════
+
+window.TIMELINE_DEFINITION = Object.freeze({
+  // 時間精度
+  RESOLUTION: 'bar:beat:tick',
+  TICKS_PER_BEAT: 480,  // MIDI標準
+  BEATS_PER_BAR: 4,     // 4/4拍子デフォルト
+  
+  // 同期保証
+  AUDIO_VIDEO_SYNC: true,
+  MAX_DRIFT_MS: 1,  // 1ms以内
+  
+  // イベント精度
+  EVENT_PRECISION: 'sample-accurate',
+  
+  // BPM範囲
+  BPM: { MIN: 40, MAX: 300, DEFAULT: 120 },
+  
+  // イージングタイプ
+  EASING_TYPES: [
+    'linear',
+    'easeIn',
+    'easeOut',
+    'easeInOut',
+    'cubic-bezier'
+  ],
+  
+  // Bar:Beat → サンプル位置変換
+  barBeatToSamples: (bar, beat, bpm) => {
+    const totalBeats = (bar - 1) * TIMELINE_DEFINITION.BEATS_PER_BAR + (beat - 1);
+    return AUDIO_DEFINITION.beatToSamples(totalBeats, bpm);
+  },
+  
+  // サンプル位置 → Bar:Beat変換
+  samplesToBarBeat: (samples, bpm) => {
+    const totalBeats = samples / AUDIO_DEFINITION.beatToSamples(1, bpm);
+    const bar = Math.floor(totalBeats / TIMELINE_DEFINITION.BEATS_PER_BAR) + 1;
+    const beat = Math.floor(totalBeats % TIMELINE_DEFINITION.BEATS_PER_BAR) + 1;
+    return { bar, beat };
+  },
+  
+  // 期間文字列 → サンプル変換
+  durationToSamples: (durationStr, bpm) => {
+    // "2s" → 2秒
+    if (durationStr.endsWith('s')) {
+      const seconds = parseFloat(durationStr);
+      return Math.floor(seconds * AUDIO_DEFINITION.SAMPLE_RATE);
+    }
+    // "4b" → 4拍
+    if (durationStr.endsWith('b')) {
+      const beats = parseFloat(durationStr);
+      return AUDIO_DEFINITION.beatToSamples(beats, bpm);
+    }
+    // "2bar" → 2小節
+    if (durationStr.endsWith('bar')) {
+      const bars = parseFloat(durationStr);
+      const beats = bars * TIMELINE_DEFINITION.BEATS_PER_BAR;
+      return AUDIO_DEFINITION.beatToSamples(beats, bpm);
+    }
+    return 0;
+  },
+  
+  // イージング関数
+  easing: {
+    linear: (t) => t,
+    easeIn: (t) => t * t,
+    easeOut: (t) => t * (2 - t),
+    easeInOut: (t) => t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t,
+    cubicBezier: (x1, y1, x2, y2) => {
+      // Cubic bezier approximation
+      return (t) => {
+        const cx = 3 * x1;
+        const bx = 3 * (x2 - x1) - cx;
+        const ax = 1 - cx - bx;
+        const cy = 3 * y1;
+        const by = 3 * (y2 - y1) - cy;
+        const ay = 1 - cy - by;
+        
+        const sampleCurveY = (t) => ((ay * t + by) * t + cy) * t;
+        return sampleCurveY(t);
+      };
+    }
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════
+// MEMORY規約 (SharedArrayBuffer Management)
+// ═════════════════════════════════════════════════════════════════
+
+window.MEMORY_DEFINITION = Object.freeze({
+  // SharedArrayBuffer対応チェック
+  SHARED_AVAILABLE: typeof SharedArrayBuffer !== 'undefined',
+  
+  // バッファタイプ
+  BUFFER_TYPES: ['shared', 'local'],
+  
+  // フォーマット
+  FORMATS: {
+    'f32': { bytes: 4, type: Float32Array },
+    'i32': { bytes: 4, type: Int32Array },
+    'u8': { bytes: 1, type: Uint8Array },
+    'rgba8': { bytes: 4, type: Uint8ClampedArray }
+  },
+  
+  // バッファ作成
+  createBuffer: (size, type = 'local', format = 'f32') => {
+    const fmt = MEMORY_DEFINITION.FORMATS[format];
+    if (!fmt) throw new Error(`Unknown format: ${format}`);
+    
+    const byteLength = size * fmt.bytes;
+    
+    if (type === 'shared' && MEMORY_DEFINITION.SHARED_AVAILABLE) {
+      const sab = new SharedArrayBuffer(byteLength);
+      return new fmt.type(sab);
+    } else {
+      const ab = new ArrayBuffer(byteLength);
+      return new fmt.type(ab);
+    }
+  },
+  
+  // 自動サイズ計算
+  autoSize: (elementCount, format = 'f32') => {
+    const fmt = MEMORY_DEFINITION.FORMATS[format];
+    return elementCount * fmt.bytes;
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════
+// UTILITY関数
+// ═════════════════════════════════════════════════════════════════
+
+window.MEDIA_UTILS = Object.freeze({
+  // MIDI音程 → 周波数
+  midiToFreq: (midi) => {
+    return 440 * Math.pow(2, (midi - 69) / 12);
+  },
+  
+  // 音名 → MIDI音程
+  noteToMidi: (noteStr) => {
+    const noteMap = { 'C': 0, 'D': 2, 'E': 4, 'F': 5, 'G': 7, 'A': 9, 'B': 11 };
+    const match = noteStr.match(/^([A-G])([#b])?(\d+)$/);
+    if (!match) return 60;  // Default C4
+    
+    const note = match[1];
+    const accidental = match[2];
+    const octave = parseInt(match[3]);
+    
+    let midi = noteMap[note] + (octave + 1) * 12;
+    if (accidental === '#') midi += 1;
+    if (accidental === 'b') midi -= 1;
+    
+    return midi;
+  },
+  
+  // デシベル → ゲイン
+  dbToGain: (db) => {
+    return Math.pow(10, db / 20);
+  },
+  
+  // ゲイン → デシベル
+  gainToDb: (gain) => {
+    return 20 * Math.log10(gain);
+  },
+  
+  // クランプ
+  clamp: (value, min, max) => {
+    return Math.max(min, Math.min(max, value));
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════
+// 初期化確認
+// ═════════════════════════════════════════════════════════════════
+
+console.info('[D層] MEDIA Definitions loaded');
+console.info(`  Audio: ${AUDIO_DEFINITION.SAMPLE_RATE}Hz, ${AUDIO_DEFINITION.MAX_TRACKS} tracks`);
+console.info(`  Video: ${VIDEO_DEFINITION.TARGET_FPS}fps, ${VIDEO_DEFINITION.GPU.MAX_LAYERS} layers`);
+console.info(`  Timeline: ${TIMELINE_DEFINITION.TICKS_PER_BEAT} ticks/beat`);
+console.info(`  Memory: SharedArrayBuffer ${MEMORY_DEFINITION.SHARED_AVAILABLE ? 'available' : 'unavailable'}`);
+
+})();
+</script>
+
+<!-- ═══ D層 Documentation ═══ -->
+<script type="sph/doc" data-doc-ext="definition">
+{
+  "title": "MEDIA Definitions - Domain Guarantees",
+  "icon": "\U0001F4D0",
+  "description": "Audio/Video/Timeline processing guarantees and utilities",
+  "version": "1.0",
+  "api": [
+    {
+      "method": "AUDIO_DEFINITION.beatToSamples",
+      "args": "beats, bpm",
+      "returns": "samples",
+      "description": "Convert beats to sample position (sample-accurate)"
+    },
+    {
+      "method": "AUDIO_DEFINITION.validateADSR",
+      "args": "adsrObj",
+      "returns": "validated ADSR",
+      "description": "Validate and normalize ADSR envelope"
+    },
+    {
+      "method": "VIDEO_DEFINITION.normalizeToPixel",
+      "args": "normalized, dimension",
+      "returns": "pixels",
+      "description": "Convert normalized coordinates (0.0-1.0) to pixels"
+    },
+    {
+      "method": "TIMELINE_DEFINITION.barBeatToSamples",
+      "args": "bar, beat, bpm",
+      "returns": "samples",
+      "description": "Convert bar:beat position to sample position"
+    },
+    {
+      "method": "MEMORY_DEFINITION.createBuffer",
+      "args": "size, type, format",
+      "returns": "TypedArray",
+      "description": "Create audio/video buffer (shared or local)"
+    },
+    {
+      "method": "MEDIA_UTILS.noteToMidi",
+      "args": "noteString",
+      "returns": "midiNumber",
+      "description": "Convert note name (C4, D#5) to MIDI number"
+    }
+  ]
+}
+</script>
