@@ -613,21 +613,31 @@ function _build(registry,mem,logFn,debug=false,signal=null){
   sph._loopBreak  =(id)=>{if(_loopState.has(id))_loopState.get(id).brk=true;};
   sph._loopStop   =(id)=>{const ls=_loopState.get(id);if(ls){ls.brk=true;_loopState.delete(id);}};
   sph._loopStopAll=()=>{for(const id of [..._loopState.keys()])sph._loopStop(id)};
+  // callDepth: injection || default で再帰爆発を防止
+  let _callDepth=0;
   const callBlock=async(name,args=[])=>{
+    // 再帰深さチェック
+    const _maxDepth=_reg.get('sph.ext.callDepth')??32;
+    if(_callDepth>=_maxDepth){
+      const e={code:'E014',args:[name,_callDepth,_maxDepth],severity:'error',phase:'runtime'};
+      emit('error',e);logFn('err',e);return null;
+    }
     const fn=cache[name]??_reg.get(name);
     if(!fn){
       const e={code:'E003',args:[name],severity:'error',phase:'runtime'};
       emit('error',e);logFn('err',e);return null;
     }
     if(debug)emit('block-call',{name,args});
+    _callDepth++;
     try{
       const r=fn(...args);
-      if(signal?.stopped){if(r instanceof Promise)r.then(()=>{}).catch(()=>{});return null;}
+      if(signal?.stopped){if(r instanceof Promise)r.then(()=>{}).catch(()=>{});_callDepth--;return null;}
       const v=r instanceof Promise?await r:r;
-      if(signal?.stopped)return null;
+      if(signal?.stopped){_callDepth--;return null;}
       if(debug)emit('block-return',{name,value:v});
-      return v;
+      _callDepth--;return v;
     }catch(e){
+      _callDepth--;
       if(e?.message==='STOP')throw e;
       const ev={code:'E004',args:[name,e.message],severity:'error',phase:'runtime'};
       emit('error',ev);logFn('err',ev);return null;
@@ -636,9 +646,12 @@ function _build(registry,mem,logFn,debug=false,signal=null){
   for(const[name,block]of Object.entries(registry)){
     if(name==='__params')continue;
     try{
-      cache[name]=new Function('i32','f64','u64','str','sph','callBlock','signal',
-        `"use strict";return ${block.hasAsync===false?'function':'async function'} _${name.replace(/\W/g,'_')}(..._args){let pc_ret=null,_w=0;while(true){\n${block.body}\nbreak;}return pc_ret;}`
-      )(i32,f64,u64,str,window.sph,callBlock,signal);
+      const _sphDSL=_makeSphForDSL();
+      const _sandbox=_makeDSLSandbox({i32,f64,u64,str,sph:_sphDSL,callBlock,signal});
+      // with(sandbox) でグローバルを遮断しつつ、関数本体は strict で実行
+      cache[name]=new Function('__sb',
+        `return with(__sb){(${block.hasAsync===false?'function':'async function'} _${name.replace(/\W/g,'_')}(..._args){"use strict";let pc_ret=null,_w=0;while(true){\n${block.body}\nbreak;}return pc_ret;})}`
+      )(_sandbox);
     }catch(e){
       const ev={code:'E005',args:[name,e.message],severity:'error',phase:'runtime'};
       emit('error',ev);logFn('err',ev);cache[name]=async()=>null;
@@ -833,7 +846,7 @@ function get(name,args=[]){
   // if fn returns a Promise, fall back to null (use sph.call for async)
   return r instanceof Promise?null:r;
 }
-// ── ループ・タイムアウトのデフォルト値登録 ─────────────────────────
+// ── SAPPHIRE 安全設定のデフォルト値 (injection || default 一覧) ──
 // sph.register('sph.loop.maxIter', N) / sph.register('sph.loop.maxMs', N)
 // sph.register('sph.ext.timeout', N) で任意に上書き可
 register('sph.loop.maxIter',  1000000); // @loop 反復上限
@@ -870,6 +883,99 @@ window.sph={compile:(src,libs,docs)=>compiler.compile(src,libs,docs),run,stop,re
   mount,unmount,ui:sph_ui,_safeCall,
   runtimeSrc:()=>document.getElementById('sph-core')?.textContent||'',_reg,_mounts,_runtimeWarn,
   _loopBreak:null,_loopStop:null,_loopStopAll:null};
+
+// ── _sphForDSL: DSL実行用の制限版sphプロキシ ────────────────────
+// DSLブロックには sph._reg / register / compile / run / mount を渡さない
+// → カーネル破壊・APIハイジャック・再帰コンパイルを防止
+// injection: sph.register('sph.dsl.allowEmit', ['error','warn','run-start']) で制御可
+function _makeSphForDSL(){
+  const _allowedEmit=new Set(_reg.get('sph.dsl.allowEmit')
+    ??['error','warn','run-start','block-call','block-return','section']);
+  return Object.freeze({
+    // API呼び出しは必ず _safeCall 経由（5秒timeout付き）
+    call:        (name,args)=>_safeCall(name,args),
+    get:         (name,args)=>get(name,args),
+    // emit はホワイトリストのみ通過
+    emit:        (name,detail)=>{ if(_allowedEmit.has(name))emit(name,detail); },
+    // ループ制御は必須
+    _loop:       (...a)=>sph._loop(...a),
+    _loopBreak:  (...a)=>sph._loopBreak?.(...a),
+    _loopStop:   (...a)=>sph._loopStop?.(...a),
+    _loopStopAll:(...a)=>sph._loopStopAll?.(...a),
+    _runtimeWarn:(...a)=>_runtimeWarn?.(...a),
+    // _reg / register / compile / run / mount は渡さない
+  });
+}
+register('sph.dsl.allowEmit',
+  ['error','warn','run-start','block-call','block-return','section']);
+
+// ── DSL Sandbox Proxy: グローバルアクセス遮断 ───────────────────
+// with(sandboxProxy){...body...} でDSLコードをラップすることで
+// window/fetch/XHR/localStorage等へのアクセスをブロック
+// injection: sph.register('sph.sandbox.mode','proxy'|'none') で切替
+const _DSL_GLOBALS_ALLOW=new Set([
+  // 基本型・標準オブジェクト
+  'undefined','null','true','false','Infinity','NaN',
+  'Math','parseInt','parseFloat','isNaN','isFinite','String','Number',
+  'Boolean','Array','Object','JSON','Date','RegExp','Error','Symbol',
+  'Map','Set','WeakMap','WeakSet','Promise','Proxy','Reflect',
+  'Int8Array','Uint8Array','Uint8ClampedArray','Int16Array','Uint16Array',
+  'Int32Array','Uint32Array','Float32Array','Float64Array','BigInt64Array','BigUint64Array',
+  'ArrayBuffer','DataView','SharedArrayBuffer','Atomics',
+  'TextEncoder','TextDecoder','URL','URLSearchParams',
+  'setTimeout','clearTimeout','requestAnimationFrame','cancelAnimationFrame',
+  'queueMicrotask','structuredClone',
+  // SAPPHIREスコープ変数（引数として渡されるもの）
+  'i32','f64','u64','str','sph','callBlock','signal',
+  // ループ用ローカル
+  'pc_ret','_w','_args',
+]);
+const _DSL_GLOBALS_BLOCK=new Set([
+  'window','self','parent','top','globalThis',  // グローバル参照
+  'document','location','history','navigator',  // DOM/ブラウザ
+  'fetch','XMLHttpRequest','WebSocket',          // 通信
+  'localStorage','sessionStorage','indexedDB',  // 永続化
+  'alert','confirm','prompt','open',             // ダイアログ
+  'eval','Function',                             // コード実行
+  'importScripts','import',                      // モジュール
+]);
+function _makeDSLSandbox(scopeVars){
+  // sandbox.mode が 'none' の場合はそのままscopeVarsを返す
+  if((_reg.get('sph.sandbox.mode')??'proxy')==='none')return scopeVars;
+  return new Proxy(scopeVars,{
+    has(_,k){
+      // 全プロパティ検索をこのProxyで横取り → with(proxy)が機能する
+      return true;
+    },
+    get(_,k){
+      if(_DSL_GLOBALS_BLOCK.has(k)){
+        // ブロック対象: E013エラーを発火してundefinedを返す
+        emit('warn',{code:'W011',args:[k],severity:'warn',phase:'sandbox'});
+        return undefined;
+      }
+      if(k in scopeVars)return scopeVars[k];
+      if(_DSL_GLOBALS_ALLOW.has(k))return globalThis[k];
+      // それ以外は黙ってundefined
+      return undefined;
+    },
+    set(_,k,v){
+      // prototype汚染チェック (proto.guard injection で無効化可)
+      if(_reg.get('sph.proto.guard')!==false){
+        if(k==='__proto__'||k==='prototype'||k==='constructor'){
+          emit('error',{code:'E013',args:[k],severity:'error',phase:'sandbox'});
+          return true; // 無言で捨てる
+        }
+      }
+      // TypedArray変数(i32/f64/u64)やstr[]はProxyを介さず直接書き込まれる
+      // scopeVarsへの書き込みは signal 等の再代入のみ想定
+      if(k in scopeVars){scopeVars[k]=v;return true;}
+      return true; // 未知キーは無視
+    },
+  });
+}
+register('sph.sandbox.mode',  'proxy'); // injection: 'proxy'|'none'
+register('sph.proto.guard',   true);   // prototype汚染チェック ON/OFF
+register('sph.ext.callDepth', 32);     // 再帰呼び出し深さ上限
 })();
 </script>
 
@@ -904,9 +1010,10 @@ async function decodeCfg(b64){try{const bin=atob(b64.replace(/-/g,'+').replace(/
 async function resolveSrc(src){if(!src)return null;if(src.startsWith('local:')){try{const v=localStorage.getItem('sph:save:'+src.slice(6));return v?JSON.parse(v):null;}catch(_){return null;}}if(src.startsWith('gist:')){try{const r=await fetch(`https://api.github.com/gists/${src.slice(5)}`);const j=await r.json();const first=Object.values(j.files)[0];return first?JSON.parse(first.content):null;}catch(_){return null;}}if(src.startsWith('url:')){try{return await(await fetch(src.slice(4))).json();}catch(_){return null;}}if(src.startsWith('data:')){try{return JSON.parse(atob(src.slice(5)));}catch(_){return null;}}return null;}
 // Parse EXT HTML and inject parts into the IDE (shared logic)
 function injectExtDoc(doc,extId,srcUrl){
-  const env=_extEnv();
+  const env=_extEnvWithPerms(extId);
   for(const s of doc.querySelectorAll('script[type="sph/ext"]')){
-    try{new Function('sph','$id','$','$$','mk','on',s.textContent)(window.sph,env.$id,env.$,env.$$,env.mk,env.on);}
+    try{new Function('sph','$id','$','$$','mk','on',s.textContent)
+        (window.sph,env.$id,env.$,env.$$,env.mk,env.on);}
     catch(e){console.warn(`[sph-boot] ext "${extId}" error`,e.name||e);}
   }
   // Fire event with src → extmgr registers as builtin=false
@@ -919,11 +1026,54 @@ function _extEnv(){return{
   mk:tag=>document.createElement(tag),
   on:(el,ev,fn)=>el?.addEventListener(ev,fn),
 };}
+
+// ── EXT用Proxyビルダー: sph/metaのpermissionsに基づき制限 ────
+// permissions に宣言されていない機能はundefinedを返す
+const _EXT_PERM_GRANTS={
+  dom:     ()=>({document,MutationObserver:window.MutationObserver}),
+  net:     ()=>({fetch:window.fetch?.bind(window),XMLHttpRequest,WebSocket}),
+  storage: ()=>({localStorage,sessionStorage}),
+  worker:  ()=>({Worker:window.Worker}),
+  wasm:    ()=>({WebAssembly:window.WebAssembly}),
+  audio:   ()=>({AudioContext:window.AudioContext||window.webkitAudioContext,
+                AudioWorkletNode:window.AudioWorkletNode}),
+  canvas:  ()=>({OffscreenCanvas:window.OffscreenCanvas,ImageData,
+                createImageBitmap:window.createImageBitmap}),
+  clipboard:()=>({navigator:{clipboard:navigator.clipboard}}),
+  file:    ()=>({File,FileReader,Blob,URL}),
+  crypto:  ()=>({crypto:window.crypto}),
+};
+function _extPermissions(extId){
+  // sph/meta から permissions を読む
+  const metaEl=document.querySelector(`script[type="sph/meta"][data-ext-id="${extId}"]`);
+  if(!metaEl)return null; // metaなし → 制限なし（後方互換）
+  try{
+    const meta=JSON.parse(metaEl.textContent);
+    return Array.isArray(meta.permissions)?meta.permissions:null;
+  }catch{return null;}
+}
+function _extEnvWithPerms(extId){
+  const base=_extEnv();
+  const perms=_extPermissions(extId);
+  if(!perms)return{...base}; // permissions未宣言 → 後方互換でfull
+  // パーミッション宣言あり → 宣言されたものだけ追加
+  let grants={};
+  for(const p of perms){
+    if(_EXT_PERM_GRANTS[p])Object.assign(grants,_EXT_PERM_GRANTS[p]());
+  }
+  // dom権限なしなら $id/$/$$ も渡さない
+  const hasDom=perms.includes('dom');
+  return{
+    ...(hasDom?base:{on:base.on,mk:base.mk}), // dom権限があればDOM関数も渡す
+    ...grants,
+  };
+}
 function loadExtInline(id){
   const el=document.querySelector(`script[type="sph/ext"][data-ext-id="${id}"]`);
   if(!el)return false;
-  const env=_extEnv();
-  try{new Function('sph','$id','$','$$','mk','on',el.textContent)(window.sph,env.$id,env.$,env.$$,env.mk,env.on);}
+  const env=_extEnvWithPerms(id);
+  try{new Function('sph','$id','$','$$','mk','on',el.textContent)
+      (window.sph,env.$id,env.$,env.$$,env.mk,env.on);}
   catch(e){console.warn(`[sph-boot] ext "${id}" error`,e.name,e.message);}
   sph.emit('ext-loaded',{id,src:null});return true;
 }
@@ -1911,6 +2061,7 @@ window.sphIdeAddTab=function(name,type,extGroup){buildPanel(name);renderTabBar()
 
 <!-- ??? ERR EXT (FEATURE TYPE) ? error code formatting & display ??? -->
 <script type="sph/meta" data-ext-id="err">
+
 {
   "cat": "D",
   "version": "1.0",
@@ -1918,8 +2069,10 @@ window.sphIdeAddTab=function(name,type,extGroup){buildPanel(name);renderTabBar()
   "icon": "⚠️",
   "consumes": [],
   "produces": [],
-  "signals": []
+  "signals": [],
+  "permissions": []
 }
+
 </script>
 <script type="sph/ext" data-ext-id="err">
 (function(){
@@ -1945,6 +2098,11 @@ const _errMessages={
   'E010': a=>`sph.call: undefined API "${a[0]}"`,
   'E011': a=>`sph.call: error in "${a[0]}": ${a[1]}`,
   'E012': a=>`ext.call: "${a[0]}" timed out after ${a[1]}ms`,
+  'E013': a=>`Sandbox: prototype mutation blocked: ${a[0]}`,
+  'E014': a=>`Call depth exceeded: "${a[0]}" at depth ${a[1]}/${a[2]}`,
+
+  'W011': a=>`Sandbox: blocked global access "${a[0]}" — add permission to sph/meta`,
+
 };
 
 // Convert error code object to string
@@ -2009,6 +2167,7 @@ sph.register('err.format',(obj)=>{
 
 <!-- ??? EDIT EXT (FEATURE TYPE) ? preview / edit panel ??? -->
 <script type="sph/meta" data-ext-id="edit">
+
 {
   "cat": "A",
   "version": "1.0",
@@ -2020,8 +2179,13 @@ sph.register('err.format',(obj)=>{
   "produces": [],
   "signals": [
     "edit:saved"
+  ],
+  "permissions": [
+    "dom",
+    "canvas"
   ]
 }
+
 </script>
 <script type="sph/ext" data-ext-id="edit">
 (function(){
@@ -2153,6 +2317,7 @@ sph.mount('edit','EDIT','?',{
 
 <!-- ??? DEBUG EXT (FEATURE TYPE) ? block trace / console capture ??? -->
 <script type="sph/meta" data-ext-id="debug">
+
 {
   "cat": "C",
   "version": "1.0",
@@ -2162,8 +2327,12 @@ sph.mount('edit','EDIT','?',{
   "produces": [],
   "signals": [
     "debug:cleared"
+  ],
+  "permissions": [
+    "dom"
   ]
 }
+
 </script>
 <script type="sph/ext" data-ext-id="debug">
 (function(){
@@ -2345,6 +2514,7 @@ sph.mount('debug','DEBUG','??',{
 
 <!-- ??? TESTER EXT (FEATURE TYPE) ? block unit test ??? -->
 <script type="sph/meta" data-ext-id="tester">
+
 {
   "cat": "C",
   "version": "1.0",
@@ -2354,8 +2524,10 @@ sph.mount('debug','DEBUG','??',{
   "produces": [],
   "signals": [
     "test:done"
-  ]
+  ],
+  "permissions": []
 }
+
 </script>
 <script type="sph/ext" data-ext-id="tester">
 (function(){
@@ -2437,6 +2609,7 @@ sph.mount('tester','TESTER','??',{
 <!-- ??? EXT Slots ??? -->
 <!-- ??? KEY_EXT ? built-in input control ??? -->
 <script type="sph/meta" data-ext-id="key">
+
 {
   "cat": "B",
   "version": "1.0",
@@ -2444,8 +2617,10 @@ sph.mount('tester','TESTER','??',{
   "icon": "🔑",
   "consumes": [],
   "produces": [],
-  "signals": []
+  "signals": [],
+  "permissions": []
 }
+
 </script>
 <script type="sph/ext" data-ext-id="key">
 (function(){
@@ -2544,6 +2719,7 @@ sph.mount('key','KEY_EXT','\uD83D\uDD12',{
 
 <!-- ??? BRIDGE_EXT ? channel / shared-buffer / sync-point ??? -->
 <script type="sph/meta" data-ext-id="bridge">
+
 {
   "cat": "B",
   "version": "1.0",
@@ -2553,8 +2729,10 @@ sph.mount('key','KEY_EXT','\uD83D\uDD12',{
   "produces": [],
   "signals": [
     "abcd:pipe"
-  ]
+  ],
+  "permissions": []
 }
+
 </script>
 <script type="sph/ext" data-ext-id="bridge">
 (function(){
@@ -2688,6 +2866,7 @@ sph.mount('bridge','BRIDGE_EXT','\uD83C\uDF09',{
 
 <!-- ??? WORKER_EXT ? Web Worker / AudioWorklet management ??? -->
 <script type="sph/meta" data-ext-id="worker">
+
 {
   "cat": "B",
   "version": "1.0",
@@ -2695,8 +2874,13 @@ sph.mount('bridge','BRIDGE_EXT','\uD83C\uDF09',{
   "icon": "⚡",
   "consumes": [],
   "produces": [],
-  "signals": []
+  "signals": [],
+  "permissions": [
+    "worker",
+    "audio"
+  ]
 }
+
 </script>
 <script type="sph/ext" data-ext-id="worker">
 (function(){
@@ -2830,6 +3014,7 @@ sph.mount('worker','WORKER_EXT','\u26A1',{
 
 <!-- ??? SOUND_EXT ? AudioContext + AudioWorklet synthesis ??? -->
 <script type="sph/meta" data-ext-id="sound">
+
 {
   "cat": "A",
   "version": "1.0",
@@ -2844,8 +3029,12 @@ sph.mount('worker','WORKER_EXT','\u26A1',{
   "signals": [
     "sound:played",
     "sound:stopped"
+  ],
+  "permissions": [
+    "audio"
   ]
 }
+
 </script>
 <script type="sph/ext" data-ext-id="sound">
 (function(){
@@ -3039,6 +3228,7 @@ sph.mount('sound','SOUND','\uD83D\uDD0A',{
      ?? EXT button → shows unified management screen in view-ext
      Manages all EXTs in one list with built-in badges.      -->
 <script type="sph/meta" data-ext-id="extmgr">
+
 {
   "cat": "C",
   "version": "1.0",
@@ -3049,8 +3239,12 @@ sph.mount('sound','SOUND','\uD83D\uDD0A',{
   "signals": [
     "ext:loaded",
     "ext:removed"
+  ],
+  "permissions": [
+    "dom"
   ]
 }
+
 </script>
 <script type="sph/ext" data-ext-id="extmgr">
 (function(){
@@ -3198,6 +3392,7 @@ sph.mount('extmgr','EXT','??',{
 
 <!-- ??? APPEARANCE EXT (FEATURE TYPE) ??? -->
 <script type="sph/meta" data-ext-id="appearance">
+
 {
   "cat": "D",
   "version": "1.0",
@@ -3207,8 +3402,12 @@ sph.mount('extmgr','EXT','??',{
   "produces": [],
   "signals": [
     "theme:changed"
+  ],
+  "permissions": [
+    "dom"
   ]
 }
+
 </script>
 <script type="sph/ext" data-ext-id="appearance">
 (function(){
@@ -3469,6 +3668,7 @@ sph.mount('appearance','APPEARANCE','?',{
 
 <!-- ??? FILE EXT (FEATURE TYPE) ? integrated file manager ??? -->
 <script type="sph/meta" data-ext-id="file">
+
 {
   "cat": "C",
   "version": "1.0",
@@ -3478,8 +3678,13 @@ sph.mount('appearance','APPEARANCE','?',{
   "produces": [],
   "signals": [
     "file:changed"
+  ],
+  "permissions": [
+    "dom",
+    "file"
   ]
 }
+
 </script>
 <script type="sph/ext" data-ext-id="file">
 (function(){
@@ -3819,9 +4024,12 @@ sph.register('file._fvDeploy'(extName){
   if(!src)return;
   const parsed=new DOMParser().parseFromString(src,'text/html');
   // Eval sph/ext scripts (sph.register etc.)
-  {const env=_extEnv();for(const s of parsed.querySelectorAll('script[type="sph/ext"]')){
-    try{new Function('sph','$id','$','$$','mk','on',s.textContent)(window.sph,env.$id,env.$,env.$$,env.mk,env.on);}
-    catch(e){sph.call('ide.log',[`EXT deploy error [${extName}]: ${e.message}`]);}
+  {for(const s of parsed.querySelectorAll('script[type="sph/ext"]')){
+    const _eid=s.dataset.extId||extName;
+    const env=_extEnvWithPerms(_eid);
+    try{new Function('sph','$id','$','$$','mk','on',s.textContent)
+        (window.sph,env.$id,env.$,env.$$,env.mk,env.on);}
+    catch(e){sph.call('ide.log',[`EXT deploy error [${_eid}]: ${e.message}`]);}
   }}
   sph.emit('ext-loaded',{id:extName});
   sph.call('ide.log',[`EXT run: ${extName}`]);
@@ -3882,6 +4090,7 @@ sph.mount('file','FILES','??',{
 
 <!-- ⬡ ABCD_EXT — EXT Structure Runtime -->
 <script type="sph/meta" data-ext-id="abcd">
+
 {
   "cat": "C",
   "version": "1.0",
@@ -3893,8 +4102,12 @@ sph.mount('file','FILES','??',{
     "abcd:registered",
     "abcd:signal",
     "abcd:pipe"
+  ],
+  "permissions": [
+    "dom"
   ]
 }
+
 </script>
 <script type="sph/ext" data-ext-id="abcd">
 (function(){
@@ -4342,15 +4555,26 @@ await sph.call('abcd.flow', [[
 
 <!-- ⬡ MONITOR_EXT — external EXT -->
 <script type="sph/meta" data-ext-id="monitor">
+
 {
   "cat": "A",
   "version": "1.1",
   "label": "MONITOR",
   "icon": "📺",
-  "consumes": ["bridge", "timeline"],
-  "produces": ["ui_event"],
-  "signals": []
+  "consumes": [
+    "bridge",
+    "timeline"
+  ],
+  "produces": [
+    "ui_event"
+  ],
+  "signals": [],
+  "permissions": [
+    "canvas",
+    "dom"
+  ]
 }
+
 </script>
 <script type="sph/ext" data-ext-id="monitor">
 (function(){
@@ -4538,15 +4762,23 @@ sph.mount('monitor', 'MONITOR', '📺', {
 
 <!-- ⬡ TIMELINE_EXT — external EXT -->
 <script type="sph/meta" data-ext-id="timeline">
+
 {
   "cat": "C",
   "version": "1.1",
   "label": "TIMELINE",
   "icon": "⏳",
-  "consumes": ["bridge"],
+  "consumes": [
+    "bridge"
+  ],
   "produces": [],
-  "signals": ["timeline:tick", "timeline:state"]
+  "signals": [
+    "timeline:tick",
+    "timeline:state"
+  ],
+  "permissions": []
 }
+
 </script>
 <script type="sph/ext" data-ext-id="timeline">
 (function(){
@@ -4712,15 +4944,28 @@ sph.mount('timeline', 'TIMELINE', '⏳', {
 
 <!-- ⬡ COMPUTE_EXT — external EXT -->
 <script type="sph/meta" data-ext-id="compute">
+
 {
   "cat": "B",
   "version": "1.2",
   "label": "COMPUTE ENGINE",
   "icon": "[C]",
-  "consumes": ["bridge"],
-  "produces": ["compute_result"],
-  "signals": ["compute:error", "media:error"]
+  "consumes": [
+    "bridge"
+  ],
+  "produces": [
+    "compute_result"
+  ],
+  "signals": [
+    "compute:error",
+    "media:error"
+  ],
+  "permissions": [
+    "worker",
+    "wasm"
+  ]
 }
+
 </script>
 <script type="sph/ext" data-ext-id="compute">
 (function(){
@@ -4910,14 +5155,24 @@ sph.mount('compute', 'COMPUTE ENGINE', '[C]', {
 
 <!-- ⬡ MEDIA_STUDIO_EXT — external EXT -->
 <script type="sph/meta" data-ext-id="media_studio">
+
 {
   "cat": "A",
   "version": "1.0",
   "label": "MEDIA STUDIO",
   "icon": "🎵",
-  "consumes": ["media_core", "find"],
-  "signals": ["media_studio:applied"]
+  "consumes": [
+    "media_core",
+    "find"
+  ],
+  "signals": [
+    "media_studio:applied"
+  ],
+  "permissions": [
+    "dom"
+  ]
 }
+
 </script>
 <script type="sph/ext" data-ext-id="media_studio">
 (function(){
@@ -4977,65 +5232,41 @@ sph.mount('compute', 'COMPUTE ENGINE', '[C]', {
 <script type="sph/tab" data-tab-name="main" data-tab-type="dsl" data-tab-order="0">
 -> main
 
-; ══ SAPPHIRE v0.6 統合デモ ═══════════════════════════════
-; EXT直接呼び出し / ABCD / bridge / sound / ループ全部入り
+; ══ SAPPHIRE v0.9 セキュリティテスト ════════════════════════
 ; Ctrl+Enter で実行
 
 !main
-  sys.print "╔═ SAPPHIRE v0.6 ═══════════════════╗"
+  sys.print "╔═ SAPPHIRE v0.9 security sandbox ═╗"
 
-  ; ① テーマ操作（EXT直接呼び出し・戻り値なし）
+  ; 1. 通常のEXT呼び出し（_safeCall経由・5秒timeout付き）
   appearance.theme "dark"
-  $theme = appearance.theme_get
-  sys.print "① theme:" $theme
+  $t = appearance.theme_get
+  sys.print "[1] theme (safe call):" $t
 
-  ; ② サウンド（非同期EXT呼び出し）
-  sound.volume 0.5
-  sound.beep 440 0.08
-  sys.print "② beep 440Hz OK"
-
-  ; ③ ABCDランタイム登録
+  ; 2. ABCDとbridge（疎結合）
   abcd.register "main" "A"
-  sys.print "③ ABCD[A] registered"
+  bridge.buf.create "test" 64
+  bridge.buf.write "test" 0 42
+  #v = bridge.buf.read "test" 0
+  sys.print "[2] bridge buf[0]=" #v
 
-  ; ④ bridge 共有バッファ（B層との連携）
-  bridge.buf.create "demo" 8
-  bridge.buf.write "demo" 0 42
-  #val = bridge.buf.read "demo" 0
-  sys.print "④ bridge buf[0]=" #val
+  ; 3. サウンド
+  sound.volume 0.4
+  sound.beep 440 0.06
+  sys.print "[3] beep OK"
 
-  ; ⑤ 存在しないAPI → E010警告、nullで安全に続行
-  $x = nonexistent.api "test"
-  sys.print "⑤ unknown api → null:" $x
+  ; 4. ループガードテスト
+  @countdown 3
+  sys.print "[5] loop done"
 
-  ; ⑥ メモリシステム（i32 / f64 / str）
-  #n   = 100
-  %pi  = 3.14159
-  $msg = "SAPPHIRE"
-  sys.print "⑥ i32=" #n " f64=" %pi " str=" $msg
-
-  ; ⑦ カウントダウンループ（@loop + break）
-  @loop_demo 5
-  sys.print "⑦ loop done"
-
-  ; ⑧ ABCDシグナル発信（C層に通知）
-  abcd.signal "main:done" "v0.7"
-  sys.print "⑧ signal sent"
-
-  ; ⑨ 安全設定の injection 確認
-  ; sph.register で上書き可能（DSLではなくJS側から）
-  ; sph.register('sph.loop.maxIter', 500)   → ループ上限を500に
-  ; sph.register('sph.loop.maxMs',   3000)  → タイムアウトを3秒に
-  ; sph.register('sph.ext.timeout',  2000)  → EXT呼び出しを2秒に
-  ; sph.register('sph.mem.strCap',   500)   → str[]上限を500に
-  sys.print "⑨ all limits are injection-configurable"
-
+  ; 6. ABCDシグナル
+  abcd.signal "main:done" "v0.9"
   sys.print "╚═ all passed ══════════════════════╝"
-  sys.stop "SAPPHIRE v0.7 OK"
+  sys.stop "v0.9 OK"
 
-@loop_demo[#n]
+@countdown[#n]
   if #n <= 0 { -> break }
-  sys.print "  loop #n=" #n
+  sys.print "  [4] tick" #n
   sound.beep 220 0.02
   #n = #n - 1
   -> @
