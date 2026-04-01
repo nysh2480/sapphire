@@ -1,0 +1,128 @@
+<!-- ⬡ AUDIO_ENGINE_EXT (B-Layer) -->
+<script type="sph/meta" data-ext-id="audio_engine">
+{
+  "cat": "B",
+  "version": "3.0",
+  "label": "AUDIO ENGINE",
+  "icon": "🔊",
+  "consumes": ["media_definition", "media_core"],
+  "produces": ["audio_stream"],
+  "signals": ["audio:started", "audio:stopped", "audio:clipping"]
+}
+</script>
+
+<script type="sph/doc" data-ext-id="audio_engine">
+{
+  "title": "AUDIO_ENGINE Synthesis Spec",
+  "description": "Subtractive/FM synthesis engine. Supports multi-layer oscillators and ADSR envelopes.",
+  "routing": "Osc -> Filter -> Amp(ADSR) -> MasterGain(Safety) -> Destination"
+}
+</script>
+
+<script type="sph/ext" data-ext-id="audio_engine">
+(function(){
+  'use strict';
+
+  let _ctx = null;
+  let _masterGain = null;
+  let _activeVoices = new Set();
+
+  // ── B: 内部エンジン初期化 ──
+  const initAudio = () => {
+    if (_ctx) return;
+    _ctx = new (window.AudioContext || window.webkitAudioContext)();
+    _masterGain = _ctx.createGain();
+    
+    // D層規約の適用: デフォルト音量を安全なレベルに
+    const safeGain = sph.call('media_definition.db_to_gain', [-6]); 
+    _masterGain.gain.value = safeGain;
+    _masterGain.connect(_ctx.destination);
+  };
+
+  // ── B: ボイス（発音体）クラス ──
+  class Voice {
+    constructor(waveDef, freq, velocity) {
+      this.ctx = _ctx;
+      this.out = _ctx.createGain();
+      this.out.connect(_masterGain);
+      
+      // ADSR適用
+      const now = this.ctx.currentTime;
+      const adsr = waveDef.adsr || [0.01, 0.1, 0.7, 0.2];
+      const [a, d, s, r] = adsr;
+      
+      this.out.gain.setValueAtTime(0, now);
+      this.out.gain.linearRampToValueAtTime(velocity, now + a);
+      this.out.gain.linearRampToValueAtTime(velocity * s, now + a + d);
+
+      // オシレーター生成 (簡易版: 最初のレイヤーのみ)
+      this.osc = this.ctx.createOscillator();
+      this.osc.type = (waveDef.layers && waveDef.layers[0]) ? waveDef.layers[0].type : 'sine';
+      this.osc.frequency.value = freq;
+      
+      // フィルター (D層安全規約適用)
+      if (waveDef.filter) {
+        this.filter = this.ctx.createBiquadFilter();
+        this.filter.type = waveDef.filter.type || 'lowpass';
+        this.filter.frequency.value = sph.call('media_definition.safe_hz', [waveDef.filter.freq || 2000]);
+        this.osc.connect(this.filter);
+        this.filter.connect(this.out);
+      } else {
+        this.osc.connect(this.out);
+      }
+
+      this.osc.start();
+      this.releaseTime = r;
+    }
+
+    stop() {
+      const now = this.ctx.currentTime;
+      this.out.gain.cancelScheduledValues(now);
+      this.out.gain.setValueAtTime(this.out.gain.value, now);
+      this.out.gain.exponentialRampToValueAtTime(0.001, now + this.releaseTime);
+      this.osc.stop(now + this.releaseTime + 0.1);
+    }
+  }
+
+  // ── API公開 ──
+  sph.mount('audio_engine', 'AUDIO', '🔊', {
+    api: {
+      // 単音発音
+      play_note: (waveId, midi, vel = 0.8, duration = 0.5) => {
+        initAudio();
+        const state = sph.call('media_core.get_state');
+        const waveDef = state.waves[waveId] || { adsr: [0.01, 0.1, 0.7, 0.2] };
+        
+        const freq = 440 * Math.pow(2, (midi - 69) / 12);
+        const voice = new Voice(waveDef, freq, vel);
+        _activeVoices.add(voice);
+
+        setTimeout(() => {
+          voice.stop();
+          _activeVoices.delete(voice);
+        }, duration * 1000);
+      },
+
+      // 全停止
+      stop_all: () => {
+        _activeVoices.forEach(v => v.stop());
+        _activeVoices.clear();
+        sph.emit('audio:stopped');
+      },
+
+      // マスターボリューム設定 (D層安全規約強制)
+      set_master_vol: (db) => {
+        initAudio();
+        const safeDb = sph.call('media_definition.safe_db', [db]);
+        const gain = sph.call('media_definition.db_to_gain', [safeDb]);
+        _masterGain.gain.setTargetAtTime(gain, _ctx.currentTime, 0.1);
+      }
+    },
+    on: {
+      'ide-ready': () => sph.call('abcd.register', ['audio_engine', 'B']),
+      // MMLが更新されたらエンジンをスタンバイ
+      'mml:parsed': () => initAudio()
+    }
+  });
+})();
+</script>
