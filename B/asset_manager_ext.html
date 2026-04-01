@@ -1,0 +1,80 @@
+<!-- ⬡ ASSET_MANAGER_EXT (B-Layer) -->
+<script type="sph/meta" data-ext-id="asset_manager">
+{
+  "cat": "B",
+  "version": "3.0",
+  "label": "ASSET MANAGER",
+  "icon": "📦",
+  "produces": ["raw_resource", "audio_buffer"],
+  "signals": ["asset:loaded", "asset:error"]
+}
+</script>
+
+<script type="sph/ext" data-ext-id="asset_manager">
+(function(){
+  'use strict';
+
+  const _cache = new Map(); // id -> { type, data, url }
+
+  // ── B: ロードロジック ──
+  const Loader = {
+    image: (url) => new Promise((res, rej) => {
+      const img = new Image();
+      img.crossOrigin = "anonymous";
+      img.onload = () => res(img);
+      img.onerror = rej;
+      img.src = url;
+    }),
+    audio: async (url) => {
+      const resp = await fetch(url);
+      const arrayBuf = await resp.arrayBuffer();
+      const ctx = await sph.call('audio_engine.get_ctx');
+      return await ctx.decodeAudioData(arrayBuf);
+    }
+  };
+
+  // ── API公開 ──
+  sph.mount('asset_manager', 'ASSETS', '📦', {
+    api: {
+      // アセットのロード実行
+      load: async (id, type, src) => {
+        try {
+          let data;
+          if (type === 'image') data = await Loader.image(src);
+          if (type === 'audio') data = await Loader.audio(src);
+          
+          _cache.set(id, { type, data, src });
+          sph.emit('asset:loaded', { id, type });
+          sph.call('ide.log', [`[ASSET] Loaded: ${id} (${type})`]);
+          return true;
+        } catch (e) {
+          sph.emit('asset:error', { id, message: e.message });
+          return false;
+        }
+      },
+
+      // リソースの取得
+      get: (id) => {
+        const asset = _cache.get(id);
+        return asset ? asset.data : null;
+      },
+
+      // 全アセットの状態取得
+      list: () => Array.from(_cache.keys())
+    },
+    on: {
+      'ide-ready': () => sph.call('abcd.register', ['asset_manager', 'B']),
+      
+      // MMLがパースされたら、未ロードのアセットを自動で読み込む
+      'mml:parsed': async (state) => {
+        if (!state.assets) return;
+        for (const [id, def] of Object.entries(state.assets)) {
+          if (!_cache.has(id)) {
+            await sph.call('asset_manager.load', [id, def.type, def.src]);
+          }
+        }
+      }
+    }
+  });
+})();
+</script>
