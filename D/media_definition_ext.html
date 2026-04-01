@@ -1,0 +1,56 @@
+<!-- ⬡ MEDIA_DEFINITION_EXT (D-Layer) -->
+<script type="sph/meta" data-ext-id="media_definition">
+{
+  "cat": "D",
+  "version": "3.0",
+  "label": "MEDIA DEFINITION",
+  "icon": "📐",
+  "produces": ["grammar", "schema", "safety_rules"],
+  "permissions": []
+}
+</script>
+
+<script type="sph/doc" data-ext-id="media_definition">
+{
+  "title": "MEDIA_MML v3.0 Specification",
+  "bnf": "上記で定義したBNF...",
+  "safety": {
+    "audio": { "max_db": 0, "min_hz": 20, "max_hz": 20000 },
+    "video": { "max_scale": 10.0, "max_fps": 60 }
+  }
+}
+</script>
+
+<script type="sph/ext" data-ext-id="media_definition">
+(function(){
+  'use strict';
+
+  // ── 内部D: 安全規約の定数 ──
+  const DEFAULT_CFG = {
+    'audio.vol.max_db': 0,
+    'audio.vol.min_db': -96,
+    'audio.freq.max': 20000,
+    'audio.freq.min': 20,
+    'video.scale.max': 10.0
+  };
+
+  // ── 内部B: 安全ロジック (Injection || Default) ──
+  const getCfg = (key) => sph.get('sph.cfg.' + key) ?? DEFAULT_CFG[key];
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
+
+  sph.mount('media_definition', 'MEDIA DEF', '📐', {
+    api: {
+      // 他のEXTが使用する安全フィルター
+      safe_db: (db) => clamp(db, getCfg('audio.vol.min_db'), getCfg('audio.vol.max_db')),
+      safe_hz: (hz) => clamp(hz, getCfg('audio.freq.min'), getCfg('audio.freq.max')),
+      db_to_gain: (db) => Math.pow(10, clamp(db, -96, 0) / 20),
+      
+      // AIプロンプトの提供
+      get_system_prompt: () => `あなたはSapphire NGのMEDIA_MML v3.0専門家です。規約: 0db以下、20-20000hz厳守...`
+    },
+    on: {
+      'ide-ready': () => sph.call('abcd.register', ['media_definition', 'D'])
+    }
+  });
+})();
+</script>
