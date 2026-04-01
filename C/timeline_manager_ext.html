@@ -1,0 +1,161 @@
+<!-- ⬡ TIMELINE_MANAGER_EXT (C-Layer) -->
+<script type="sph/meta" data-ext-id="timeline_manager">
+{
+  "cat": "C",
+  "version": "3.0",
+  "label": "TIMELINE CLOCK",
+  "icon": "⏱",
+  "consumes": ["media_core", "audio_engine", "media_definition"],
+  "produces": ["clock_signal", "tween_values"],
+  "signals": ["timeline:tick", "timeline:beat", "timeline:started", "timeline:stopped"]
+}
+</script>
+
+<script type="sph/doc" data-ext-id="timeline_manager">
+{
+  "title": "Timeline Specification",
+  "time_format": "#Bar:Beat (1-based)",
+  "easing_types": ["linear", "easeIn", "easeOut", "easeInOut"],
+  "logic": "Look-ahead scheduler (25ms interval, 100ms window)"
+}
+</script>
+
+<script type="sph/ext" data-ext-id="timeline_manager">
+(function(){
+  'use strict';
+
+  // ── 内部状態 ──
+  let _state = {
+    isPlaying: false,
+    startTime: 0,      // AudioContext基準の開始時間
+    pauseTime: 0,
+    currentBar: 1,
+    currentBeat: 1,
+    bpm: 120,
+    nextEventIndex: 0,
+    processedEvents: new Set()
+  };
+
+  let _timer = null;
+  const LOOK_AHEAD = 0.1; // 100ms先まで予約
+  const CHECK_INTERVAL = 25; // 25msごとにチェック
+
+  // ── B: 時間変換ロジック ──
+  const TimeUtils = {
+    // Bar:Beat を秒に変換
+    posToSec: (bar, beat, bpm) => {
+      const beatSec = 60 / bpm;
+      return ((bar - 1) * 4 + (beat - 1)) * beatSec;
+    },
+    // 秒を Bar:Beat に変換
+    secToPos: (sec, bpm) => {
+      const beatSec = 60 / bpm;
+      const totalBeats = sec / beatSec;
+      return {
+        bar: Math.floor(totalBeats / 4) + 1,
+        beat: Math.floor(totalBeats % 4) + 1
+      };
+    }
+  };
+
+  // ── B: スケジューラー (Look-ahead) ──
+  const _scheduler = () => {
+    if (!_state.isPlaying) return;
+
+    const ctx = sph.call('audio_engine.get_ctx'); // AudioContext取得
+    if (!ctx) return;
+
+    const currentTime = ctx.currentTime - _state.startTime;
+    const scheduleUntil = currentTime + LOOK_AHEAD;
+
+    const fullState = sph.call('media_core.get_state');
+    const timeline = fullState.timeline || [];
+
+    timeline.forEach((block, idx) => {
+      const eventTime = TimeUtils.posToSec(block.bar, block.beat, _state.bpm);
+      
+      // まだ処理しておらず、予約ウィンドウ内に入ったイベントを実行
+      if (!_state.processedEvents.has(idx) && eventTime <= scheduleUntil) {
+        _executeBlock(block, eventTime + _state.startTime);
+        _state.processedEvents.add(idx);
+      }
+    });
+
+    // UI更新用のシグナル
+    const pos = TimeUtils.secToPos(currentTime, _state.bpm);
+    if (pos.bar !== _state.currentBar || pos.beat !== _state.currentBeat) {
+      _state.currentBar = pos.bar;
+      _state.currentBeat = pos.beat;
+      sph.emit('timeline:beat', _state);
+    }
+    
+    sph.emit('timeline:tick', { time: currentTime, ...pos });
+  };
+
+  // ── B: ブロック実行ロジック ──
+  const _executeBlock = (block, absoluteTime) => {
+    // block.raw 内の命令を解析して実行
+    // 例: "play @bass" -> audio_engine.play_note
+    const lines = block.raw.split(/,|\n/);
+    
+    lines.forEach(line => {
+      const cmd = line.trim();
+      if (cmd.startsWith('play ')) {
+        const id = cmd.replace('play ', '').trim();
+        // Note定義を探して再生
+        const note = sph.call('media_core.get_state').notes[id];
+        if (note) {
+          // サンプル精度でスケジュール（簡易実装としてsetTimeout/AudioAPI併用）
+          const delay = (absoluteTime - sph.call('audio_engine.get_ctx').currentTime) * 1000;
+          setTimeout(() => {
+            sph.call('audio_engine.play_note', [note.wave, 60, 0.8, 1.0]);
+          }, Math.max(0, delay));
+        }
+      }
+      // TODO: &記法（Tween）の解析と実行
+    });
+  };
+
+  // ── API公開 ──
+  sph.mount('timeline_manager', 'TIMELINE', '⏱', {
+    api: {
+      play: () => {
+        if (_state.isPlaying) return;
+        const ctx = sph.call('audio_engine.get_ctx');
+        if (!ctx) return;
+
+        _state.bpm = sph.call('media_core.get_state').config.bpm || 120;
+        _state.startTime = ctx.currentTime - _state.pauseTime;
+        _state.isPlaying = true;
+        _state.processedEvents.clear();
+        
+        _timer = setInterval(_scheduler, CHECK_INTERVAL);
+        sph.emit('timeline:started');
+        sph.call('ide.log', ['[TIMELINE] Started']);
+      },
+
+      stop: () => {
+        _state.isPlaying = false;
+        _state.pauseTime = 0;
+        clearInterval(_timer);
+        sph.emit('timeline:stopped');
+        sph.call('ide.log', ['[TIMELINE] Stopped & Reset']);
+      },
+
+      pause: () => {
+        if (!_state.isPlaying) return;
+        const ctx = sph.call('audio_engine.get_ctx');
+        _state.pauseTime = ctx.currentTime - _state.startTime;
+        _state.isPlaying = false;
+        clearInterval(_timer);
+        sph.call('ide.log', ['[TIMELINE] Paused']);
+      },
+
+      get_status: () => ({ ..._state })
+    },
+    on: {
+      'ide-ready': () => sph.call('abcd.register', ['timeline_manager', 'C'])
+    }
+  });
+})();
+</script>
