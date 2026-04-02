@@ -1,161 +1,342 @@
-<!-- ⬡ TIMELINE_MANAGER_EXT (C-Layer) -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="sph-ext" content="timeline_manager">
+  <meta name="sph-version" content="3.2">
+  <title>TIMELINE MANAGER EXT</title>
+</head>
+<body>
+
+<!-- 
+  TIMELINE_MANAGER EXT v3.2
+  [C] Control: Master Clock, Transport & Marker Management
+  [B] Base: High-Precision Look-ahead Scheduler & Advanced Tween Engine
+-->
+
 <script type="sph/meta" data-ext-id="timeline_manager">
 {
   "cat": "C",
-  "version": "3.0",
+  "version": "3.2",
   "label": "TIMELINE CLOCK",
   "icon": "⏱",
-  "consumes": ["media_core", "audio_engine", "media_definition"],
-  "produces": ["clock_signal", "tween_values"],
-  "signals": ["timeline:tick", "timeline:beat", "timeline:started", "timeline:stopped"]
+  "consumes": ["media_core", "audio_engine", "video_engine", "media_definition"],
+  "produces": ["clock_signal", "tween_values", "marker_events"],
+  "signals": [
+    "timeline:started",
+    "timeline:stopped",
+    "timeline:tick",
+    "timeline:beat",
+    "timeline:marker",
+    "timeline:loop"
+  ],
+  "permissions": ["dom"]
 }
 </script>
 
 <script type="sph/doc" data-ext-id="timeline_manager">
 {
-  "title": "Timeline Specification",
-  "time_format": "#Bar:Beat (1-based)",
-  "easing_types": ["linear", "easeIn", "easeOut", "easeInOut"],
-  "logic": "Look-ahead scheduler (25ms interval, 100ms window)"
+  "title": "Timeline & Tween v3.2 Reference",
+  "description": "The master clock for the Sapphire Media System. It synchronizes Audio/Video events and handles complex parameter animations.",
+  "syntax": {
+    "event": "#Bar:Beat { play @id, stop @id, @id &param: start -> end [duration, easing] }",
+    "duration": "Value + 'b' (beats), 's' (seconds), or 'bar' (bars).",
+    "easing": ["linear", "easeIn", "easeOut", "easeInOut", "elastic", "bounce", "step"]
+  },
+  "api": [
+    { "method": "timeline_manager.play", "description": "Starts playback from current position." },
+    { "method": "timeline_manager.set_marker", "args": "name, bar, beat", "description": "Defines a named jump point." },
+    { "method": "timeline_manager.jump_to", "args": "markerName", "description": "Seeks to a defined marker." },
+    { "method": "timeline_manager.set_metronome", "args": "enabled", "description": "Toggles the audible click track." }
+  ],
+  "ai_prompt": "Use #Bar:Beat for timing. For smooth movement, use: '@clip &transform.x: 0 -> 1 [4b, elastic]'. 1 bar = 4 beats."
 }
+</script>
+
+<script type="sph/sec" id="timeline-transport-ui">
+<style>
+  .transport-panel { font-family: var(--sph-font); padding: 12px; background: var(--sph-surface); border-radius: 6px; border: 1px solid var(--sph-border); }
+  .time-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+  .time-display { font-size: 20px; color: var(--sph-accent); font-weight: 900; letter-spacing: 1px; }
+  .progress-container { height: 6px; background: var(--sph-bg); border-radius: 3px; overflow: hidden; margin-bottom: 10px; border: 1px solid var(--sph-border); }
+  .progress-bar { height: 100%; background: linear-gradient(90deg, var(--sph-accent), var(--sph-ok)); width: 0%; }
+  .controls-row { display: flex; gap: 8px; align-items: center; font-size: 10px; color: var(--sph-dim); }
+  .marker-tag { background: var(--sph-accent)22; color: var(--sph-accent); padding: 1px 5px; border-radius: 3px; font-size: 9px; }
+</style>
+<div class="transport-panel">
+  <div class="time-row">
+    <div id="tl-display" class="time-display">01:01:000</div>
+    <div id="tl-marker-display" class="marker-tag">NO MARKER</div>
+  </div>
+  <div class="progress-container"><div id="tl-progress" class="progress-bar"></div></div>
+  <div class="controls-row">
+    <span>BPM: <b id="tl-bpm-val" style="color:var(--sph-text)">120</b></span>
+    <div style="flex:1"></div>
+    <label style="display:flex; align-items:center; gap:4px; cursor:pointer;">
+      <input type="checkbox" id="tl-metronome-check" onchange="sph.call('timeline_manager.set_metronome', [this.checked])"> METRO
+    </label>
+    <div id="tl-status-led" style="width:8px; height:8px; border-radius:50%; background:var(--sph-dim);"></div>
+  </div>
+</div>
 </script>
 
 <script type="sph/ext" data-ext-id="timeline_manager">
 (function(){
   'use strict';
 
-  // ── 内部状態 ──
+  // ── D: Internal Constants & State ──
+  const LOOK_AHEAD = 0.15; 
+  const CHECK_INTERVAL = 25;
+  const TICKS_PER_BEAT = 480;
+
   let _state = {
     isPlaying: false,
-    startTime: 0,      // AudioContext基準の開始時間
+    startTime: 0,
     pauseTime: 0,
-    currentBar: 1,
-    currentBeat: 1,
     bpm: 120,
-    nextEventIndex: 0,
-    processedEvents: new Set()
+    currentSec: 0,
+    metronome: false,
+    loop: { active: false, start: 1, end: 33 },
+    markers: new Map(),
+    processedEvents: new Set(),
+    activeTweens: []
   };
 
   let _timer = null;
-  const LOOK_AHEAD = 0.1; // 100ms先まで予約
-  const CHECK_INTERVAL = 25; // 25msごとにチェック
 
-  // ── B: 時間変換ロジック ──
-  const TimeUtils = {
-    // Bar:Beat を秒に変換
-    posToSec: (bar, beat, bpm) => {
-      const beatSec = 60 / bpm;
-      return ((bar - 1) * 4 + (beat - 1)) * beatSec;
+  // ── B: Advanced Easing Engine ──
+  const Easing = {
+    linear: t => t,
+    easeIn: t => t * t,
+    easeOut: t => t * (2 - t),
+    easeInOut: t => t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t,
+    elastic: t => t === 0 ? 0 : t === 1 ? 1 : -Math.pow(2, 10 * t - 10) * Math.sin((t * 10 - 10.75) * (2 * Math.PI) / 3),
+    bounce: t => {
+      const n1 = 7.5625, d1 = 2.75;
+      if (t < 1 / d1) return n1 * t * t;
+      else if (t < 2 / d1) return n1 * (t -= 1.5 / d1) * t + 0.75;
+      else if (t < 2.5 / d1) return n1 * (t -= 2.25 / d1) * t + 0.9375;
+      else return n1 * (t -= 2.625 / d1) * t + 0.984375;
     },
-    // 秒を Bar:Beat に変換
+    step: t => t >= 1 ? 1 : 0
+  };
+
+  // ── B: Time Conversion ──
+  const Time = {
+    posToSec: (bar, beat, bpm) => ((bar - 1) * 4 + (beat - 1)) * (60 / bpm),
     secToPos: (sec, bpm) => {
-      const beatSec = 60 / bpm;
-      const totalBeats = sec / beatSec;
+      const totalBeats = sec / (60 / bpm);
       return {
         bar: Math.floor(totalBeats / 4) + 1,
-        beat: Math.floor(totalBeats % 4) + 1
+        beat: Math.floor(totalBeats % 4) + 1,
+        tick: Math.floor((totalBeats % 1) * TICKS_PER_BEAT)
       };
+    },
+    parseDuration: (str, bpm) => {
+      const val = parseFloat(str);
+      if (str.endsWith('b')) return val * (60 / bpm);
+      if (str.endsWith('bar')) return val * 4 * (60 / bpm);
+      if (str.endsWith('s')) return val;
+      return val;
     }
   };
 
-  // ── B: スケジューラー (Look-ahead) ──
+  // ── B: Scheduler & Tween Logic ──
+  const _updateTweens = (now) => {
+    _state.activeTweens = _state.activeTweens.filter(tw => {
+      const elapsed = now - tw.startT;
+      const progress = Math.min(1, elapsed / tw.duration);
+      const eased = (Easing[tw.easing] || Easing.linear)(progress);
+      const currentVal = tw.from + (tw.to - tw.from) * eased;
+      sph.call('media_core.update_param', [tw.target, currentVal]);
+      return progress < 1;
+    });
+  };
+
   const _scheduler = () => {
     if (!_state.isPlaying) return;
-
-    const ctx = sph.call('audio_engine.get_ctx'); // AudioContext取得
+    const ctx = sph.call('audio_engine.get_ctx');
     if (!ctx) return;
 
-    const currentTime = ctx.currentTime - _state.startTime;
-    const scheduleUntil = currentTime + LOOK_AHEAD;
+    const now = ctx.currentTime;
+    const localSec = now - _state.startTime;
+    _state.currentSec = localSec;
 
+    // Loop Logic
+    if (_state.loop.active && localSec >= Time.posToSec(_state.loop.end, 1, _state.bpm)) {
+      _state.startTime += Time.posToSec(_state.loop.end - _state.loop.start + 1, 1, _state.bpm);
+      _state.processedEvents.clear();
+      sph.emit('timeline:loop');
+      return;
+    }
+
+    const scheduleUntil = localSec + LOOK_AHEAD;
     const fullState = sph.call('media_core.get_state');
-    const timeline = fullState.timeline || [];
 
-    timeline.forEach((block, idx) => {
-      const eventTime = TimeUtils.posToSec(block.bar, block.beat, _state.bpm);
-      
-      // まだ処理しておらず、予約ウィンドウ内に入ったイベントを実行
-      if (!_state.processedEvents.has(idx) && eventTime <= scheduleUntil) {
-        _executeBlock(block, eventTime + _state.startTime);
+    // Event Execution
+    (fullState.timeline || []).forEach((block, idx) => {
+      const eventSec = Time.posToSec(block.bar, block.beat, _state.bpm);
+      if (!_state.processedEvents.has(idx) && eventSec <= scheduleUntil) {
+        _executeBlock(block, eventSec + _state.startTime);
         _state.processedEvents.add(idx);
       }
     });
 
-    // UI更新用のシグナル
-    const pos = TimeUtils.secToPos(currentTime, _state.bpm);
-    if (pos.bar !== _state.currentBar || pos.beat !== _state.currentBeat) {
-      _state.currentBar = pos.bar;
-      _state.currentBeat = pos.beat;
-      sph.emit('timeline:beat', _state);
+    // Metronome Logic (Audible Click)
+    if (_state.metronome) {
+      const pos = Time.secToPos(localSec, _state.bpm);
+      const beatSec = Time.posToSec(pos.bar, pos.beat, _state.bpm);
+      const mKey = `m-${pos.bar}-${pos.beat}`;
+      if (!_state.processedEvents.has(mKey) && beatSec <= scheduleUntil) {
+        const pitch = pos.beat === 1 ? 84 : 72;
+        sph.call('audio_engine.play_note', ['@default', pitch, 0.3, 0.05, beatSec + _state.startTime]);
+        _state.processedEvents.add(mKey);
+      }
     }
-    
-    sph.emit('timeline:tick', { time: currentTime, ...pos });
+
+    _updateTweens(localSec);
+    const pos = Time.secToPos(localSec, _state.bpm);
+    _updateUI(pos);
+    sph.emit('timeline:tick', { time: localSec, ...pos });
   };
 
-  // ── B: ブロック実行ロジック ──
-  const _executeBlock = (block, absoluteTime) => {
-    // block.raw 内の命令を解析して実行
-    // 例: "play @bass" -> audio_engine.play_note
+  const _executeBlock = (block, absTime) => {
     const lines = block.raw.split(/,|\n/);
-    
     lines.forEach(line => {
-      const cmd = line.trim();
-      if (cmd.startsWith('play ')) {
-        const id = cmd.replace('play ', '').trim();
-        // Note定義を探して再生
+      const l = line.trim();
+      if (l.startsWith('play ')) {
+        const id = l.replace('play ', '').trim();
         const note = sph.call('media_core.get_state').notes[id];
-        if (note) {
-          // サンプル精度でスケジュール（簡易実装としてsetTimeout/AudioAPI併用）
-          const delay = (absoluteTime - sph.call('audio_engine.get_ctx').currentTime) * 1000;
-          setTimeout(() => {
-            sph.call('audio_engine.play_note', [note.wave, 60, 0.8, 1.0]);
-          }, Math.max(0, delay));
-        }
+        if (note) sph.call('audio_engine.play_note', [note.wave, 60, 0.8, 1.0, absTime]);
       }
-      // TODO: &記法（Tween）の解析と実行
+      // Tween: @id &param: from -> to [dur, ease]
+      const twMatch = l.match(/(@[\w.]+)\s+&([\w.]+):\s*([\d.-]+)\s*->\s*([\d.-]+)\s*\[([^\]]+)\]/);
+      if (twMatch) {
+        const [_, target, param, from, to, durPart] = twMatch;
+        const [durStr, easeStr] = durPart.split(',').map(s => s.trim());
+        _state.activeTweens.push({
+          target: `${target}.${param}`,
+          from: parseFloat(from),
+          to: parseFloat(to),
+          startT: absTime - _state.startTime,
+          duration: Time.parseDuration(durStr, _state.bpm),
+          easing: easeStr || 'linear'
+        });
+      }
     });
   };
 
-  // ── API公開 ──
+  const _updateUI = (pos) => {
+    const el = document.getElementById('tl-display');
+    if (el) el.textContent = `${String(pos.bar).padStart(2,'0')}:${String(pos.beat).padStart(2,'0')}:${String(pos.tick).padStart(3,'0')}`;
+    const prog = document.getElementById('tl-progress');
+    if (prog) prog.style.width = ((pos.beat - 1 + pos.tick/TICKS_PER_BEAT) / 4 * 100) + '%';
+    
+    // Check Markers
+    for (const [name, m] of _state.markers) {
+      if (m.bar === pos.bar && m.beat === pos.beat && pos.tick < 20) {
+        const mEl = document.getElementById('tl-marker-display');
+        if (mEl) mEl.textContent = name.toUpperCase();
+        sph.emit('timeline:marker', { name, ...m });
+      }
+    }
+  };
+
+  // ── API: Control Layer ──
   sph.mount('timeline_manager', 'TIMELINE', '⏱', {
+    panel: () => document.getElementById('timeline-transport-ui').innerHTML,
+    
     api: {
       play: () => {
         if (_state.isPlaying) return;
         const ctx = sph.call('audio_engine.get_ctx');
-        if (!ctx) return;
-
         _state.bpm = sph.call('media_core.get_state').config.bpm || 120;
         _state.startTime = ctx.currentTime - _state.pauseTime;
         _state.isPlaying = true;
         _state.processedEvents.clear();
-        
         _timer = setInterval(_scheduler, CHECK_INTERVAL);
+        
+        const led = document.getElementById('tl-status-led');
+        if (led) led.style.background = 'var(--sph-ok)';
+        document.getElementById('tl-bpm-val').textContent = _state.bpm;
         sph.emit('timeline:started');
-        sph.call('ide.log', ['[TIMELINE] Started']);
       },
 
       stop: () => {
         _state.isPlaying = false;
         _state.pauseTime = 0;
+        _state.activeTweens = [];
         clearInterval(_timer);
+        const led = document.getElementById('tl-status-led');
+        if (led) led.style.background = 'var(--sph-dim)';
         sph.emit('timeline:stopped');
-        sph.call('ide.log', ['[TIMELINE] Stopped & Reset']);
       },
 
-      pause: () => {
-        if (!_state.isPlaying) return;
-        const ctx = sph.call('audio_engine.get_ctx');
-        _state.pauseTime = ctx.currentTime - _state.startTime;
-        _state.isPlaying = false;
-        clearInterval(_timer);
-        sph.call('ide.log', ['[TIMELINE] Paused']);
+      set_metronome: (enabled) => { _state.metronome = !!enabled; },
+
+      set_marker: (name, bar, beat = 1) => { _state.markers.set(name, { bar, beat }); },
+
+      jump_to: (name) => {
+        const m = _state.markers.get(name);
+        if (m) sph.call('timeline_manager.seek', [m.bar, m.beat]);
       },
 
-      get_status: () => ({ ..._state })
+      seek: (bar, beat = 1) => {
+        _state.pauseTime = Time.posToSec(bar, beat, _state.bpm);
+        if (_state.isPlaying) {
+          const ctx = sph.call('audio_engine.get_ctx');
+          _state.startTime = ctx.currentTime - _state.pauseTime;
+          _state.processedEvents.clear();
+        }
+        _updateUI({ bar, beat, tick: 0 });
+      }
     },
+
     on: {
-      'ide-ready': () => sph.call('abcd.register', ['timeline_manager', 'C'])
+      'ide-ready': () => {
+        sph.call('abcd.register', ['timeline_manager', 'C']);
+      }
     }
   });
 })();
 </script>
+
+<!-- 
+  TIMELINE_LIB (DSL Library)
+  High-level orchestration for time-based events.
+-->
+<script type="sph/lib" data-tab-name="timeline_lib">
+; lib timeline_lib
+; High-level time orchestration for Sapphire DSL.
+
+; --- Wait until a specific bar is reached ---
+!timeline.wait_until [#_target_bar]
+  @wait_loop #_target_bar
+  RET 1
+
+@wait_loop [#_target_bar]
+  @loop
+    $status = timeline_manager.get_status
+    if $status.currentBar >= #_target_bar { -> break }
+    sys.wait
+    -> @
+
+; --- Create a smooth fade for any parameter ---
+!timeline.fade [$_target, %_from, %_to, $_dur]
+  ; Injects a tween into the next available timeline slot
+  ; Note: In v3.2, this is best done via MML injection
+  $mml = "#1:1 { " + $_target + " &val: " + %_from + " -> " + %_to + " [" + $_dur + "] }"
+  media_core.apply_mml $mml
+  RET 1
+
+; --- Define a song structure ---
+!timeline.setup_markers
+  timeline_manager.set_marker "intro" 1 1
+  timeline_manager.set_marker "verse" 9 1
+  timeline_manager.set_marker "chorus" 17 1
+  timeline_manager.set_marker "outro" 25 1
+  RET 1
+</script>
+
+</body>
+</html>
