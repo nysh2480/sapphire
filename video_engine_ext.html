@@ -1,148 +1,714 @@
-<!-- ⬡ VIDEO_ENGINE_EXT (B-Layer) -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="sph-ext" content="video_engine">
+  <meta name="sph-version" content="3.2">
+  <title>VIDEO ENGINE EXT</title>
+</head>
+<body>
+
+<!--  visual orchestration, and **functional expansions** including advanced transition support, video file playback, and dynamic layer management.
+
+---
+
+### ⬡ VIDEO_ENGINE_EXT v3.2 (B-Layer)
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="sph-ext" content="video_engine">
+  <meta name="sph-version" content="3.2">
+  <title>VIDEO ENGINE EXT</title>
+</head>
+<body>
+
+<!-- 
+  VIDEO_ENGINE EXT v3.2
+  [B] Base: High-Performance Canvas Compositor
+  [C] Control: Layer Management & Frame
+  VIDEO_ENGINE EXT v3.2
+  [B] Base: High-Performance Canvas Compositor
+  [C] Control: Frame Synchronization & Layer Management
+-->
+
 <script type="sph/meta" data-ext-id="video_engine">
 {
   "cat": "B",
-  "version": "3.0",
+  "version": "3.2",
   "label": "VIDEO ENGINE",
   "icon": "🎬",
-  "consumes": ["media_definition", "media_core"],
-  "produces": ["video_stream"],
-  "signals": ["video:frame_rendered", "video:source_ready"]
+  "consumes": ["media_definition", "media_core", "asset_manager"],
+  "produces": ["video_stream", "frame_buffer"],
+  "signals": Synchronization
+-->
+
+<script type="sph/meta" data-ext-id="video_engine">
+{ [
+    "video:ready",
+    "video:frame_rendered",
+    "video:source_error",
+    "video:transition_start",
+    "video:transition_end"
+  ],
+  "permissions": ["dom", "canvas"]
+  "cat": "B",
+  "version": "3.2",
+  "label": "
 }
+</script>
+
+<script type="sph/doc" data-ext-id="video_engineVIDEO ENGINE",
+  "icon": "🎬",
+  "consumes": ["media_definition", "media_core", "asset_">
+{
+  "title": "Video Engine v3.2 Reference",
+  "description": "A resolutionmanager"],
+  "produces": ["video_stream", "frame_buffer"],
+  "signals": [
+    "video:ready",
+    "video:frame_rendered",
+    "video:source_loaded",
+    "video:transition-independent compositor using a normalized coordinate system (0.0 to 1.0). Supports real-time CSS filters, advanced_start",
+    "video:transition_end"
+  ],
+  "permissions": ["dom", "canvas"]
+ blending, and layer-based effects.",
+  "api": [
+    { "method": "video_engine.attach", "args": "}
 </script>
 
 <script type="sph/doc" data-ext-id="video_engine">
 {
-  "title": "VIDEO_ENGINE Rendering Spec",
-  "coordinates": "Normalized 0.0 to 1.0 (Top-Left to Bottom-Right)",
-  "filters": ["sepia", "blur", "brightness", "contrast", "grayscale", "hue-rotate"],
-  "layers": "Ascending order (Layer 0 is back)"
+  "title": "Video Engine v3.2 Reference",
+  "description": "A resolutioncanvasId", "description": "Binds the engine output to a specific HTML5 Canvas." },
+    { "method": "`VIDEO_ENGINE_EXT` has been upgraded to **v3.-independent compositor using a normalized coordinate system (0.0 to 1.0). Supports real-time CSS filters, alphavideo_engine.set_global_alpha", "args": "value", "description": "Sets the master opacity for2**. This version features **full English documentation**, a **built-in DSL Library (LIB)** for high-level blending, and hardware-accelerated rendering.",
+  "api": [
+    { "method": "video_ the entire composition." },
+    { "method": "video_engine.snapshot", "args": "", "description": "Returnsengine.attach", "args": "canvasId", "description": "Binds the engine output to a specific HTML5 the current frame as a Base64 PNG string." }
+  ],
+  "coordinate_system": {
+    " Canvas." },
+    { "method": "video_engine.set_source", "args": "id, type, url", "description": visual orchestration, and **functional expansions** including advanced transition support, video file playback, and dynamic layer management.
+
+---
+
+### ⬡ VIDEO_ENGINE_EXT v3.2 (B-Layer)
+
+```html
+<!DOCTYPE html>x_y": "0.0 (Top/Left) to 1.0 (Bottom/Right)",
+    "scale "Registers a visual source: 'image', 'video', or 'camera'." },
+    { "method": "video_engine.
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="sph-": "1.0 is original size relative to canvas width",
+    "rotation": "Degrees (0-360)"
+  },
+ext" content="video_engine">
+  <meta name="sph-version" content="3.2">
+  <title>VIDEO ENGINE EXT</title>
+</head>
+<body>
+
+<!-- 
+  VIDEO_ENGINE EXT v3.2  "blend_modes": ["source-over", "screen", "multiply", "overlay", "additive", "destinationset_layer", "args": "clipId, layerIndex", "description": "Changes the Z-index of a specific clip." },
+    { "method": "video_engine.snapshot", "args": "", "description": "-out"]
 }
 </script>
 
-<script type="sph/ext" data-ext-id="video_engine">
+<script type="sph/sec" id="video-monitor-ui">
+
+  [B] Base: High-Performance Canvas Compositor
+  [C] Control: Layer Management & FrameReturns the current frame as a PNG DataURL." }
+  ],
+  "coordinate_system": {
+    <style>
+  .video-mon { font-family: var(--sph-font); padding: 12px; background: #050505; border-radius: 6px; border: 1px solid var(--sph-"x_y": "0.0 (Top/Left) to 1.0 (Bottom/Right)",
+    " Synchronization
+-->
+
+<script type="sph/meta" data-ext-id="video_engine">
+{
+  "cat": "B",
+  "version": "3.2",
+  "label": "VIDEO ENGINE",
+  "icon": "🎬",
+  "consumes": ["media_definition", "media_core", "asset_border); }
+  .mon-header { font-size: 10px; color: var(--sph-scale": "1.0 is original size relative to canvas width",
+    "rotation": "Degrees (0 toaccent); margin-bottom: 8px; letter-spacing: 1px; font-weight: bold;manager"],
+  "produces": ["video_stream", "frame_buffer"],
+  "signals": [
+    "video:ready", }
+  .mon-canvas-wrap { width: 100%; aspect-ratio: 16
+    "video:frame_rendered",
+    "video:source_loaded",
+    "video:transition 360)"
+  },
+  "blending_modes": ["source-over", "screen",/9; background: #111; display: flex; align-items: center; justify-content:_start",
+    "video:transition_end"
+  ],
+  "permissions": ["dom", "canvas"]
+ "multiply", "additive", "difference", "overlay"]
+}
+</script>
+
+<script type="sph}
+</script>
+
+<script type="sph/doc" data-ext-id="video_engine"> center; overflow: hidden; border: 1px solid #222; }
+  #video-mini-preview { max-/sec" id="video-monitor-ui">
+<style>
+  .video-mon { font-family: var(--sph
+{
+  "title": "Video Engine v3.2 Reference",
+  "description": "A resolution-font); padding: 12px; background: var(--sph-surface); border-radius: 6width: 100%; max-height: 100%; object-fit: contain; image-rendering: pixelated; }
+  .mon-footer { display: grid; grid-template-columns: 1fr 1fr 1frpx; border: 1px solid var(--sph-border); }
+  .mon-header { display: flex; justify-content-independent compositor using a normalized coordinate system (0.0 to 1.0). Supports real-time CSS filters, alpha: space-between; align-items: center; margin-bottom: 8px; }
+  .mon; font-size: 8px; color: #0f0; margin-top: 6px; font blending, and hardware-accelerated rendering.",
+  "api": [
+    { "method": "video_-canvas-wrap { width: 100%; aspect-ratio: 16/9; background:engine.attach", "args": "canvasId", "description": "Binds the engine output to a specific HTML5-family: monospace; }
+</style>
+<div class="video-mon">
+  <div class #000; display: flex; align-items: center; justify-content: center; overflow: hidden; border:="mon-header">LIVE COMPOSITOR MONITOR</div>
+  <div class="mon-canvas-wrap">
+    < Canvas." },
+    { "method": "video_engine.set_source", "args": "id, type, url", "description": 1px solid #000; }
+  #video-mini-preview { max-width: 100%; maxcanvas id="video-mini-preview" width="320" height="180"></canvas>
+  </div>
+  -height: 100%; object-fit: contain; image-rendering: pixelated; }
+  .mon-stats { display:<div class="mon-footer">
+    <span id="video-fps">FPS: --</span>
+    <span id="video "Registers a visual source: 'image', 'video', or 'camera'." },
+    { "method": "video_engine. grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-top: 8-res" style="text-align:center;">RES: 0x0</span>
+    <span id="video-status" stylepx; font-size: 9px; color: var(--sph-dim); }
+  .stat-itemset_layer", "args": "clipId, layerIndex", "description": "Changes the Z-index of a specific="text-align:right;">IDLE</span>
+  </div>
+</div>
+</script>
+
+<script type=" clip." },
+    { "method": "video_engine.snapshot", "args": "", "description": "sph/ext" data-ext-id="video_engine">
+(function(){
+  'use strict'; b { color: var(--sph-accent); }
+  .status-tag { font-size: 8px; paddingReturns the current frame as a PNG DataURL." }
+  ],
+  "coordinate_system": {
+    
+
+  // ── D: Internal State ──
+  let _mainCanvas = null;
+  let _mainCtx = null;
+  let _miniCanvas = null;
+  let _miniCtx = null;
+: 1px 4px; border-radius: 3px; background: var(--sph-bg); color: var(--sph-"x_y": "0.0 (Top/Left) to 1.0 (Bottom/Right)",
+    "  let _lastFrameTime = 0;
+  let _frameCount = 0;
+  let _fps = 0;
+ok); border: 1px solid var(--sph-ok)55; }
+</style>
+<scale": "1.0 is original size relative to canvas width",
+    "rotation": "Degrees (0 to  let _globalAlpha = 1.0;
+
+  // ── B: Rendering Core ──
+  const Renderer = {
+div class="video-mon">
+  <div class="mon-header">
+    <span class="sph-label">LIVE    // Build CSS filter string from object
+    getFilter: (f) => {
+      if (!f) return 'none';
+ 360)"
+  },
+  "blending_modes": ["source-over", "screen", MONITOR</span>
+    <span id="video-status-tag" class="status-tag">IDLE</span>
+  </div>
+   "multiply", "additive", "difference", "overlay"]
+}
+</script>
+
+<script type="sph      return Object.entries(f).map(([type, val]) => {
+        const unit = (type === 'blur') ? 'px<div class="mon-canvas-wrap">
+    <canvas id="video-mini-preview" width="/sec" id="video-monitor-ui">
+<style>
+  .video-mon { font-family: var(--sph320" height="180"></canvas>
+  </div>
+  <div class="mon-stats' : (type === 'hue-rotate') ? 'deg' : (type === 'brightness' || type === 'contrast'-font); padding: 12px; background: var(--sph-surface); border-radius: 6">
+    <div class="stat-item">FPS: <b id="video-fps">0</b></div>
+    <div || type === 'saturate') ? '' : '';
+        return `${type}(${val}${unit})`;
+      }).join(' ');
+    px; border: 1px solid var(--sph-border); }
+  .mon-header { display: flex; justify-content class="stat-item">RES: <b id="video-res">0x0</b></div>
+    <},
+
+    // Draw a single Video Clip (VC)
+    drawClip: (ctx, clip, canvas): space-between; align-items: center; margin-bottom: 8px; }
+  .mondiv class="stat-item">LAYERS: <b id="video-layer-count">0</b></div>
+ => {
+      const asset = sph.call('asset_manager.get', [clip.src]);
+      if (!asset) return;-canvas-wrap { width: 100%; aspect-ratio: 16/9; background:    <div class="stat-item">ENGINE: <b id="video-engine-ver">v3.2</b> #000; display: flex; align-items: center; justify-content: center; overflow: hidden; border:
+
+      ctx.save();
+      
+      // Blending & Transparency
+      ctx.globalAlpha = (clip.alpha ??</div>
+  </div>
+</div>
+</script>
+
+<script type="sph/ext" data-ext-id 1px solid #000; }
+  #video-mini-preview { max-width: 100%; max 1.0) * _globalAlpha;
+      ctx.globalCompositeOperation = clip.blend || 'source-over';
+      
+="video_engine">
 (function(){
   'use strict';
 
-  let _canvas = null;
-  let _ctx = null;
-  let _sources = new Map(); // id -> HTMLImageElement | HTMLVideoElement
+  // ── D: Internal State ──
+  let _mainCanvas = null;
+  let _mainCtx = null;
+  let _mini      // Apply Filters
+      if (clip.filter) ctx.filter = Renderer.getFilter(clip.filter);
 
-  // ── B: フィルタ変換ロジック ──
-  const _getFilterString = (filterDef) => {
-    if (!filterDef) return 'none';
-    const { type, intensity, unit } = filterDef;
-    const val = intensity ?? 1;
-    const u = unit ?? (type === 'blur' ? 'px' : type === 'hue-rotate' ? 'deg' : '');
-    
-    // MMLの型名をCSSフィルタ名にマッピング
-    const map = {
-      'sepia': `sepia(${val})`,
-      'blur': `blur(${val}${u})`,
-      'brightness': `brightness(${val})`,
-      'contrast': `contrast(${val})`,
-      'grayscale': `grayscale(${val})`,
-      'hue-rotate': `hue-rotate(${val}${u})`
-    };
-    return map[type] || 'none';
-  };
+      -height: 100%; object-fit: contain; image-rendering: pixelated; }
+  .mon-stats { display:// Transform (Normalized -> Pixel)
+      const t = clip.transform || { x: 0.5, y: Canvas = null;
+  let _miniCtx = null;
+  let _sources = new Map(); // id -> HTML grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-top: 8px; font-size: 9px; color: var(--sph-dim); }
+  .stat-item0.5, scale: 1, rotation: 0 };
+      const w = canvas.width;
+      ImageElement | HTMLVideoElement
+  let _lastFrameTime = 0;
+  let _frameCount = 0;
+  let _fps = 0;
 
-  // ── B: 描画コア ──
-  const _render = () => {
-    if (!_ctx || !_canvas) return;
+  // ── B: Rendering Core ──
+  const Renderer = {
+ b { color: var(--sph-accent); }
+  .status-tag { font-size: 8px; paddingconst h = canvas.height;
+      
+      // Move to center of the clip
+      ctx.translate((    buildFilterString: (f) => {
+      if (!f) return 'none';
+      return Objectt.x || 0.5) * w, (t.y || 0.5) * h);
+      if: 1px 4px; border-radius: 3px; background: var(--sph-bg); color: var(--sph-.entries(f).map(([type, val]) => {
+        const unit = (type === 'blur') (t.rotation) ctx.rotate(t.rotation * Math.PI / 180);
+      
+      const dw = wok); border: 1px solid var(--sph-ok)55; }
+</style>
+< ? 'px' : (type === 'hue-rotate') ? 'deg' : (type === 'brightness' * (t.scale || 1);
+      const dh = (asset.height / asset.width) * dwdiv class="video-mon">
+  <div class="mon-header">
+    <span class="sph-label">LIVE || type === 'contrast') ? '' : '%';
+        return `${type}(${val}${unit})`;
+      }).join; // Maintain aspect ratio
+      
+      ctx.drawImage(asset, -dw/2, -dh/2, dw, dh);
+      
+      ctx.restore();
+    },
 
-    const state = sph.call('media_core.get_state');
-    const { waves, notes, videos, timeline } = state;
+    // Main Composition Loop
+    compose: () => {
+(' ');
+    },
 
-    // 背景クリア
-    _ctx.fillStyle = '#000';
-    _ctx.fillRect(0, 0, _canvas.width, _canvas.height);
+    drawClip: (ctx, clip, canvas) => {
+      // Try to get source from local MONITOR</span>
+    <span id="video-status-tag" class="status-tag">IDLE</span>
+  </div>
+        if (!_mainCtx || !_mainCanvas) return;
 
-    // トラック（レイヤー）順に描画
-    // videosオブジェクトからtypeがVTのものを抽出してソート
-    const tracks = Object.values(videos)
-      .filter(v => v.type === 'VT' || v.layer !== undefined)
-      .sort((a, b) => (a.layer || 0) - (b.layer || 0));
-
-    tracks.forEach(track => {
-      // トラックに含まれるクリップ(VC)を描画
-      const clipId = track.clip || track.refs?.[0];
-      const clip = videos[clipId];
-      if (!clip) return;
-
-      const src = _sources.get(clip.src);
+      // Clear with black
+      _mainCtx.fillStyle map or asset_manager
+      let src = _sources.get(clip.src) || sph.call('<div class="mon-canvas-wrap">
+    <canvas id="video-mini-preview" width="320" height="180"></canvas>
+  </div>
+  <div class="mon-stats = '#000';
+      _mainCtx.fillRect(0, 0, _mainCanvas.width, _mainCanvasasset_manager.get', [clip.src]);
       if (!src) return;
 
-      _ctx.save();
+      ctx.save">
+    <div class="stat-item">FPS: <b id="video-fps">0</b></div>
+    <div.height);
 
-      // フィルタ適用
-      if (clip.filter) {
-        _ctx.filter = _getFilterString(clip.filter);
+      const state = sph.call('media_core.get_state');
+      if (! class="stat-item">RES: <b id="video-res">0x0</b></div>
+    <();
+      
+      // Alpha & Blending
+      ctx.globalAlpha = clip.alpha ?? 1.0;
+      ctx.globaldiv class="stat-item">LAYERS: <b id="video-layer-count">0</b></div>
+CompositeOperation = clip.blend || 'source-over';
+      
+      // Filters
+      if (clip.state || !state.videos) return;
+
+      // Sort by layer and render
+      Object.values(state.videos)
+        .filter(v => v.type === 'VC' || v.src)
+        .    <div class="stat-item">ENGINE: <b id="video-engine-ver">v3.2</b>filter) ctx.filter = Renderer.buildFilterString(clip.filter);
+
+      // Transform (Normalized -> Pixel)
+      const tsort((a, b) => (a.layer || 0) - (b.layer || 0))</div>
+  </div>
+</div>
+</script>
+
+<script type="sph/ext" data-ext-id = clip.transform || { x: 0.5, y: 0.5, scale: 1
+        .forEach(clip => Renderer.drawClip(_mainCtx, clip, _mainCanvas));
+
+      // Update Mini="video_engine">
+(function(){
+  'use strict';
+
+  // ── D: Internal State , rotation: 0 };
+      const w = canvas.width;
+      const h = canvas.height;
+ Preview
+      if (_miniCtx) {
+        _miniCtx.drawImage(_mainCanvas, 0, 0──
+  let _mainCanvas = null;
+  let _mainCtx = null;
+  let _mini      
+      // Translate to center of the clip
+      ctx.translate((t.x || 0.5Canvas = null;
+  let _miniCtx = null;
+  let _sources = new Map(); // id -> HTML, _miniCanvas.width, _miniCanvas.height);
       }
 
-      // トランスフォーム (0.0-1.0 -> Pixel)
-      const t = clip.transform || { x: 0, y: 0, scale: 1 };
-      const x = (t.x || 0) * _canvas.width;
-      const y = (t.y || 0) * _canvas.height;
-      const sw = _canvas.width * (t.scale || 1);
-      const sh = _canvas.height * (t.scale || 1);
+      // Performance Tracking
+      _frameCount++;
+      constImageElement | HTMLVideoElement
+  let _lastFrameTime = 0;
+  let _frameCount = 0;
+  let now = performance.now();
+      if (now - _lastFrameTime >= 1000) {
+        _fps = _frameCount _fps = 0;
 
-      // アルファ
-      _ctx.globalAlpha = clip.alpha ?? 1.0;
-
-      // 描画
-      _ctx.drawImage(src, x, y, sw, sh);
-
-      _ctx.restore();
-    });
-
-    sph.emit('video:frame_rendered', { timestamp: Date.now() });
+  // ── B: Rendering Core ──
+  const Renderer = {
+) * w, (t.y || 0.5) * h);
+      if (t.rotation    buildFilterString: (f) => {
+      if (!f) return 'none';
+      return Object;
+        _frameCount = 0;
+        _lastFrameTime = now;
+        const fpsEl = document.getElementById('video-) ctx.rotate(t.rotation * Math.PI / 180);
+      
+      // Calculate dimensions.entries(f).map(([type, val]) => {
+        const unit = (type === 'blur')fps');
+        if (fpsEl) fpsEl.textContent = `FPS: ${_fps}`;
+      }
+ (scale 1.0 = full canvas width)
+      const dw = w * (t.scale || 1    }
   };
 
-  // ── API公開 ──
-  sph.mount('video_engine', 'VIDEO', '🎬', {
+  // ── API: Control Layer ──
+  sph.mount('video_ ? 'px' : (type === 'hue-rotate') ? 'deg' : (type === 'brightness');
+      const dh = (src.height / src.width) * dw; // Maintain aspect ratio
+      
+      ctx.engine', 'VIDEO', '🎬', {
+    panel: () => document.getElementById('video-monitor-ui || type === 'contrast') ? '' : '%';
+        return `${type}(${val}${unit})`;
+      }).join').innerHTML,
+    
     api: {
-      // 描画先キャンバスの設定
       attach: (canvasId) => {
-        _canvas = document.getElementById(canvasId);
-        if (_canvas) {
-          _ctx = _canvas.getContext('2d');
-          sph.call('ide.log', ['[VIDEO] Engine attached to canvas: ' + canvasId]);
-        }
-      },
-
-      // ソース（画像・カメラ）の登録
-      set_source: async (id, type, url) => {
-        if (type === 'camera') {
-          const video = document.createElement('video');
-          video.autoplay = true;
-          video.srcObject = await navigator.mediaDevices.getUserMedia({ video: true });
-          _sources.set(id, video);
-        } else {
-          const img = new Image();
-          img.src = url;
-          await img.decode();
-          _sources.set(id, img);
-        }
-        sph.emit('video:source_ready', { id });
-      },
-
-      // 手動レンダリング実行
-      render: () => _render()
+        _maindrawImage(src, -dw/2, -dh/2, dw, dh);
+      
+      ctx.restore();
     },
+
+    Canvas = document.getElementById(canvasId);
+        if (_mainCanvas) {
+          _mainCtx = _compose: () => {
+      if (!_mainCtx || !_mainCanvas) return;
+
+      // Clear with backgroundmainCanvas.getContext('2d', { alpha: false });
+          const resEl = document.getElementById('video-res');
+           color
+      _mainCtx.fillStyle = '#000';
+      _mainCtx.fillRect(0, (' ');
+    },
+
+    drawClip: (ctx, clip, canvas) => {
+      // Try to get source from local map or asset_manager
+      let src = _sources.get(clip.src) || sph.call('if (resEl) resEl.textContent = `RES: ${_mainCanvas.width}x${_mainCanvas0, _mainCanvas.width, _mainCanvas.height);
+
+      const state = sph.call('mediaasset_manager.get', [clip.src]);
+      if (!src) return;
+
+      ctx.save_core.get_state');
+      if (!state || !state.videos) return;
+
+      // Sort.height}`;
+          sph.call('ide.log', [`[VIDEO] Attached to ${canvasId}`]);
+        }
+      },
+
+();
+      
+      // Alpha & Blending
+      ctx.globalAlpha = clip.alpha ?? 1.0;
+      ctx.globalCompositeOperation = clip.blend || 'source-over';
+      
+      // Filters
+      if (clip.      set_global_alpha: (val) => { _globalAlpha = Math.max(0, Math.min(1, val)); }, by layer and render
+      const clips = Object.values(state.videos)
+        .filter(v => v.type
+
+      render: () => Renderer.compose(),
+
+      snapshot: () => _mainCanvas ? _mainCanvas. === 'VC' || v.src)
+        .sort((a, b) => (a.layer ||filter) ctx.filter = Renderer.buildFilterString(clip.filter);
+
+      // Transform (Normalized -> Pixel)
+      const ttoDataURL('image/png') : null,
+
+      describe: () => ({
+        cat: 'B = clip.transform || { x: 0.5, y: 0.5, scale: 1 0) - (b.layer || 0));
+
+      clips.forEach(clip => Renderer.drawClip(_mainCtx, clip, rotation: 0 };
+      const w = canvas.width;
+      const h = canvas.height;
+', version: '3.2',
+        features: ['normalized_coords', 'aspect_correction', 'blend_modes', 'mini, _mainCanvas));
+
+      // Update Mini Preview
+      if (_miniCtx) {
+        _miniCtx_monitor'],
+        fps: _fps
+      })
+    },
+
     on: {
-      'ide-ready': () => {
+      'ide-ready':.drawImage(_mainCanvas, 0, 0, _miniCanvas.width, _miniCanvas.height);
+      }
+
+      // Performance () => {
         sph.call('abcd.register', ['video_engine', 'B']);
-      },
-      // タイムラインの刻みに合わせて再描画
-      'timeline:tick': () => {
-        _render();
-      },
-      // MMLが更新されたらソースを自動準備（将来的な拡張用）
-      'mml:parsed': (state) => {
-        // state.assets を見て自動ロードするロジックをここに追加可能
+      }, Tracking
+      _frameCount++;
+      const now = performance.now();
+      if (now - _lastFrameTime
+      'frame-mounted': ({id}) => {
+        if (id === 'video_engine') { >= 1000) {
+        _fps = _frameCount;
+        _frameCount = 0;
+        _lastFrame
+          _miniCanvas = document.getElementById('video-mini-preview');
+          if (_miniCanvas) _miniCtx = _miniCanvas.      
+      // Translate to center of the clip
+      ctx.translate((t.x || 0.5Time = now;
+        const fpsEl = document.getElementById('video-fps');
+        if (fpsEl) * w, (t.y || 0.5) * h);
+      if (t.rotation) ctx.rotate(t.rotation * Math.PI / 180);
+      
+      // Calculate dimensionsgetContext('2d');
+          const stEl = document.getElementById('video-status');
+          if (st (scale 1.0 = full canvas width)
+      const dw = w * (t.scale || 1) fpsEl.textContent = _fps;
+        const lyrEl = document.getElementById('video-layer-count');
+        if ();
+      const dh = (src.height / src.width) * dw; // Maintain aspect ratio
+      
+      ctx.lyrEl) lyrEl.textContent = clips.length;
       }
     }
+  };
+
+  El) stEl.textContent = 'READY';
+        }
+      },
+      'timeline:tick': ()drawImage(src, -dw/2, -dh/2, dw, dh);
+      
+      ctx.restore();
+    },
+
+    // ── API: Control Layer ──
+  sph.mount('video_engine', 'VIDEO', '🎬', {
+    panel: () => document.getElementById('video-monitor-ui').innerHTML,
+    
+     => Renderer.compose(),
+      'timeline:started': () => {
+        const stEl = document.getElementById('video-status');
+        if (stEl) { stEl.textContent = 'RUNNING'; stEl.style.color = '#0f0'; }
+      },
+      'timeline:stopped': () => {compose: () => {
+      if (!_mainCtx || !_mainCanvas) return;
+
+      // Clear with backgroundapi: {
+      attach: (canvasId) => {
+        _mainCanvas = document.getElementById(canvas color
+      _mainCtx.fillStyle = '#000';
+      _mainCtx.fillRect(0, 
+        const stEl = document.getElementById('video-status');
+        if (stEl) { stEl0, _mainCanvas.width, _mainCanvas.height);
+
+      const state = sph.call('mediaId);
+        if (_mainCanvas) {
+          _mainCtx = _mainCanvas.getContext('2d.textContent = 'IDLE'; stEl.style.color = '#0f0'; }
+      }
+_core.get_state');
+      if (!state || !state.videos) return;
+
+      // Sort    }
   });
 })();
 </script>
+
+<!-- 
+  VIDEO_LIB (DSL Library)
+', { alpha: false });
+          const resEl = document.getElementById('video-res');
+          if (resEl) resEl.textContent = `${_mainCanvas.width}x${_mainCanvas.height}`;
+          sph.call('ide by layer and render
+      const clips = Object.values(state.videos)
+        .filter(v => v.type  High-level visual orchestration patterns.
+-->
+<script type="sph/lib" data-tab-name.log', [`[VIDEO] Engine attached to ${canvasId}`]);
+        }
+      },
+
+      set === 'VC' || v.src)
+        .sort((a, b) => (a.layer ||="video_lib">
+; lib video_lib
+; High-level visual patterns for Sapphire DSL.
+
+; 0) - (b.layer || 0));
+
+      clips.forEach(clip => Renderer.drawClip(_mainCtx, clip_source: async (id, type, url) => {
+        return new Promise((resolve, reject) => --- Quick Clip Setup ---
+!video.show [$_id, $_src, #_layer]
+  media {
+          let el;
+          if (type === 'video') {
+            el = document.createElement(', _mainCanvas));
+
+      // Update Mini Preview
+      if (_miniCtx) {
+        _miniCtx_core.update_param "videos." + $_id + ".src" $_src
+  media_core.updatevideo');
+            el.src = url; el.loop = true; el.muted = true; el.autoplay.drawImage(_mainCanvas, 0, 0, _miniCanvas.width, _miniCanvas.height);
+      }
+
+      // Performance_param "videos." + $_id + ".layer" #_layer
+  RET 1
+
+; --- Fade = true;
+            el.oncanplay = () => { _sources.set(id, el); resolve( Tracking
+      _frameCount++;
+      const now = performance.now();
+      if (now - _lastFrameTimetrue); };
+          } else if (type === 'camera') {
+            el = document.createElement('video In Global Opacity ---
+!video.fade_in [%_sec]
+  @v_fade_loop %_sec
+ >= 1000) {
+        _fps = _frameCount;
+        _frameCount = 0;
+        _lastFrameTime = now;
+        const fpsEl = document.getElementById('video-fps');
+        if (fpsEl  RET 1
+
+@v_fade_loop [%_sec]
+  %_a = 0.0
+  @');
+            navigator.mediaDevices.getUserMedia({ video: true })
+              .then(stream => {
+                el.srcObject = streamloop
+    if %_a >= 1.0 { -> break }
+    video_engine.set_) fpsEl.textContent = _fps;
+        const lyrEl = document.getElementById('video-layer-count');
+        if (; el.autoplay = true;
+                _sources.set(id, el); resolve(true);
+              }).global_alpha %_a
+    %_a = %_a + 0.05
+    sys.wait
+    -> @
+
+lyrEl) lyrEl.textContent = clips.length;
+      }
+    }
+  };
+
+  catch(reject);
+          } else {
+            el = new Image();
+            el.crossOrigin = "anonymous";
+            el// ── API: Control Layer ──
+  sph.mount('video_engine', 'VIDEO', '🎬; --- Shake Effect ---
+!video.shake [$_clip_id, #_intensity]
+  @shake', {
+    panel: () => document.getElementById('video-monitor-ui').innerHTML,
+    
+    .onload = () => { _sources.set(id, el); resolve(true); };
+            el.src = url;
+          }api: {
+      attach: (canvasId) => {
+        _mainCanvas = document.getElementById(canvas_loop $_clip_id #_intensity
+  RET 1
+
+@shake_loop [$_id, #_int
+          sph.emit('video:source_loaded', { id, type });
+        });
+      },
+
+      render: () => Renderer.Id);
+        if (_mainCanvas) {
+          _mainCtx = _mainCanvas.getContext('2d]
+  #_count = 10
+  @loop
+    if #_count <= 0 { ->compose(),
+
+      snapshot: () => _mainCanvas ? _mainCanvas.toDataURL('image/png')', { alpha: false });
+          const resEl = document.getElementById('video-res');
+          if (resEl) resEl. : null,
+
+      describe: () => ({
+        cat: 'B', version: '3.2', break }
+    %_rx = sys.rndf -0.02 0.02
+    %_ry = sys.textContent = `${_mainCanvas.width}x${_mainCanvas.height}`;
+          sph.call('iderndf -0.02 0.02
+    media_core.update_param "videos."
+        features: ['normalized_coords', 'blending', 'video_support', 'camera_input'],
+        fps: _fps
+.log', [`[VIDEO] Engine attached to ${canvasId}`]);
+        }
+      },
+
+      set + $_id + ".transform.x" 0.5 + %_rx
+    media_core.update_source: async (id, type, url) => {
+        return new Promise((resolve, reject) =>      })
+    },
+
+    on: {
+      'ide-ready': () => {
+        sph._param "videos." + $_id + ".transform.y" 0.5 + %_ry
+     {
+          let el;
+          if (type === 'video') {
+            el = document.createElement('call('abcd.register', ['video_engine', 'B']);
+      },
+      'frame-mounted':#_count = #_count - 1
+    sys.wait
+    -> @
+  ; Reset position ({id}) => {
+        if (id === 'video_engine') {
+          _miniCanvas = documentvideo');
+            el.src = url; el.loop = true; el.muted = true; el.autoplay
+  media_core.update_param "videos." + $_id + ".transform.x" 0..getElementById('video-mini-preview');
+          if (_miniCanvas) _miniCtx = _miniCanvas.5
+  media_core.update_param "videos." + $_id + ".transform.y" 0 = true;
+            el.oncanplay = () => { _sources.set(id, el); resolve(getContext('2d');
+        }
+      },
+      'timeline:tick': () => Renderer.compose(),
+      'timeline:started':.5
+</script>
+
+</body>
+</html>
