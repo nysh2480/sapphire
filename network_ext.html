@@ -6,7 +6,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="sph-ext" content="network">
 <meta name="sph-ext-version" content="1.3.0">
-<title>NETWORK EXT - Signaling Support</title>
+<title>NETWORK EXT - Full Signaling & P2P</title>
 </head>
 <body>
 
@@ -22,6 +22,7 @@ let _dc = null;
 let _ws = null;
 let _config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 
+// --- Logging & UI Feedback ---
 const _log = (msg, isErr = false) => {
   const prefix = isErr ? '❌ [net-err]' : '[net]';
   sph.call('ide.log', [`${prefix} ${msg}`]);
@@ -32,67 +33,86 @@ const _log = (msg, isErr = false) => {
   }
 };
 
+// --- DataChannel Event Handlers ---
 function _setupDataChannel(channel) {
   _dc = channel;
-  _dc.onopen = () => { _log('✅ P2P Connected'); _updateUI(); sph.emit('network:connected', {state:'open'}); };
+  _dc.onopen = () => { 
+    _log('✅ P2P DataChannel Opened'); 
+    _updateUI(); 
+    sph.emit('network:connected', { state: 'open' }); 
+  };
   _dc.onclose = () => {
-    _log('⚠️ P2P Closed');
+    _log('⚠️ P2P DataChannel Closed');
     _updateUI();
     sph.emit('network:disconnected', {});
+    // Auto-reconnect logic using IDE registry
     if (sph.get('network.autoReconnect') === true) {
-      _log('🔄 Auto-reconnect enabled');
+      _log('🔄 Auto-reconnect enabled: Generating new Offer...');
       setTimeout(() => api.createOffer(), 1500);
     }
   };
-  _dc.onmessage = e => {
+  _dc.onmessage = (e) => {
     const data = e.data instanceof ArrayBuffer ? new Uint8Array(e.data) : e.data;
     sph.emit('network:message', { data, isBinary: e.data instanceof ArrayBuffer });
     _appendMsg('Peer', data);
   };
+  _dc.onerror = (e) => _log('DC Error: ' + (e.message || e), true);
 }
 
-// --- Signaling Logic ---
+// --- Signaling Server Logic ---
 const _connectSignaling = (url, roomId) => {
   if (_ws) _ws.close();
-  _ws = new WebSocket(url);
-  _ws.onopen = () => {
-    _log(`📡 Signaling connected. Joining room: ${roomId}`);
-    _ws.send(JSON.stringify({ type: 'join', roomId }));
-  };
-  _ws.onmessage = async (e) => {
-    const msg = JSON.parse(e.data);
-    if (msg.type === 'offer') {
-      const answer = await api.receiveOffer(JSON.stringify(msg.sdp));
-      _ws.send(JSON.stringify({ type: 'answer', roomId, sdp: JSON.parse(answer) }));
-    } else if (msg.type === 'answer') {
-      await api.finalize(JSON.stringify(msg.sdp));
-    } else if (msg.type === 'candidate') {
-      if (_pc) _pc.addIceCandidate(new RTCIceCandidate(msg.candidate)).catch(e => {});
-    } else if (msg.type === 'user-joined') {
-      // 後から誰か来たらOfferを送る
-      const offer = await api.createOffer();
-      _ws.send(JSON.stringify({ type: 'offer', roomId, sdp: JSON.parse(offer) }));
-    }
-  };
-  _ws.onerror = () => _log('Signaling Server Error', true);
+  try {
+    _ws = new WebSocket(url);
+    _ws.onopen = () => {
+      _log(`📡 Signaling connected. Joining room: ${roomId}`);
+      _ws.send(JSON.stringify({ type: 'join', roomId }));
+    };
+    _ws.onmessage = async (e) => {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'offer') {
+        _log('📩 Offer received via signaling');
+        const answer = await api.receiveOffer(JSON.stringify(msg.sdp));
+        _ws.send(JSON.stringify({ type: 'answer', roomId, sdp: JSON.parse(answer) }));
+      } else if (msg.type === 'answer') {
+        _log('📩 Answer received via signaling');
+        await api.finalize(JSON.stringify(msg.sdp));
+      } else if (msg.type === 'candidate') {
+        if (_pc) {
+          _pc.addIceCandidate(new RTCIceCandidate(msg.candidate)).catch(err => _log('ICE Error: ' + err.message, true));
+        }
+      } else if (msg.type === 'user-joined') {
+        _log('👤 Peer joined the room. Sending offer...');
+        const offer = await api.createOffer();
+        _ws.send(JSON.stringify({ type: 'offer', roomId, sdp: JSON.parse(offer) }));
+      }
+    };
+    _ws.onclose = () => _log('📡 Signaling connection closed');
+    _ws.onerror = () => _log('📡 Signaling server error', true);
+  } catch (e) { _log('WebSocket Init Error: ' + e.message, true); }
 };
 
+// --- Public API ---
 const api = {
   createOffer: async () => {
     try {
       if (_pc) _pc.close();
       _pc = new RTCPeerConnection(_config);
       _setupDataChannel(_pc.createDataChannel('sph-data'));
-      _pc.onicecandidate = e => {
+      
+      _pc.onicecandidate = (e) => {
+        // Send candidate to signaling server if connected
         if (e.candidate && _ws && _ws.readyState === 1) {
           _ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate }));
         }
+        // Update UI for manual copy
         if (!e.candidate && _pc.localDescription) {
           const el = document.getElementById('net-sdp-out');
           if (el) el.value = JSON.stringify(_pc.localDescription);
           _log('Offer SDP ready');
         }
       };
+
       const offer = await _pc.createOffer();
       await _pc.setLocalDescription(offer);
       return JSON.stringify(offer);
@@ -100,12 +120,14 @@ const api = {
   },
 
   receiveOffer: async (sdpStr) => {
+    if (!sdpStr) return _log('Input SDP is empty', true);
     try {
       const offer = JSON.parse(sdpStr);
       if (_pc) _pc.close();
       _pc = new RTCPeerConnection(_config);
-      _pc.ondatachannel = e => _setupDataChannel(e.channel);
-      _pc.onicecandidate = e => {
+      _pc.ondatachannel = (e) => _setupDataChannel(e.channel);
+      
+      _pc.onicecandidate = (e) => {
         if (e.candidate && _ws && _ws.readyState === 1) {
           _ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate }));
         }
@@ -114,6 +136,7 @@ const api = {
           if (el) el.value = JSON.stringify(_pc.localDescription);
         }
       };
+
       await _pc.setRemoteDescription(offer);
       const answer = await _pc.createAnswer();
       await _pc.setLocalDescription(answer);
@@ -122,46 +145,56 @@ const api = {
   },
 
   finalize: async (sdpStr) => {
+    if (!sdpStr) return _log('Input SDP is empty', true);
     try {
       await _pc.setRemoteDescription(JSON.parse(sdpStr));
       _log('✅ Connection Finalized');
     } catch (e) { _log('Invalid Answer SDP', true); }
   },
 
-  joinRoom: (roomId, url = 'wss://your-signaling-server.com') => {
-    _connectSignaling(url, roomId);
+  joinRoom: (roomId, url) => {
+    if (!roomId) return _log('Room ID is required', true);
+    const serverUrl = url || 'wss://your-signaling-server.com';
+    _connectSignaling(serverUrl, roomId);
   },
 
   send: (data) => {
     if (!_dc || _dc.readyState !== 'open') return false;
-    if (data instanceof ArrayBuffer || data instanceof Uint8Array) {
-      _dc.send(data);
-      _appendMsg('Me', `[Binary ${data.byteLength} bytes]`);
-    } else {
-      const p = typeof data === 'string' ? data : JSON.stringify(data);
-      _dc.send(p);
-      _appendMsg('Me', p);
-    }
-    return true;
+    try {
+      if (data instanceof ArrayBuffer || data instanceof Uint8Array) {
+        _dc.send(data);
+        _appendMsg('Me', `[Binary: ${data.byteLength} bytes]`);
+      } else {
+        const payload = typeof data === 'string' ? data : JSON.stringify(data);
+        _dc.send(payload);
+        _appendMsg('Me', payload);
+      }
+      return true;
+    } catch (e) { _log('Send failed: ' + e.message, true); return false; }
   },
 
-  close: () => { 
-    if (_pc) _pc.close(); 
+  close: () => {
+    if (_pc) _pc.close();
     if (_ws) _ws.close();
-    _pc = _dc = _ws = null; 
-    _updateUI(); 
-    _log('Connection closed'); 
+    _pc = _dc = _ws = null;
+    _updateUI();
+    _log('All connections closed');
   },
 
   setIceConfig: (url, user, cred, auto) => {
     let servers = [{ urls: 'stun:stun.l.google.com:19302' }];
-    if (url) servers.push({ urls: url, username: user, credential: cred });
+    if (url) {
+      const s = { urls: url, username: user, credential: cred };
+      servers.push(s);
+    }
     _config.iceServers = servers;
     sph.register('network.autoReconnect', !!auto);
-    _log('Config updated');
+    _log('ICE & Auto-reconnect config updated');
+    if (_pc) api.close();
   }
 };
 
+// --- UI Helpers ---
 function _updateUI() {
   const el = document.getElementById('net-status');
   if (el) {
@@ -178,38 +211,63 @@ function _appendMsg(who, data) {
   div.className = 'sph-meta';
   div.style.fontSize = '10px';
   div.style.borderBottom = '1px solid var(--sph-border)';
-  let display = (data instanceof Uint8Array) ? `Binary[${data.length}]` : data;
+  let display = (data instanceof Uint8Array) ? `Binary[${data.length}] {${Array.from(data.slice(0,4)).join(',')}}` : data;
   div.innerHTML = `<b>${who}:</b> ${String(display).replace(/</g,'&lt;')}`;
   logEl.prepend(div);
 }
 
+// --- Mount Extension ---
 sph.mount('network', 'NETWORK', '🌐', {
   panel: () => sph.ui.panel('network',
     '<div id="net-ui-error" style="display:none;background:var(--sph-err);color:#fff;padding:4px;font-size:10px;margin-bottom:8px"></div>' +
-    sph.ui.section('Auto-Connect (Signaling)',
-      sph.ui.row('Room ID', sph.ui.input('net-room-id')) +
+    
+    sph.ui.section('1. Auto-Connect (Signaling)',
+      sph.ui.row('Room ID', sph.ui.input('net-room-id', {placeholder:'e.g. lobby-123'})) +
       sph.ui.row('Server', sph.ui.input('net-sig-url', {value:'wss://your-signaling-server.com'})) +
-      '<button class="sph-btn sph-btn-ok" style="width:100%;margin-top:8px" onclick="sph.call(\'network.joinRoom\',[document.getElementById(\'net-room-id\').value, document.getElementById(\'net-sig-url\').value])">Join Room</button>'
+      '<button class="sph-btn sph-btn-ok" style="width:100%;margin-top:8px" onclick="sph.call(\'network.joinRoom\',[document.getElementById(\'net-room-id\').value, document.getElementById(\'net-sig-url\').value])">Join Room & Connect</button>'
     ) +
-    sph.ui.section('Manual Connection (SDP)',
+    
+    sph.ui.section('2. Configuration (ICE/TURN)',
+      sph.ui.row('TURN URL', sph.ui.input('net-ice-url', {placeholder:'turn:example.com'})) +
+      sph.ui.row('User', sph.ui.input('net-ice-user')) +
+      sph.ui.row('Pass', sph.ui.input('net-ice-cred', {type:'password'})) +
+      '<label class="sph-meta" style="display:flex;align-items:center;gap:4px;margin-top:4px">' +
+      '<input type="checkbox" id="net-ice-auto"> Auto-reconnect on close</label>' +
+      '<button class="sph-btn" style="width:100%;margin-top:8px" onclick="sph.call(\'network.setIceConfig\',[document.getElementById(\'net-ice-url\').value, document.getElementById(\'net-ice-user\').value, document.getElementById(\'net-ice-cred\').value, document.getElementById(\'net-ice-auto\').checked])">Apply Settings</button>'
+    ) +
+    
+    sph.ui.section('3. Manual Connection (SDP)',
       '<div style="display:flex;justify-content:space-between;margin-bottom:8px"><span class="sph-meta">Status: <b id="net-status">DISCONNECTED</b></span><button class="sph-btn" onclick="sph.call(\'network.close\')">Reset</button></div>' +
       '<div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-bottom:8px"><button class="sph-btn" onclick="sph.call(\'network.createOffer\')">Create Offer</button><button class="sph-btn" onclick="sph.call(\'network.receiveOffer\',[document.getElementById(\'net-sdp-in\').value])">Accept Offer</button></div>' +
       '<textarea id="net-sdp-in" class="sph-input" placeholder="Paste Remote SDP here..." style="width:100%;height:40px;font-size:9px;margin-bottom:4px"></textarea>' +
       '<button class="sph-btn" style="width:100%;margin-bottom:8px" onclick="sph.call(\'network.finalize\',[document.getElementById(\'net-sdp-in\').value])">Finalize (Host Only)</button>' +
-      '<textarea id="net-sdp-out" class="sph-input" readonly style="width:100%;height:40px;font-size:9px;background:rgba(0,0,0,0.1)" placeholder="Your SDP"></textarea>'
+      '<textarea id="net-sdp-out" class="sph-input" readonly style="width:100%;height:40px;font-size:9px;background:rgba(0,0,0,0.1)" placeholder="Your SDP will appear here"></textarea>'
     ) +
-    sph.ui.section('Data Transfer',
-      '<div style="display:flex;gap:4px;margin-bottom:8px"><input id="net-send-in" class="sph-input" style="flex:1" placeholder="Message..."><button class="sph-btn sph-btn-ok" onclick="sph.call(\'network.send\',[document.getElementById(\'net-send-in\').value])">Send</button></div>' +
+    
+    sph.ui.section('4. Data Transfer',
+      '<div style="display:flex;gap:4px;margin-bottom:8px"><input id="net-send-in" class="sph-input" style="flex:1" placeholder="Message..." onkeydown="if(event.key===\'Enter\')sph.call(\'network.send\',[this.value])"><button class="sph-btn sph-btn-ok" onclick="sph.call(\'network.send\',[document.getElementById(\'net-send-in\').value])">Send</button></div>' +
       '<div id="net-msg-log" style="height:80px;overflow-y:auto;border:1px solid var(--sph-border);padding:4px;background:rgba(0,0,0,0.05);font-family:monospace"></div>'
     )
   ),
+  commands: [
+    {name:'network.joinRoom',    desc:'Join room via signaling server', args:'roomId, serverUrl?'},
+    {name:'network.createOffer',  desc:'Generate Offer SDP'},
+    {name:'network.receiveOffer', desc:'Accept Offer and generate Answer', args:'sdp'},
+    {name:'network.finalize',     desc:'Finalize connection with Answer', args:'sdp'},
+    {name:'network.send',         desc:'Send data to peer', args:'data'},
+    {name:'network.close',        desc:'Close all connections'},
+    {name:'network.setIceConfig', desc:'Configure TURN/ICE', args:'url,user,pass,auto'}
+  ],
   api: api,
   on: { 'frame-mounted': () => _updateUI() }
 });
 
+// ABCD Metadata Registration
 sph.register('network.describe', () => ({
-  cat: 'B', version: '1.3.0',
-  consumes: ['bridge'], produces: ['p2p'],
+  cat: 'B',
+  version: '1.3.0',
+  consumes: ['bridge'],
+  produces: ['p2p'],
   signals: ['network:connected', 'network:message', 'network:disconnected']
 }));
 
@@ -220,30 +278,76 @@ sph.register('network.describe', () => ({
      B: BRIDGE LIBRARY (sph/lib)
      ========================================== -->
 <script type="sph/lib" data-lib-id="network">
+/**
+ * Network Library Proxy v1.3.0
+ */
 export default {
   joinRoom: (roomId, url) => sph.call('network.joinRoom', [roomId, url]),
   send: (data) => sph.call('network.send', [data]),
   close: () => sph.call('network.close'),
+  setIceConfig: (url, user, pass, auto) => sph.call('network.setIceConfig', [url, user, pass, auto]),
   onMessage: (cb) => sph.on('network:message', cb),
-  onConnected: (cb) => sph.on('network:connected', cb)
+  onConnected: (cb) => sph.on('network:connected', cb),
+  onDisconnected: (cb) => sph.on('network:disconnected', cb)
 };
 </script>
 
 <!-- ==========================================
-     D: DOCUMENTATION (sph/doc)
+     D: DOCUMENTATION (sph/doc & sph/sec)
      ========================================== -->
 <script type="sph/doc" data-doc-ext="network">
 {
-  "title": "NETWORK v1.3 - Signaling Ready",
+  "title": "NETWORK - Signaling & P2P",
   "icon": "🌐",
-  "description": "P2P communication with WebSocket signaling for easy room-based connections.",
+  "description": "Advanced P2P communication with WebSocket signaling, TURN support, and binary sync.",
   "version": "1.3.0",
   "api": [
-    { "method": "network.joinRoom", "args": "roomId, serverUrl?", "description": "Join a room and connect to peers automatically." },
-    { "method": "network.send", "args": "data", "description": "Send string or Uint8Array." },
-    { "method": "network.close", "args": "", "description": "Disconnect everything." }
+    { "method": "network.joinRoom", "args": "roomId, serverUrl?", "description": "Join a room and connect to peers automatically via signaling server." },
+    { "method": "network.createOffer", "args": "", "description": "Start connection as Host (Manual)." },
+    { "method": "network.receiveOffer", "args": "sdp", "description": "Accept offer and create Answer (Manual)." },
+    { "method": "network.finalize", "args": "sdp", "description": "Host completes connection (Manual)." },
+    { "method": "network.send", "args": "data", "description": "Send string or Uint8Array to peer." },
+    { "method": "network.setIceConfig", "args": "url, user, pass, auto", "description": "Configure TURN and auto-reconnect settings." }
   ]
 }
+</script>
+
+<script type="sph/sec" data-sec-ext="network" data-sec-title="NETWORK GUIDE">
+<div class="sph-doc">
+  <h2>🌐 P2P Network Extension v1.3</h2>
+  <p>Direct browser-to-browser communication using WebRTC DataChannel.</p>
+
+  <h3>1. Automatic Connection (Signaling)</h3>
+  <p>Enter a <strong>Room ID</strong> and click <strong>Join Room</strong>. The extension will connect to the signaling server and automatically establish a P2P connection with anyone else in the same room.</p>
+
+  <h3>2. Manual Connection (SDP)</h3>
+  <ol>
+    <li><strong>Host:</strong> Click "Create Offer". Copy the SDP.</li>
+    <li><strong>Peer:</strong> Paste Host's SDP, click "Accept Offer". Copy your Answer SDP.</li>
+    <li><strong>Host:</strong> Paste Peer's Answer SDP, click "Finalize".</li>
+  </ol>
+
+  <h3>3. Features</h3>
+  <ul>
+    <li><strong>Binary Support:</strong> Send <code>Uint8Array</code> for high-speed sync (e.g., game state).</li>
+    <li><strong>TURN Support:</strong> Connect across different networks via TURN servers.</li>
+    <li><strong>Auto-Reconnect:</strong> Automatically resets to "Offer" state on disconnection if enabled.</li>
+  </ul>
+
+  <h3>JS Example</h3>
+  <pre><code>const net = sph.lib('network');
+
+// Join a room
+net.joinRoom('my-secret-room');
+
+// Listen for messages
+net.onMessage(({data, isBinary}) => {
+  console.log("Received:", data);
+});
+
+// Send data
+net.send({ type: 'sync', x: 100, y: 200 });</code></pre>
+</div>
 </script>
 
 </body>
