@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="sph-ext" content="wave">
+  <meta name="sph-version" content="3.2">
+  <title>WAVE COMPONENT EXT</title>
+</head>
+<body>
+
+<!-- 
+  WAVE_EXT v3.2
+  [C] Component: Sound Patch Management & Validation
+  [D] Definition: Waveform Data Structure & Modulation Schema
+-->
+
+<script type="sph/meta" data-ext-id="wave">
+{
+  "cat": "C",
+  "version": "3.2",
+  "label": "WAVE COMPONENT",
+  "icon": "🌊",
+  "consumes": ["media_definition"],
+  "produces": ["wave_definition"],
+  "signals": [
+    "wave:registered", 
+    "wave:updated", 
+    "wave:error",
+    "wave:lfo_changed"
+  ]
+}
+</script>
+
+<script type="sph/doc" data-ext-id="wave">
+{
+  "title": "Wave Component Specification",
+  "description": "Manages synthesizer patches (Waves). Supports multi-layer oscillators, ADSR envelopes, filters, and LFO modulations.",
+  "structure": {
+    "layers": "Array of { type: 'sine'|'square'|'sawtooth'|'triangle'|'noise', mix: 0..1, detune: cents, fm: {ratio, depth} }",
+    "adsr": "[Attack, Decay, Sustain, Release] in seconds/level",
+    "filter": "{ type: 'lowpass'|'highpass'|'bandpass', freq: Hz, q: resonance }",
+    "lfo": "{ target: 'pitch'|'filter'|'amp', type: 'sine'|'triangle', freq: Hz, depth: amount }",
+    "pan": "Initial stereo position (-1.0 to 1.0)"
+  },
+  "ai_prompt": "Define a @Wave block. Use 'layers' for complex textures. Add an 'lfo' with target:'filter' for movement. Ensure ADSR values are within 0.0 to 4.0 seconds."
+}
+</script>
+
+<script type="sph/sec" id="wave-inspector-ui">
+<style>
+  .wave-panel { font-family: var(--sph-font); padding: 12px; background: var(--sph-surface); border-radius: 6px; border: 1px solid var(--sph-border); }
+  .wave-list { margin-top: 10px; max-height: 200px; overflow-y: auto; }
+  .wave-item { display: flex; align-items: center; justify-content: space-between; padding: 6px 10px; background: var(--sph-bg); border: 1px solid var(--sph-border); border-radius: 4px; margin-bottom: 4px; transition: border-color 0.2s; }
+  .wave-item:hover { border-color: var(--sph-accent); }
+  .wave-id { color: var(--sph-accent); font-weight: bold; font-size: 11px; }
+  .wave-meta { color: var(--sph-dim); font-size: 9px; margin-top: 2px; }
+  .preview-btn { background: var(--sph-ok); color: #000; border: none; border-radius: 3px; padding: 2px 8px; font-size: 10px; cursor: pointer; font-weight: bold; }
+</style>
+<div class="wave-panel">
+  <div class="sph-label" style="letter-spacing: 1px;">REGISTERED PATCHES</div>
+  <div id="wave-registry-list" class="wave-list">
+    <div class="sph-meta" style="text-align:center; padding:20px;">No waves registered.</div>
+  </div>
+  <div style="margin-top:10px; display:flex; gap:6px;">
+    <button class="sph-btn" onclick="sph.call('wave.load_factory_presets')">RESET PRESETS</button>
+  </div>
+</div>
+</script>
+
+<script type="sph/ext" data-ext-id="wave">
+(function(){
+  'use strict';
+
+  // ── D: Internal Registry & Defaults ──
+  const _registry = new Map();
+  
+  const DEFAULT_WAVE = {
+    layers: [{ type: 'sine', mix: 1.0, detune: 0 }],
+    adsr: [0.01, 0.1, 0.7, 0.2],
+    filter: { type: 'none', freq: 2000, q: 1 },
+    lfo: { target: 'none', freq: 5, depth: 0 },
+    pan: 0
+  };
+
+  // ── B: Validation & Transformation Logic ──
+  const Logic = {
+    validate: (def) => {
+      const d = JSON.parse(JSON.stringify(Object.assign({}, DEFAULT_WAVE, def)));
+      
+      // Apply D-Layer Safety: Frequency clamping
+      if (d.filter && d.filter.freq) {
+        d.filter.freq = sph.call('media_definition.safe_hz', [d.filter.freq]);
+      }
+      
+      // Normalize legacy 'osc' format to 'layers'
+      if (d.osc && !d.layers) {
+        d.layers = d.osc.map(type => ({ type, mix: 1.0 }));
+      }
+      
+      return d;
+    }
+  };
+
+  // ── C: Registry Management ──
+  const updateUI = () => {
+    const el = document.getElementById('wave-registry-list');
+    if (!el) return;
+    if (_registry.size === 0) {
+      el.innerHTML = '<div class="sph-meta" style="text-align:center; padding:20px;">No waves registered.</div>';
+      return;
+    }
+    el.innerHTML = Array.from(_registry.entries()).map(([id, def]) => `
+      <div class="wave-item">
+        <div>
+          <div class="wave-id">${id}</div>
+          <div class="wave-meta">${def.layers.map(l => l.type).join(' + ')} | LFO: ${def.lfo.target}</div>
+        </div>
+        <button class="preview-btn" onclick="sph.call('audio_engine.play_note', ['${id}', 60, 0.8, 0.5])">LISTEN</button>
+      </div>
+    `).join('');
+  };
+
+  // ── API: Component Layer ──
+  sph.mount('wave', 'WAVE', '🌊', {
+    panel: () => document.getElementById('wave-inspector-ui').innerHTML,
+    
+    api: {
+      // Register or update a sound patch
+      register: (id, def) => {
+        try {
+          const validated = Logic.validate(def);
+          _registry.set(id, validated);
+          sph.emit('wave:registered', { id, def: validated });
+          updateUI();
+          return true;
+        } catch (e) {
+          sph.emit('wave:error', { id, message: e.message });
+          return false;
+        }
+      },
+
+      get: (id) => _registry.get(id) || _registry.get('@default'),
+      
+      list: () => Array.from(_registry.keys()),
+
+      // Modify a specific parameter of an existing wave
+      modify: (id, path, value) => {
+        const w = _registry.get(id);
+        if (!w) return false;
+        // Simple path resolution (e.g., "filter.freq")
+        const keys = path.split('.');
+        let target = w;
+        for (let i = 0; i < keys.length - 1; i++) target = target[keys[i]];
+        target[keys[keys.length - 1]] = value;
+        
+        const validated = Logic.validate(w);
+        _registry.set(id, validated);
+        sph.emit('wave:updated', { id, path, value });
+        return true;
+      },
+
+      load_factory_presets: () => {
+        sph.call('wave.register', ['@default', DEFAULT_WAVE]);
+        sph.call('wave.register', ['@acid', {
+          layers: [{ type: 'sawtooth', mix: 1.0 }],
+          adsr: [0.01, 0.2, 0.3, 0.1],
+          filter: { type: 'lowpass', freq: 800, q: 15 },
+          lfo: { target: 'filter', freq: 2, depth: 400 }
+        }]);
+        sph.call('wave.register', ['@pad', {
+          layers: [{ type: 'sine', mix: 0.6 }, { type: 'triangle', mix: 0.4, detune: 5 }],
+          adsr: [1.5, 1.0, 0.8, 2.0],
+          filter: { type: 'lowpass', freq: 1200, q: 1 }
+        }]);
+        updateUI();
+      }
+    },
+
+    on: {
+      'ide-ready': () => {
+        sph.call('abcd.register', ['wave', 'C']);
+        sph.call('wave.load_factory_presets');
+      },
+      'frame-mounted': ({id}) => {
+        if (id === 'wave') updateUI();
+      },
+      'mml:parsed': (state) => {
+        if (!state.waves) return;
+        for (const [id, def] of Object.entries(state.waves)) {
+          sph.call('wave.register', [id, def]);
+        }
+      }
+    }
+  });
+})();
+</script>
+
+<!-- 
+  WAVE_LIB (DSL Library)
+  High-level DSL patterns for dynamic sound design.
+-->
+<script type="sph/lib" data-tab-name="wave_lib">
+; lib wave_lib
+; High-level patterns for manipulating sound patches via DSL.
+
+; --- Create a simple wave with one call ---
+!wave.quick_init [$_id, $_type, #_freq]
+  wave.register $_id { layers: [{type: $_type}], filter: {type: "lowpass", freq: #_freq} }
+  RET 1
+
+; --- Dynamic Filter Sweep ---
+!wave.sweep_filter [$_id, #_start, #_end, %_dur]
+  @sweep_loop $_id #_start #_end %_dur
+  RET 1
+
+@sweep_loop [$_id, #_start, #_end, %_dur]
+  #_steps = 20
+  #_current = #_start
+  #_inc = (#_end - #_start) / #_steps
+  @loop
+    if #_steps <= 0 { -> break }
+    wave.modify $_id "filter.freq" #_current
+    #_current = #_current + #_inc
+    #_steps = #_steps - 1
+    sys.wait
+    -> @
+</script>
+
+</body>
+</html>

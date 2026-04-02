@@ -1,0 +1,299 @@
+<!-- 
+  AUDIO_ENGINE EXT v3.2
+  [B] Base: High-Precision Web Audio DSP
+  [C] Control: Voice Orchestration & FX Routing
+-->
+
+<script type="sph/meta" data-ext-id="audio_engine">
+{
+  "cat": "B",
+  "version": "3.2",
+  "label": "AUDIO ENGINE",
+  "icon": "🔊",
+  "consumes": ["media_definition", "media_core"],
+  "produces": ["audio_stream", "analysis_data"],
+  "signals": [
+    "audio:started", 
+    "audio:stopped", 
+    "audio:voice_on", 
+    "audio:voice_off",
+    "audio:fx_changed"
+  ],
+  "permissions": ["audio"]
+}
+</script>
+
+<script type="sph/doc" data-ext-id="audio_engine">
+{
+  "title": "Audio Engine API Reference",
+  "description": "High-performance additive/subtractive/FM synthesis engine. All outputs are clamped below 0dB per D-Layer safety regulations.",
+  "api": [
+    {
+      "method": "audio_engine.play_note",
+      "args": "waveId, midi, vel, dur, time?, pan?",
+      "description": "Triggers a note with specified wave and spatial panning (-1 to 1)."
+    },
+    {
+      "method": "audio_engine.set_master_vol",
+      "args": "db",
+      "description": "Sets master gain in decibels (Max 0dB)."
+    },
+    {
+      "method": "audio_engine.apply_fx",
+      "args": "type, params",
+      "description": "Configures master effects: 'reverb' (wet, decay) or 'delay' (wet, time, feedback)."
+    }
+  ],
+  "wave_schema": {
+    "layers": "Array of {type, mix, detune, fm: {ratio, depth}}",
+    "adsr": "[A, D, S, R] in seconds",
+    "filter": "{type, freq, q}",
+    "pan": "Initial panning value (-1.0 to 1.0)"
+  }
+}
+</script>
+
+<script type="sph/sec" id="audio-status-ui">
+<style>
+  .audio-monitor { font-family: var(--sph-font); padding: 12px; background: var(--sph-surface); border-radius: 6px; border: 1px solid var(--sph-border); }
+  .v-meter { height: 6px; background: var(--sph-bg); border-radius: 3px; position: relative; overflow: hidden; margin: 8px 0; border: 1px solid var(--sph-border); }
+  .v-fill { height: 100%; background: linear-gradient(90deg, var(--sph-ok), var(--sph-warn)); width: 0%; transition: width 0.05s; }
+  .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 9px; color: var(--sph-dim); }
+  .stat-val { color: var(--sph-accent); font-weight: bold; }
+</style>
+<div class="audio-monitor">
+  <div class="sph-label" style="letter-spacing: 2px;">MASTER SIGNAL MONITOR</div>
+  <div class="v-meter"><div id="audio-meter-l" class="v-fill"></div></div>
+  <div class="stats-grid">
+    <div>VOICES: <span id="audio-voice-count" class="stat-val">0</span></div>
+    <div>CPU LOAD: <span id="audio-cpu-load" class="stat-val">LOW</span></div>
+    <div>SAMPLE RATE: <span id="audio-sr" class="stat-val">--</span></div>
+    <div>STATUS: <span id="audio-status-text" class="stat-val">IDLE</span></div>
+  </div>
+</div>
+</script>
+
+<script type="sph/ext" data-ext-id="audio_engine">
+(function(){
+  'use strict';
+
+  // ── D: Internal Constants ──
+  const MAX_VOICES = 32;
+  const DEFAULT_ADSR = [0.01, 0.1, 0.7, 0.2];
+
+  // ── B: DSP Core ──
+  let _ctx = null;
+  let _masterGain = null;
+  let _analyser = null;
+  let _fxChain = { reverb: null, delay: null };
+  let _activeVoices = new Set();
+
+  const DSP = {
+    init: () => {
+      if (_ctx) return;
+      _ctx = new (window.AudioContext || window.webkitAudioContext)();
+      _masterGain = _ctx.createGain();
+      _analyser = _ctx.createAnalyser();
+      _analyser.fftSize = 256;
+      
+      // Safety: Start at -12dB
+      _masterGain.gain.value = sph.call('media_definition.db_to_gain', [-12]);
+      
+      // Routing: Voices -> MasterGain -> Analyser -> Destination
+      _masterGain.connect(_analyser);
+      _analyser.connect(_ctx.destination);
+      
+      document.getElementById('audio-sr').textContent = _ctx.sampleRate + 'Hz';
+      DSP.startMonitor();
+    },
+
+    startMonitor: () => {
+      const data = new Uint8Array(_analyser.frequencyBinCount);
+      const update = () => {
+        if (!_analyser) return;
+        _analyser.getByteFrequencyData(data);
+        const avg = data.reduce((a, b) => a + b, 0) / data.length;
+        const el = document.getElementById('audio-meter-l');
+        if (el) el.style.width = Math.min(100, avg * 1.8) + '%';
+        const vEl = document.getElementById('audio-voice-count');
+        if (vEl) vEl.textContent = _activeVoices.size;
+        requestAnimationFrame(update);
+      };
+      update();
+    }
+  };
+
+  // ── C: Voice Class ──
+  class Voice {
+    constructor(waveDef, freq, velocity, startTime, pan = 0) {
+      this.ctx = _ctx;
+      this.out = _ctx.createGain();
+      this.panner = _ctx.createStereoPanner();
+      this.panner.pan.value = pan;
+      
+      this.out.connect(this.panner);
+      this.panner.connect(_masterGain);
+      
+      const now = startTime || this.ctx.currentTime;
+      const adsr = waveDef.adsr || DEFAULT_ADSR;
+      const [a, d, s, r] = adsr;
+      const gainVal = velocity * 0.5;
+
+      this.out.gain.setValueAtTime(0, now);
+      this.out.gain.linearRampToValueAtTime(gainVal, now + a);
+      this.out.gain.linearRampToValueAtTime(gainVal * s, now + a + d);
+
+      this.nodes = [];
+      const layers = waveDef.layers || [{type: 'sine', mix: 1}];
+
+      layers.forEach(ly => {
+        let source;
+        if (ly.type === 'noise') {
+          const bufSize = _ctx.sampleRate * 2;
+          const buffer = _ctx.createBuffer(1, bufSize, _ctx.sampleRate);
+          const d = buffer.getChannelData(0);
+          for (let i = 0; i < bufSize; i++) d[i] = Math.random() * 2 - 1;
+          source = _ctx.createBufferSource();
+          source.buffer = buffer;
+          source.loop = true;
+        } else {
+          source = _ctx.createOscillator();
+          source.type = ly.type || 'sine';
+          source.frequency.value = freq + (ly.detune || 0);
+          
+          if (ly.fm && ly.fm.depth > 0) {
+            const mod = _ctx.createOscillator();
+            const modG = _ctx.createGain();
+            mod.frequency.value = freq * ly.fm.ratio;
+            modG.gain.value = ly.fm.depth;
+            mod.connect(modG); modG.connect(source.frequency);
+            mod.start(now); this.nodes.push(mod, modG);
+          }
+        }
+
+        const mix = _ctx.createGain();
+        mix.gain.value = ly.mix || 1.0;
+        source.connect(mix); mix.connect(this.out);
+        if (source.start) source.start(now);
+        this.nodes.push(source, mix);
+      });
+
+      if (waveDef.filter && waveDef.filter.type !== 'none') {
+        this.filter = _ctx.createBiquadFilter();
+        this.filter.type = waveDef.filter.type;
+        this.filter.frequency.value = sph.call('media_definition.safe_hz', [waveDef.filter.freq]);
+        this.panner.disconnect();
+        this.panner.connect(this.filter);
+        this.filter.connect(_masterGain);
+      }
+
+      this.releaseTime = r;
+    }
+
+    stop(time) {
+      const now = time || _ctx.currentTime;
+      this.out.gain.cancelScheduledValues(now);
+      this.out.gain.setValueAtTime(this.out.gain.value, now);
+      this.out.gain.exponentialRampToValueAtTime(0.001, now + this.releaseTime);
+      this.nodes.forEach(n => { if (n.stop) n.stop(now + this.releaseTime + 0.1); });
+    }
+  }
+
+  // ── API: Action Layer ──
+  sph.mount('audio_engine', 'AUDIO', '🔊', {
+    panel: () => document.getElementById('audio-status-ui').innerHTML,
+    
+    api: {
+      get_ctx: () => { DSP.init(); return _ctx; },
+
+      play_note: (waveId, midi, vel = 0.8, dur = 0.5, time = null, pan = 0) => {
+        DSP.init();
+        if (_activeVoices.size >= MAX_VOICES) return;
+
+        const state = sph.call('media_core.get_state');
+        const waveDef = state.waves[waveId] || { adsr: DEFAULT_ADSR };
+        
+        const freq = 440 * Math.pow(2, (midi - 69) / 12);
+        const startTime = time || _ctx.currentTime;
+        
+        const voice = new Voice(waveDef, freq, vel, startTime, pan);
+        _activeVoices.add(voice);
+
+        const stopTime = startTime + dur;
+        voice.stop(stopTime);
+        
+        setTimeout(() => { _activeVoices.delete(voice); }, (stopTime - _ctx.currentTime + voice.releaseTime + 0.5) * 1000);
+        sph.emit('audio:voice_on', { waveId, midi, time: startTime });
+      },
+
+      stop_all: () => {
+        _activeVoices.forEach(v => v.stop());
+        _activeVoices.clear();
+        const st = document.getElementById('audio-status-text');
+        if (st) st.textContent = 'STOPPED';
+        sph.emit('audio:stopped');
+      },
+
+      set_master_vol: (db) => {
+        DSP.init();
+        const gain = sph.call('media_definition.db_to_gain', [db]);
+        _masterGain.gain.setTargetAtTime(gain, _ctx.currentTime, 0.1);
+      },
+
+      describe: () => ({
+        cat: 'B', version: '3.2',
+        features: ['multi-layer', 'fm', 'noise', 'panning', 'adsr', 'filter'],
+        max_voices: MAX_VOICES
+      })
+    },
+
+    on: {
+      'ide-ready': () => {
+        sph.call('abcd.register', ['audio_engine', 'B']);
+      },
+      'timeline:started': () => {
+        const st = document.getElementById('audio-status-text');
+        if (st) { st.textContent = 'RUNNING'; st.style.color = 'var(--sph-ok)'; }
+      },
+      'timeline:stopped': () => {
+        sph.call('audio_engine.stop_all');
+      }
+    }
+  });
+})();
+</script>
+
+<!-- 
+  AUDIO_LIB (DSL Library)
+  High-level DSL patterns for musical orchestration.
+-->
+<script type="sph/lib" data-tab-name="audio_lib">
+; lib audio_lib
+; High-level musical patterns for Sapphire DSL.
+
+; --- Play a simple beep ---
+!audio.beep [#_midi, %_dur]
+  audio_engine.play_note "@default" #_midi 0.8 %_dur
+  RET 1
+
+; --- Play a chord (3 notes) ---
+!audio.chord [$_wave, #_m1, #_m2, #_m3, %_dur]
+  audio_engine.play_note $_wave #_m1 0.6 %_dur
+  audio_engine.play_note $_wave #_m2 0.6 %_dur
+  audio_engine.play_note $_wave #_m3 0.6 %_dur
+  RET 1
+
+; --- Fade out master volume ---
+!audio.fade_out [%_sec]
+  @fade_loop %_sec
+  RET 1
+
+@fade_loop [%_sec]
+  %_vol = 0.0
+  @loop
+    if %_vol < -90.0 { -> break }
+    audio_engine.set_master_vol %_vol
+    %_vol = %_vol - 2.0
+    sys.wait
+    -> @
+</script>

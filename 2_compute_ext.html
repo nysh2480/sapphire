@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="sph-ext" content="compute">
+  <meta name="sph-version" content="3.2">
+  <title>COMPUTE ENGINE EXT - SAB Runtime</title>
+</head>
+<body>
+
+<!-- 
+  COMPUTE_ENGINE EXT v3.2
+  [B] Base: SharedArrayBuffer & Atomics WASM Runtime
+  [C] Control: Worker Lifecycle & Command Packet Orchestration
+-->
+
+<script type="sph/meta" data-ext-id="compute">
+{
+  "cat": "B",
+  "version": "3.2",
+  "label": "COMPUTE ENGINE",
+  "icon": "⚡",
+  "consumes": ["bridge", "media_definition"],
+  "produces": ["compute_result", "shared_memory"],
+  "signals": [
+    "compute:ready",
+    "compute:done",
+    "compute:error",
+    "compute:timeout",
+    "compute:atomic_update"
+  ],
+  "permissions": ["worker", "wasm"]
+}
+</script>
+
+<script type="sph/doc" data-ext-id="compute">
+{
+  "title": "Compute Engine v3.2 Reference",
+  "description": "High-performance WASM execution layer using SharedArrayBuffer (SAB) command packets. Eliminates postMessage overhead for real-time processing.",
+  "protocol": "16-word (64-byte) Int32Array Command Packet",
+  "api": [
+    { "method": "compute.setup", "args": "id, size, wasm, methods", "description": "Initializes a worker with shared memory and WASM binary." },
+    { "method": "compute.exec", "args": "id, method, args, timeout", "description": "Dispatches a command via SAB and waits for completion." },
+    { "method": "compute.atomic_op", "args": "id, op, offset, val", "description": "Performs Atomics operations (add, sub, and, or, xor) on shared data." },
+    { "method": "compute.read", "args": "id, offset, len", "description": "Reads a snapshot from shared data buffer." }
+  ],
+  "states": {
+    "0": "IDLE", "1": "PENDING", "2": "EXECUTING", "3": "DONE", "4": "ERROR", "5": "ABORT"
+  }
+}
+</script>
+
+<script type="sph/sec" id="compute-monitor-ui">
+<style>
+  .comp-panel { font-family: var(--sph-font); padding: 12px; background: var(--sph-surface); border-radius: 6px; border: 1px solid var(--sph-border); }
+  .worker-card { background: var(--sph-bg); border: 1px solid var(--sph-border); padding: 8px; border-radius: 4px; margin-bottom: 8px; }
+  .status-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+  .state-led { width: 8px; height: 8px; border-radius: 50%; }
+  .packet-grid { display: grid; grid-template-columns: repeat(8, 1fr); gap: 2px; margin-top: 6px; }
+  .packet-cell { font-size: 7px; background: var(--sph-surface); color: var(--sph-dim); text-align: center; padding: 2px 0; border-radius: 1px; }
+  .packet-cell.active { color: var(--sph-accent); font-weight: bold; }
+</style>
+<div class="comp-panel">
+  <div class="sph-label" style="margin-bottom:10px;">ACTIVE COMPUTE WORKERS</div>
+  <div id="compute-worker-list">
+    <div class="sph-meta" style="text-align:center; padding:20px;">No active workers.</div>
+  </div>
+  <button class="sph-btn" style="width:100%; margin-top:8px;" onclick="sph.call('compute.refresh')">REFRESH MONITOR</button>
+</div>
+</script>
+
+<script type="sph/ext" data-ext-id="compute">
+(function(){
+  'use strict';
+
+  // ── D: Protocol Constants ──
+  const S = { IDLE:0, PENDING:1, EXECUTING:2, DONE:3, ERROR:4, ABORT:5 };
+  const C = { NOP:0, EXEC:1, INIT:2, KILL:3 };
+  const W = { STATE:0, CMD:1, METHOD:2, ARGC:3, ARG0:4, ARG1:5, ARG2:6, ARG3:7, RES0:8, RES1:9, TYPE:10, ERR:11, TO:12, SEQ:13, OFF:14, LEN:15 };
+  const RT = { VOID:0, I32:1, F64:2, PTR:3 };
+
+  // ── B: Worker Source ──
+  const WORKER_SRC = `
+    'use strict';
+    const S={IDLE:0,PENDING:1,EXECUTING:2,DONE:3,ERROR:4,ABORT:5}, W={STATE:0,CMD:1,METHOD:2,ARGC:3,ARG0:4,ARG1:5,ARG2:6,ARG3:7,RES0:8,RES1:9,TYPE:10,ERR:11,TO:12,SEQ:13,OFF:14,LEN:15};
+    let _cmd, _data, _inst, _methods=[];
+    self.onmessage = async (e) => {
+      const { cmdSAB, dataSAB, wasm, methods } = e.data;
+      _cmd = new Int32Array(cmdSAB); _data = new Uint8Array(dataSAB); _methods = methods || [];
+      try {
+        const mod = await WebAssembly.compile(wasm);
+        _inst = await WebAssembly.instantiate(mod, { env: { memory: new WebAssembly.Memory({initial:Math.ceil(dataSAB.byteLength/65536), shared:true}) } });
+        Atomics.store(_cmd, W.STATE, S.DONE); Atomics.notify(_cmd, W.STATE, 1);
+      } catch(e) { Atomics.store(_cmd, W.STATE, S.ERROR); Atomics.notify(_cmd, W.STATE, 1); return; }
+      self.onmessage = null; _loop();
+    };
+    function _loop() {
+      while(true) {
+        Atomics.wait(_cmd, W.STATE, S.IDLE);
+        const state = Atomics.load(_cmd, W.STATE);
+        if(state === S.ABORT) break;
+        if(state !== S.PENDING) continue;
+        Atomics.store(_cmd, W.STATE, S.EXECUTING);
+        const mid = Atomics.load(_cmd, W.METHOD), argc = Atomics.load(_cmd, W.ARGC);
+        const args = []; for(let i=0; i<Math.min(argc,4); i++) args.push(Atomics.load(_cmd, W.ARG0+i));
+        const fn = _inst.exports[_methods[mid]];
+        if(!fn) { Atomics.store(_cmd, W.STATE, S.ERROR); Atomics.notify(_cmd, W.STATE, 1); continue; }
+        try {
+          const r = fn(...args);
+          Atomics.store(_cmd, W.RES0, r|0); Atomics.store(_cmd, W.TYPE, 1);
+          Atomics.store(_cmd, W.STATE, S.DONE); Atomics.notify(_cmd, W.STATE, 1);
+        } catch(e) { Atomics.store(_cmd, W.STATE, S.ERROR); Atomics.notify(_cmd, W.STATE, 1); }
+      }
+    }
+  `;
+
+  const _channels = new Map();
+
+  // ── C: Control Logic ──
+  const updateUI = () => {
+    const el = document.getElementById('compute-worker-list');
+    if(!el) return;
+    if(_channels.size === 0) { el.innerHTML = '<div class="sph-meta" style="text-align:center; padding:20px;">No active workers.</div>'; return; }
+    el.innerHTML = Array.from(_channels.entries()).map(([id, ch]) => {
+      const state = Atomics.load(ch.cmd, W.STATE);
+      const colors = ['var(--sph-dim)', 'var(--sph-warn)', 'var(--sph-accent)', 'var(--sph-ok)', 'var(--sph-err)', 'var(--sph-err)'];
+      const labels = ['IDLE', 'PENDING', 'EXEC', 'DONE', 'ERROR', 'ABORT'];
+      return `
+        <div class="worker-card">
+          <div class="status-row">
+            <div class="state-led" style="background:${colors[state]}"></div>
+            <span style="font-size:11px; font-weight:bold;">${id}</span>
+            <span style="font-size:9px; color:var(--sph-dim); margin-left:auto;">${labels[state]}</span>
+          </div>
+          <div class="packet-grid">
+            ${Array.from({length:16}).map((_,i)=>`<div class="packet-cell ${i===W.STATE?'active':''}">${Atomics.load(ch.cmd, i)}</div>`).join('')}
+          </div>
+        </div>
+      `;
+    }).join('');
+  };
+
+  // ── API: Base Layer ──
+  sph.mount('compute', 'COMPUTE', '⚡', {
+    panel: () => document.getElementById('compute-monitor-ui').innerHTML,
+    
+    api: {
+      setup: async (id, size, wasm, methods) => {
+        if(_channels.has(id)) return id;
+        const cmdSAB = new SharedArrayBuffer(64), dataSAB = new SharedArrayBuffer(size || 65536);
+        const ch = { id, cmdSAB, dataSAB, cmd: new Int32Array(cmdSAB), data: new Uint8Array(dataSAB), methods: methods || [], seq: 0 };
+        const blob = new Blob([WORKER_SRC], {type:'application/javascript'});
+        ch.worker = new Worker(URL.createObjectURL(blob));
+        ch.worker.postMessage({ cmdSAB, dataSAB, wasm, methods });
+        _channels.set(id, ch);
+        updateUI();
+        return id;
+      },
+
+      exec: async (id, method, args = [], timeout = 5000) => {
+        const ch = _channels.get(id);
+        if(!ch) return null;
+        const mid = ch.methods.indexOf(method);
+        if(mid < 0) return null;
+
+        Atomics.store(ch.cmd, W.METHOD, mid);
+        Atomics.store(ch.cmd, W.ARGC, args.length);
+        args.forEach((a, i) => Atomics.store(ch.cmd, W.ARG0 + i, a | 0));
+        Atomics.store(ch.cmd, W.STATE, S.PENDING);
+        Atomics.notify(ch.cmd, W.STATE, 1);
+
+        return new Promise((res) => {
+          const start = Date.now();
+          const check = () => {
+            const state = Atomics.load(ch.cmd, W.STATE);
+            if(state === S.DONE) {
+              const r = Atomics.load(ch.cmd, W.RES0);
+              Atomics.store(ch.cmd, W.STATE, S.IDLE);
+              res(r); updateUI();
+            } else if(state === S.ERROR) {
+              res(null); updateUI();
+            } else if(Date.now() - start > timeout) {
+              Atomics.store(ch.cmd, W.STATE, S.ABORT);
+              res(null); updateUI();
+            } else {
+              setTimeout(check, 10);
+            }
+          };
+          check();
+        });
+      },
+
+      atomic_op: (id, op, offset, val) => {
+        const ch = _channels.get(id);
+        if(!ch) return null;
+        const view = new Int32Array(ch.dataSAB);
+        const idx = offset >> 2;
+        let res;
+        switch(op) {
+          case 'add': res = Atomics.add(view, idx, val); break;
+          case 'sub': res = Atomics.sub(view, idx, val); break;
+          case 'and': res = Atomics.and(view, idx, val); break;
+          case 'or':  res = Atomics.or(view, idx, val); break;
+          case 'xor': res = Atomics.xor(view, idx, val); break;
+          default: res = Atomics.load(view, idx);
+        }
+        sph.emit('compute:atomic_update', { id, op, offset, val });
+        return res;
+      },
+
+      read: (id, offset, len) => {
+        const ch = _channels.get(id);
+        return ch ? new Uint8Array(ch.dataSAB.slice(offset, offset + len)) : null;
+      },
+
+      refresh: () => updateUI()
+    },
+
+    on: {
+      'ide-ready': () => sph.call('abcd.register', ['compute', 'B']),
+      'frame-mounted': ({id}) => { if(id === 'compute') updateUI(); }
+    }
+  });
+})();
+</script>
+
+<!-- 
+  COMPUTE_LIB v3.2
+  High-level DSL patterns for parallel computing.
+-->
+<script type="sph/tab" data-tab-name="compute_lib" data-tab-type="lib">
+; lib compute_lib
+; High-level orchestration for WASM/SAB compute tasks.
+
+; --- Initialize a compute worker ---
+!compute.init [$_id, #_size, $_wasm_tab, $_methods_csv]
+  $wasm = sys.tab.get $_wasm_tab
+  $methods = sys.str.split $_methods_csv ","
+  compute.setup $_id #_size $wasm $methods
+  RET 1
+
+; --- Safe execution with error handling ---
+!compute.safe_run [#_res] [$_id, $_method, #_arg0]
+  #_res = compute.exec $_id $_method [#_arg0] 2000
+  if #_res == null {
+    sys.print "[COMPUTE] Error or Timeout in" $_method
+    RET 0
+  }
+  RET #_res
+
+; --- Atomic counter increment ---
+!compute.inc_counter [#_old] [$_id, #_offset]
+  #_old = compute.atomic_op $_id "add" #_offset 1
+  RET #_old
+</script>
+
+</body>
+</html>
