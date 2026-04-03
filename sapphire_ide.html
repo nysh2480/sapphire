@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="sapphire-version" content="ng-0.3">
-<title>Sapphire NG 0.3</title>
+<title>Sapphire NG 0.3 +DIVD</title>
 <script>
 // ── SAB/crossOriginIsolated via inline ServiceWorker ─────────────
 // COOP + COEP ヘッダをServiceWorkerで注入することでfile://でもSABが使用可能になる
@@ -67,7 +67,7 @@ body{display:flex;flex-direction:column;
      font-family:var(--sph-font);
      background:var(--sph-bg);color:var(--sph-text);
      font-size:var(--sph-font-size)}
-/* ── .sph-panel: EXT panel root ? inherits all IDE tokens ── */
+/* ── .sph-panel: EXT panel root — inherits all IDE tokens ── */
 .sph-panel,.sph-panel *{box-sizing:border-box}
 .sph-panel{font-family:var(--sph-font);font-size:var(--sph-font-size);
            color:var(--sph-text);background:var(--sph-bg)}
@@ -223,26 +223,26 @@ section.show{display:block}
 #frame-a{flex:var(--sph-a-ratio);min-height:0;min-width:0;
          display:flex;flex-direction:column;overflow:hidden;position:relative}
 
-/* frame-b: takes the rest ? hidden in S */
+/* frame-b: takes the rest — hidden in S */
 #frame-b{flex:calc(1 - var(--sph-a-ratio));min-height:0;min-width:0;
          display:none;flex-direction:column;
          background:var(--sph-bg);overflow:hidden;
          border-top:1px solid var(--sph-border)}
 
-/* S ? frame-a only (frame-a takes everything) */
+/* S — frame-a only (frame-a takes everything) */
 body[data-frame="S"] #frame-a{flex:1}
 body[data-frame="S"] #frame-b{display:none}
 
-/* V ? vertical split */
+/* V — vertical split */
 body[data-frame="V"] #frame-b{display:flex;border-top:1px solid var(--sph-border);border-left:none}
 
-/* H ? horizontal split */
+/* H — horizontal split */
 body[data-frame="H"] #main-wrap{flex-direction:row}
 body[data-frame="H"] #frame-b{display:flex;border-top:none;border-left:1px solid var(--sph-border)}
 body[data-frame="H"] #frame-resize{cursor:col-resize;width:5px;height:auto;border-top:none;border-left:1px solid var(--sph-border)}
 body[data-frame="V"] #frame-resize{cursor:row-resize;height:5px;width:auto;border-left:none;border-top:1px solid var(--sph-border)}
 
-/* frame-a content areas ? only one visible at a time */
+/* frame-a content areas — only one visible at a time */
 #editor-wrap,#run-mount{flex:1;min-height:0;display:none;flex-direction:column}
 #frame-a-ext{flex:1;min-height:0;display:none;flex-direction:column;overflow-y:auto}
 body[data-frame-a="editor"] #editor-wrap{display:flex}
@@ -277,8 +277,8 @@ body[data-view="doc"] #logo{color:var(--sph-ok)}
   <div id="tab-bar"></div>
   <div id="actions">
     <div id="stat"></div>
-    <button class="abtn" id="btn-run">? RUN</button>
-    <button class="abtn" id="btn-ext">?? EXT</button>
+    <button class="abtn" id="btn-run">▶ RUN</button>
+    <button class="abtn" id="btn-ext">⚙ EXT</button>
   </div>
 </div>
 <input type="file" id="file-input" accept=".html,.txt,.sph" style="display:none">
@@ -590,6 +590,10 @@ function _registerSys(mem,signal,logFn,docs){
     'sys.dom.mount':(docName,parentId)=>{const html=docs[docName];if(!html)return;const parent=parentId==='body'?document.body:document.getElementById(String(parentId));if(!parent)return;const tmp=document.createElement('div');tmp.innerHTML=html;for(const s of tmp.querySelectorAll('style'))document.head.appendChild(s.cloneNode(true));while(tmp.firstChild)parent.appendChild(tmp.firstChild);},
     'sys.section.show':(id)=>_setSection(id),
     'sys.section.get':()=>_curSection,
+    // ── DIVD: Definition / Injection / Validation / Default ──────────────
+    'sys.divd':(v,k,s=_reg.get('divd.schema.'+k)??{})=>
+      (v??=s.default??0,Math.max(s.min??-1/0,Math.min(s.max??1/0,v))),
+    'sys.divd.define':(k,schema)=>_reg.set('divd.schema.'+k,schema),
   };
   for(const[n,f]of Object.entries(sys))_reg.set(n,f);
 }
@@ -613,31 +617,21 @@ function _build(registry,mem,logFn,debug=false,signal=null){
   sph._loopBreak  =(id)=>{if(_loopState.has(id))_loopState.get(id).brk=true;};
   sph._loopStop   =(id)=>{const ls=_loopState.get(id);if(ls){ls.brk=true;_loopState.delete(id);}};
   sph._loopStopAll=()=>{for(const id of [..._loopState.keys()])sph._loopStop(id)};
-  // callDepth: injection || default で再帰爆発を防止
-  let _callDepth=0;
   const callBlock=async(name,args=[])=>{
-    // 再帰深さチェック
-    const _maxDepth=_reg.get('sph.ext.callDepth')??32;
-    if(_callDepth>=_maxDepth){
-      const e={code:'E014',args:[name,_callDepth,_maxDepth],severity:'error',phase:'runtime'};
-      emit('error',e);logFn('err',e);return null;
-    }
     const fn=cache[name]??_reg.get(name);
     if(!fn){
       const e={code:'E003',args:[name],severity:'error',phase:'runtime'};
       emit('error',e);logFn('err',e);return null;
     }
     if(debug)emit('block-call',{name,args});
-    _callDepth++;
     try{
       const r=fn(...args);
-      if(signal?.stopped){if(r instanceof Promise)r.then(()=>{}).catch(()=>{});_callDepth--;return null;}
+      if(signal?.stopped){if(r instanceof Promise)r.then(()=>{}).catch(()=>{});return null;}
       const v=r instanceof Promise?await r:r;
-      if(signal?.stopped){_callDepth--;return null;}
+      if(signal?.stopped)return null;
       if(debug)emit('block-return',{name,value:v});
-      _callDepth--;return v;
+      return v;
     }catch(e){
-      _callDepth--;
       if(e?.message==='STOP')throw e;
       const ev={code:'E004',args:[name,e.message],severity:'error',phase:'runtime'};
       emit('error',ev);logFn('err',ev);return null;
@@ -846,7 +840,7 @@ function get(name,args=[]){
   // if fn returns a Promise, fall back to null (use sph.call for async)
   return r instanceof Promise?null:r;
 }
-// ── SAPPHIRE 安全設定のデフォルト値 (injection || default 一覧) ──
+// ── ループ・タイムアウトのデフォルト値登録 ─────────────────────────
 // sph.register('sph.loop.maxIter', N) / sph.register('sph.loop.maxMs', N)
 // sph.register('sph.ext.timeout', N) で任意に上書き可
 register('sph.loop.maxIter',  1000000); // @loop 反復上限
@@ -959,17 +953,13 @@ function _makeDSLSandbox(scopeVars){
       return undefined;
     },
     set(_,k,v){
-      // prototype汚染チェック (proto.guard injection で無効化可)
-      if(_reg.get('sph.proto.guard')!==false){
-        if(k==='__proto__'||k==='prototype'||k==='constructor'){
-          emit('error',{code:'E013',args:[k],severity:'error',phase:'sandbox'});
-          return true; // 無言で捨てる
-        }
+      // prototype汚染チェック
+      if(k==='__proto__'||k==='prototype'||k==='constructor'){
+        emit('error',{code:'E013',args:[k],severity:'error',phase:'sandbox'});
+        return true; // 無言で捨てる
       }
-      // TypedArray変数(i32/f64/u64)やstr[]はProxyを介さず直接書き込まれる
-      // scopeVarsへの書き込みは signal 等の再代入のみ想定
       if(k in scopeVars){scopeVars[k]=v;return true;}
-      return true; // 未知キーは無視
+      return true;
     },
   });
 }
@@ -1276,8 +1266,8 @@ function _renderExtGroup(bar,extName,allTabs){
   // Group toggle button
   const toggle=mk('button');
   toggle.className='tab-group-toggle'+(isOpen?' open':'');
-  toggle.innerHTML=`<span>${isOpen?'?':'?'}</span><span class="tab-group-label">${extName}</span>`;
-  toggle.title=`${extName} EXT ? ${isOpen?'Collapse':'Expand'}`;
+  toggle.innerHTML=`<span>${isOpen?'▾':'▸'}</span><span class="tab-group-label">${extName}</span>`;
+  toggle.title=`${extName} EXT — ${isOpen?'Collapse':'Expand'}`;
   toggle.onclick=()=>{TabGroups.set(extName,!isOpen);renderTabBar();};
   group.appendChild(toggle);
 
@@ -1843,13 +1833,13 @@ sph.register('ide.doc.export', ()=>{
 </style>
 <div id="_doc">
   <div class="dh">
-    <h1>◆ SAPPHIRE NG 0.3 ? DOC</h1>
+    <h1>◆ SAPPHIRE NG 0.3 — DOC</h1>
     <button onclick="sph.call('ide.frame.unmount')">← Editor</button>
   </div>
   <p class="meta">${now} &nbsp;|&nbsp; Files: ${tabs.length} &nbsp;|&nbsp; EXTs: ${extIds.length} &nbsp;|&nbsp; Registry: ${regs.length}</p>
   <div class="dl">
     <button onclick="sph.call('ide.save')">↓ Save HTML</button>
-    <button onclick="sph.call('ide.url.copy')">? Copy URL</button>
+    <button onclick="sph.call('ide.url.copy')">⛓ Copy URL</button>
   </div>
   <h2>Files (${tabs.length})</h2>
   <table><tr><th>Name</th><th>Type</th><th>Description</th></tr>
@@ -1861,7 +1851,7 @@ sph.register('ide.doc.export', ()=>{
   <table><tr><th>Command</th><th>Description</th></tr>
   ${e.cmds.length
     ?e.cmds.map(c=>`<tr><td>${c.name}</td><td>${c.desc||'?'}${c.args?' <span style="color:var(--sph-dim)">('+c.args+')</span>':''}</td></tr>`).join('')
-    :e.autoKeys.map(k=>`<tr><td>${k}</td><td>?</td></tr>`).join('')
+    :e.autoKeys.map(k=>`<tr><td>${k}</td><td>—</td></tr>`).join('')
   }
   </table>`).join('')}
   <h2>Registry (${regs.length})</h2>
@@ -2099,8 +2089,6 @@ const _errMessages={
   'E011': a=>`sph.call: error in "${a[0]}": ${a[1]}`,
   'E012': a=>`ext.call: "${a[0]}" timed out after ${a[1]}ms`,
   'E013': a=>`Sandbox: prototype mutation blocked: ${a[0]}`,
-  'E014': a=>`Call depth exceeded: "${a[0]}" at depth ${a[1]}/${a[2]}`,
-
   'W011': a=>`Sandbox: blocked global access "${a[0]}" — add permission to sph/meta`,
 
 };
@@ -2141,7 +2129,7 @@ const _errPanelHtml='<div style="font-size:var(--sph-sz-lg);color:var(--sph-text
   +'<div style="margin-top:12px;font-size:var(--sph-sz-md);color:var(--sph-dim)">Converts error/warning codes to messages in the IDE log.</div>'
   +'</div>';
 
-sph.mount('err','ERR','?',{
+sph.mount('err','ERR','⚠',{
   panel:()=>sph.ui.panel('err',
     '<div id="err-list" style="font-size:var(--sph-sz-md);line-height:1.8"></div>'
     +'<p style="font-size:var(--sph-sz-md);color:var(--sph-dim);margin-top:8px">Converts error/warning codes to messages in the IDE log.</p>'
@@ -2299,9 +2287,9 @@ const _editPanelHtml='<div style="font-size:var(--sph-sz-lg);color:var(--sph-tex
   +'<span style="font-size:var(--sph-sz-lg);letter-spacing:var(--sph-ls-head);color:var(--sph-accent)">◆ EDIT</span>'
   +'<button onclick="sph.call(\'ide.frame.unmount\')" class="sph-btn">← EXT</button>'
   +'</div>'
-  +'<p style="font-size:var(--sph-sz-md);color:var(--sph-dim);line-height:1.7">Provides preview ? edit panel for DOC / EXT / SECTION tabs.<br>API: edit.open(tabName, div, isHtml, opts)</p>'
+  +'<p style="font-size:var(--sph-sz-md);color:var(--sph-dim);line-height:1.7">Provides preview / edit panel for DOC / EXT / SECTION tabs.<br>API: edit.open(tabName, div, isHtml, opts)</p>'
   +'</div>';
-sph.mount('edit','EDIT','?',{
+sph.mount('edit','EDIT','✎',{
   panel:()=>_editPanelHtml,
   commands:[
     {name:'edit.open',   desc:'Build an editor panel for a tab. Delegated from buildPanel',args:'tabName, containerDiv, isHtml, opts'},
@@ -2473,7 +2461,7 @@ const _dbgPanel=
   +'<div style="display:flex;gap:4px">'
   +_tabBtn('console','Console',"sph.call('debug.tab',['console'])")
   +_tabBtn('trace','Trace',"sph.call('debug.tab',['trace'])")
-  +'<button onclick="sph.call(\'debug.enable\')" class="sph-btn sph-btn-ok">? Trace</button>'
+  +'<button onclick="sph.call(\'debug.enable\')" class="sph-btn sph-btn-ok">◉ Trace</button>'
   +'<button onclick="sph.call(\'debug.clear\')" class="sph-btn">CLR</button>'
   +'<button onclick="sph.call(\'ide.frame.unmount\')" class="sph-btn">← EXT</button>'
   +'</div></div>'
@@ -2482,7 +2470,7 @@ const _dbgPanel=
 
 // _dbgTab → sph.register経由 (window.* 不要)
 
-sph.mount('debug','DEBUG','??',{
+sph.mount('debug','DEBUG','🔍',{
   panel:()=>_dbgPanel,
   commands:[
     {name:'debug.enable',     desc:'Enable block call tracing'},
@@ -2560,7 +2548,7 @@ const _tstPanel=
   +'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--sph-border)">'
   +'<span style="font-size:var(--sph-sz-lg);letter-spacing:var(--sph-ls-head);color:var(--sph-accent)">◆ TESTER</span>'
   +'<div style="display:flex;gap:6px">'
-  +'<button onclick="sph.call(\'test.run_all\')" class="sph-btn sph-btn-ok">? Run All</button>'
+  +'<button onclick="sph.call(\'test.run_all\')" class="sph-btn sph-btn-ok">▶ Run All</button>'
   +'<button onclick="sph.call(\'test.clear\')" class="sph-btn">CLR</button>'
   +'<button onclick="sph.call(\'ide.frame.unmount\')" class="sph-btn">← EXT</button>'
   +'</div></div>'
@@ -2568,7 +2556,7 @@ const _tstPanel=
   +'<div id="tst-results" style="flex:1;overflow-y:auto"></div>'
   +'</div>';
 
-sph.mount('tester','TESTER','??',{
+sph.mount('tester','TESTER','✓',{
   panel:()=>_tstPanel,
   commands:[
     {name:'test.add',     desc:'Register a test case',args:'name, fn: async({assert,run,compile,log})=>void'},
@@ -2810,7 +2798,7 @@ sph.mount('bridge','BRIDGE_EXT','\uD83C\uDF09',{
   panel:()=>sph.ui.panel('bridge',
     sph.ui.section('Status','<div id="bridge-status" class="sph-meta">No channels</div>')+
     `<div style="margin-top:8px;display:flex;gap:6px">
-      <button onclick="sph.call('bridge.refresh')" class="sph-btn">? Refresh</button>
+      <button onclick="sph.call('bridge.refresh')" class="sph-btn">↺ Refresh</button>
     </div>`
   ),
   commands:[
@@ -2964,8 +2952,8 @@ sph.mount('worker','WORKER_EXT','\u26A1',{
   panel:()=>sph.ui.panel('worker',
     sph.ui.section('Status','<div id="worker-status" class="sph-meta">No workers</div>')+
     `<div style="margin-top:8px;display:flex;gap:6px">
-      <button onclick="sph.call('worker.terminate_all')" class="sph-btn">? Terminate All</button>
-      <button onclick="sph.call('worker.refresh')" class="sph-btn">? Refresh</button>
+      <button onclick="sph.call('worker.terminate_all')" class="sph-btn">■ Terminate All</button>
+      <button onclick="sph.call('worker.refresh')" class="sph-btn">↺ Refresh</button>
     </div>`
   ),
   commands:[
@@ -3294,7 +3282,7 @@ const _emHtml=`<style>
       <button class="sph-btn" onclick="sph.call('ide.frame.unmount')">← Editor</button>
       <button class="sph-btn sph-btn-ok" id="em-load">↑ Load</button>
       <button class="sph-btn sph-btn-ok" id="em-save">↓ Save HTML</button>
-      <button class="sph-btn"    id="em-url">? URL</button>
+      <button class="sph-btn"    id="em-url">⛓ URL</button>
     </div>
   </div>
   <div class="em-list" id="em-list"></div>
@@ -3329,15 +3317,15 @@ function _emRender(){
     const badge=builtin?'<span class="em-badge">built-in</span>':'';
     // Show RELOAD / REMOVE buttons only for external EXTs
     const extBtns=builtin?'':
-      `<button class="em-reload" title="Remove then reload EXT">? Reload</button>`+
-      `<button class="em-remove" title="Remove this EXT">? Remove</button>`;
+      `<button class="em-reload" title="Remove then reload EXT">↺ Reload</button>`+
+      `<button class="em-remove" title="Remove this EXT">✕ Remove</button>`;
     row.innerHTML=
       `<div class="em-icon">${icon}</div>`+
       `<div class="em-info">`+
         `<div class="em-name">${label}${badge}</div>`+
         `<div class="em-id">${id} <span style="opacity:.5">(${[...sph._mounts.get(id)||[]].length} keys)</span></div>`+
       `</div>`+
-      `<button class="em-open">? Open</button>`+
+      `<button class="em-open">↗ Open</button>`+
       extBtns;
     row.querySelector('.em-open').onclick=()=>sph.call('ide.ext.open_panel',[id]);
     if(!builtin){
@@ -3355,7 +3343,7 @@ function _emRender(){
 
 // ide-ready handled via on:{} in sph.mount below
 // ext lifecycle events handled via on:{} in sph.mount above
-sph.mount('extmgr','EXT','??',{
+sph.mount('extmgr','EXT','⊞',{
   panel:()=>_emHtml,
   commands:[
     {name:'extmgr.refresh',desc:'Re-render the EXT manager list'},
@@ -3476,13 +3464,13 @@ const _cfgHtml=`
       <!-- Layout picker -->
       <div class="cfg-layout-btns" id="cfg-layout-btns">
         <button class="sph-btn sph-layout-btn" data-layout="V">
-          <span class="cfg-layout-icon">?</span>Split V
+          <span class="cfg-layout-icon">⬒</span>Split V
         </button>
         <button class="sph-btn sph-layout-btn" data-layout="H">
-          <span class="cfg-layout-icon">?</span>Split H
+          <span class="cfg-layout-icon">⬓</span>Split H
         </button>
         <button class="sph-btn sph-layout-btn" data-layout="S">
-          <span class="cfg-layout-icon">?</span>Full
+          <span class="cfg-layout-icon">□</span>Full
         </button>
       </div>
       <!-- Split ratio slider (frame-a proportion, works in V and H) -->
@@ -3496,7 +3484,7 @@ const _cfgHtml=`
     </div>
   </div>
   <div class="cfg-actions">
-    <button class="cfg-ab primary" id="cfg-apply">? Apply</button>
+    <button class="cfg-ab primary" id="cfg-apply">✓ Apply</button>
   </div>
 </div>`;
 
@@ -3603,7 +3591,7 @@ function _initLayoutUI(){
 
 let _currentTheme='dark';
 
-sph.mount('appearance','APPEARANCE','?',{
+sph.mount('appearance','APPEARANCE','◈',{
   panel:()=>_cfgHtml,
   commands:[
     {name:'appearance.theme', desc:'Apply a preset theme (dark/light/nord/mocha)',args:'name: string'},
@@ -3763,8 +3751,8 @@ table.ft tr:hover td{background:var(--sph-surface)}
     <div class="fv-toolbar-sep"></div>
     <button class="fab" id="fv-load">↑ Load</button>
     <button class="fab ok" id="fv-save">↓ Save HTML</button>
-    <button class="fab ok" id="fv-app">? Export App</button>
-    <button class="fab" id="fv-url">? URL</button>
+    <button class="fab ok" id="fv-app">↗ Export App</button>
+    <button class="fab" id="fv-url">⛓ URL</button>
     <button class="fab" id="fv-clr">LOG CLR</button>
   </div>
   <!-- File list -->
@@ -3816,14 +3804,14 @@ function _renderFileTable(){
     tr.innerHTML=
       `<td><input type="checkbox" class="ft-chk fv-chk" data-name="${extName}"></td>`+
       `<td style="padding-left:6px">`+
-        `<button onclick="sph.call('file._fvToggleGroup',['${extName}'])" style="font-size:var(--sph-sz-md);background:none;border:none;cursor:pointer;color:var(--sph-accent);margin-right:4px">${isOpen?'?':'?'}</button>`+
+        `<button onclick="sph.call('file._fvToggleGroup',['${extName}'])" style="font-size:var(--sph-sz-md);background:none;border:none;cursor:pointer;color:var(--sph-accent);margin-right:4px">${isOpen?'▾':'▸'}</button>`+
         `<span style="font-weight:700;color:var(--sph-accent)">${extName}</span></td>`+
       `<td><span class="ft-type ext">EXT</span></td>`+
       `<td class="ft-desc"><input type="text" value="${ext.desc||''}" placeholder="Description..." data-name="${extName}" onchange="sph.call(\'file._fvSetDesc\',[this.dataset.name,this.value])"></td>`+
       `<td class="ft-ops">`+
-        `<button class="ft-op ok" onclick="sph.call('file._fvDeploy',['${extName}'])">? Run</button>`+
+        `<button class="ft-op ok" onclick="sph.call('file._fvDeploy',['${extName}'])">▶ Run</button>`+
         `<button class="ft-op" onclick="sph.call('file._fvExportExt',['${extName}'])">↓ Export</button>`+
-        `<button class="ft-op del" onclick="sph.call('file._fvDelGroup',['${extName}'])">?</button>`+
+        `<button class="ft-op del" onclick="sph.call('file._fvDelGroup',['${extName}'])">✕</button>`+
       `</td>`;
     tbody.appendChild(tr);
     if(isOpen){
@@ -3841,9 +3829,9 @@ function _fvRow(name,type,desc,builtin,isChild,extName){
   const ops=
     `<button class="ft-op" onclick="sph.call('file._fvEdit',['${name}'])">Edit</button>`+
     (type==='ext'
-      ?`<button class="ft-op ok" onclick="sph.call('file._fvDeploy',['${name}'])">? Deploy</button>`
+      ?`<button class="ft-op ok" onclick="sph.call('file._fvDeploy',['${name}'])">▶ Deploy</button>`
       :`<button class="ft-op" onclick="sph.call('file._fvExportOne',['${name}'])">↓ Export</button>`)+
-    (builtin?'':`<button class="ft-op del" onclick="sph.call('file._fvDel',['${name}'])">?</button>`);
+    (builtin?'':`<button class="ft-op del" onclick="sph.call('file._fvDel',['${name}'])">✕</button>`);
   tr.innerHTML=
     `<td><input type="checkbox" class="ft-chk fv-chk" data-name="${name}"></td>`+
     `<td style="${indent}"><span class="ft-name">${name}</span></td>`+
@@ -3855,20 +3843,20 @@ function _fvRow(name,type,desc,builtin,isChild,extName){
 }
 let _fvGroups=new Map();
 // Toggle EXT group collapse
-sph.register('file._fvToggleGroup'=function(extName){
+sph.register('file._fvToggleGroup',function(extName){
   if(!_fvGroups)_fvGroups=new Map();
   _fvGroups.set(extName,!(_fvGroups.get(extName)??false));
   _renderFileTable();
-};
+});
 // Delete an entire EXT group
-sph.register('file._fvDelGroup'(extName){
+sph.register('file._fvDelGroup',function(extName){
   if(!confirm(`Delete "${extName}" and all its files?`))return;
   $$(`script[type="sph/tab"][data-tab-ext="${extName}"]`).forEach(e=>e.remove());
   $(Tsel(extName))?.remove();
   _renderFileTable();
   sph.emit('tab-deleted',{name:extName});
-};
-sph.register('file._fvExportExt'(extName){
+});
+sph.register('file._fvExportExt',function(extName){
   const parentEl=$(Tsel(extName));
   const children=$$(`script[type="sph/tab"][data-tab-ext="${extName}"]`);
   let body=`<!DOCTYPE html>\n<html><head>\n<meta charset="UTF-8">\n<meta name="sph-ext" content="${extName}">\n<meta name="sph-ext-version" content="1">\n</head><body>\n\n`;
@@ -3884,10 +3872,10 @@ sph.register('file._fvExportExt'(extName){
   const a=mk('a');
   a.href=URL.createObjectURL(new Blob([body],{type:'text/html'}));
   a.download=`${extName}.html`;a.click();URL.revokeObjectURL(a.href);
-};
+});
 
 // ── Create new file ──
-sph.register('file._fvNewFile'(type){
+sph.register('file._fvNewFile',function(type){
   if(type==='ext'){sph.call('file._fvNewExt',[]);return;}
   const name=prompt(`New ${type.toUpperCase()} file name`,'');
   if(!name||!name.trim())return;
@@ -3901,7 +3889,7 @@ sph.register('file._fvNewFile'(type){
   sph.call('ide.tab.add',[type,n,defaults[type]||'']);
   sph.call('ide.tab.activate',[n]);
   sph.call('ide.frame.unmount');
-};
+});
 sph.register('file._fvNewExt',()=>{
   const name=prompt('New EXT ID (e.g. myext)','');
   if(!name||!name.trim())return;
@@ -3937,7 +3925,15 @@ sph.register('file._fvNewExt',()=>{
 // ── State ──────────────────────────────────────────────
 let _lastResult = null;
 
-// ── Panel UI ───────────────────────────────────────────
+${cat === 'D' ? `// ── DIVD: D層スキーマ定義 ────────────────────────────
+// このEXTが管理するパラメータのスキーマをカーネルに登録する
+// 例: sph.call('sys.divd.define', ['${n}.gain', {min:0, max:1, default:1.0}])
+function _registerSchemas() {
+  // TODO: ここにスキーマを定義する
+  // sph.call('sys.divd.define', ['${n}.param', { min: 0, max: 100, default: 50 }]);
+}
+
+` : ''}// ── Panel UI ───────────────────────────────────────────
 const _panel = () => sph.ui.panel('${n}',
   sph.ui.section('${n.toUpperCase()}',
     '<p style="color:var(--sph-dim);font-size:var(--sph-sz-md)">Your UI here</p>'
@@ -3965,7 +3961,9 @@ sph.mount('${n}', '${n.toUpperCase()}', '${icon}', {
     }),
   },
   on: {
-    'ide-ready': () => sph.call('abcd.register', ['${n}', '${cat}']),
+    'ide-ready': () => {
+      sph.call('abcd.register', ['${n}', '${cat}']);${cat === 'D' ? "\n      _registerSchemas();" : ''}
+    },
     'frame-mounted': ({ id }) => { if (id === '${n}') console.log('${n} mounted'); },
   },
 });
@@ -3996,18 +3994,18 @@ sph.register('sph.ext.cleanup.${n}', () => {
   sph.call('ide.tab.add',['ext',n,tmpl]);
   sph.call('ide.tab.activate',[n]);
   sph.call('ide.frame.unmount');
-};
+});
 
 // ── Other actions ──
-sph.register('file._fvSetDesc'(input){
+sph.register('file._fvSetDesc',function(input){
   const el=$(Tsel(input.dataset.name));
   if(el)el.dataset.tabDesc=input.value;
-};
-sph.register('file._fvEdit'(name){
+});
+sph.register('file._fvEdit',function(name){
   sph.call('ide.tab.activate',[name]);
   sph.call('ide.frame.unmount');
-};
-sph.register('file._fvExportOne'(name){
+});
+sph.register('file._fvExportOne',function(name){
   // Export single file as text
   const el=$(Tsel(name));
   const content=el?.textContent||'';
@@ -4016,8 +4014,8 @@ sph.register('file._fvExportOne'(name){
   const a=mk('a');
   a.href=URL.createObjectURL(new Blob([content],{type:'text/plain'}));
   a.download=`${name}.${ext}`;a.click();URL.revokeObjectURL(a.href);
-};
-sph.register('file._fvDeploy'(extName){
+});
+sph.register('file._fvDeploy',function(extName){
   // Eval EXT script from parent tab content
   const parentEl=$(Tsel(extName));
   const src=parentEl?.textContent||'';
@@ -4034,16 +4032,16 @@ sph.register('file._fvDeploy'(extName){
   sph.emit('ext-loaded',{id:extName});
   sph.call('ide.log',[`EXT run: ${extName}`]);
   _renderFileTable();
-};
-sph.register('file._fvDel'(name){
+});
+sph.register('file._fvDel',function(name){
   if(!confirm(`Delete "${name}"?`))return;
   const el=$(Tsel(name));
   if(el)el.remove();
   _renderFileTable();
   sph.emit('tab-deleted',{name});
-};
+});
 
-sph.mount('file','FILES','??',{
+sph.mount('file','FILES','⊟',{
   panel:()=>_fileHtml,
   api:{
     /** Re-render the file list table */
@@ -4806,9 +4804,9 @@ var _panel = function() {
   return sph.ui.panel('timeline',
     sph.ui.section('Transport',
       '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">' +
-        '<button class="sph-btn sph-btn-ok" onclick="sph.call('timeline.play')">▶ PLAY</button>' +
-        '<button class="sph-btn" onclick="sph.call('timeline.stop')">■ STOP</button>' +
-        '<button class="sph-btn" onclick="sph.call('timeline.seek',[0])">⏮ RESET</button>' +
+        '<button class="sph-btn sph-btn-ok" onclick="sph.call(\'timeline.play\')">▶ PLAY</button>' +
+        '<button class="sph-btn" onclick="sph.call(\'timeline.stop\')">■ STOP</button>' +
+        '<button class="sph-btn" onclick="sph.call(\'timeline.seek\',[0])">⏮ RESET</button>' +
       '</div>' +
       '<div style="margin-top:8px;display:flex;align-items:center;gap:8px">' +
         '<span style="color:var(--sph-dim);font-size:var(--sph-sz-md)">Time:</span>' +
@@ -4820,7 +4818,7 @@ var _panel = function() {
       '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">' +
         '<span style="color:var(--sph-dim);font-size:var(--sph-sz-md);width:40px">BPM</span>' +
         '<input id="tl-bpm" type="number" class="sph-input" value="' + _state.bpm + '" min="20" max="400" style="width:70px"' +
-        ' onchange="sph.call('timeline.setBpm',[+this.value])">' +
+        ' onchange="sph.call(\'timeline.setBpm\',[+this.value])">' +
       '</div>' +
       '<div style="display:flex;align-items:center;gap:8px">' +
         '<span style="color:var(--sph-dim);font-size:var(--sph-sz-md);width:40px">SAB</span>' +
@@ -5086,7 +5084,7 @@ sph.mount('compute', 'COMPUTE ENGINE', '[C]', {
     produce: () => ({ workers: [..._workers.keys()], pending: _taskResolvers.size }),
     describe: () => ({ cat: 'B', version: '1.2', consumes: ['bridge'], produces: ['compute_result'], signals: ['compute:error'] }),
 
-  }
+  },
   on: {
     'ide-ready': () => sph.call('abcd.register', ['compute', 'B']),
   },
@@ -5232,41 +5230,65 @@ sph.mount('compute', 'COMPUTE ENGINE', '[C]', {
 <script type="sph/tab" data-tab-name="main" data-tab-type="dsl" data-tab-order="0">
 -> main
 
-; ══ SAPPHIRE v0.9 セキュリティテスト ════════════════════════
+; ══ SAPPHIRE v0.6 統合デモ ═══════════════════════════════
+; EXT直接呼び出し / ABCD / bridge / sound / ループ全部入り
 ; Ctrl+Enter で実行
 
 !main
-  sys.print "╔═ SAPPHIRE v0.9 security sandbox ═╗"
+  sys.print "╔═ SAPPHIRE v0.6 ═══════════════════╗"
 
-  ; 1. 通常のEXT呼び出し（_safeCall経由・5秒timeout付き）
+  ; ① テーマ操作（EXT直接呼び出し・戻り値なし）
   appearance.theme "dark"
-  $t = appearance.theme_get
-  sys.print "[1] theme (safe call):" $t
+  $theme = appearance.theme_get
+  sys.print "① theme:" $theme
 
-  ; 2. ABCDとbridge（疎結合）
+  ; ② サウンド（非同期EXT呼び出し）
+  sound.volume 0.5
+  sound.beep 440 0.08
+  sys.print "② beep 440Hz OK"
+
+  ; ③ ABCDランタイム登録
   abcd.register "main" "A"
-  bridge.buf.create "test" 64
-  bridge.buf.write "test" 0 42
-  #v = bridge.buf.read "test" 0
-  sys.print "[2] bridge buf[0]=" #v
+  sys.print "③ ABCD[A] registered"
 
-  ; 3. サウンド
-  sound.volume 0.4
-  sound.beep 440 0.06
-  sys.print "[3] beep OK"
+  ; ④ bridge 共有バッファ（B層との連携）
+  bridge.buf.create "demo" 8
+  bridge.buf.write "demo" 0 42
+  #val = bridge.buf.read "demo" 0
+  sys.print "④ bridge buf[0]=" #val
 
-  ; 4. ループガードテスト
-  @countdown 3
-  sys.print "[5] loop done"
+  ; ⑤ 存在しないAPI → E010警告、nullで安全に続行
+  $x = nonexistent.api "test"
+  sys.print "⑤ unknown api → null:" $x
 
-  ; 6. ABCDシグナル
-  abcd.signal "main:done" "v0.9"
+  ; ⑥ メモリシステム（i32 / f64 / str）
+  #n   = 100
+  %pi  = 3.14159
+  $msg = "SAPPHIRE"
+  sys.print "⑥ i32=" #n " f64=" %pi " str=" $msg
+
+  ; ⑦ カウントダウンループ（@loop + break）
+  @loop_demo 5
+  sys.print "⑦ loop done"
+
+  ; ⑧ ABCDシグナル発信（C層に通知）
+  abcd.signal "main:done" "v0.7"
+  sys.print "⑧ signal sent"
+
+  ; ⑨ 安全設定の injection 確認
+  ; sph.register で上書き可能（DSLではなくJS側から）
+  ; sph.register('sph.loop.maxIter', 500)   → ループ上限を500に
+  ; sph.register('sph.loop.maxMs',   3000)  → タイムアウトを3秒に
+  ; sph.register('sph.ext.timeout',  2000)  → EXT呼び出しを2秒に
+  ; sph.register('sph.mem.strCap',   500)   → str[]上限を500に
+  sys.print "⑨ all limits are injection-configurable"
+
   sys.print "╚═ all passed ══════════════════════╝"
-  sys.stop "v0.9 OK"
+  sys.stop "SAPPHIRE v0.7 OK"
 
-@countdown[#n]
+@loop_demo[#n]
   if #n <= 0 { -> break }
-  sys.print "  [4] tick" #n
+  sys.print "  loop #n=" #n
   sound.beep 220 0.02
   #n = #n - 1
   -> @
@@ -5583,6 +5605,53 @@ bridge.buf.write  "shared" 0 42   ; [0] = 42
 <tr><td>sph.call</td><td>try/catch, E010/E011イベント発火</td></tr>
 </table>
 </div>
+
+<div class="v06-section">
+<h2>DIVD — パラメータ統治フレームワーク <span class="v06-tag">NEW</span></h2>
+<p>Definition / Injection / Validation / Default の4層でパラメータを安全に解決します。</p>
+
+<h3>sys.divd.define — スキーマ登録（D層）</h3>
+<pre>
+; JS側（EXT mount時など）でスキーマを定義する
+sph.call('sys.divd.define', ['volume', { min:0, max:1, default:0.5 }])
+sph.call('sys.divd.define', ['bpm',    { min:20, max:300, default:120 }])
+sph.call('sys.divd.define', ['width',  { min:1, max:7680, default:1920 }])
+</pre>
+
+<h3>sys.divd — 値の解決（Validation + Default）</h3>
+<pre>
+; DSL から: sys.divd &lt;value&gt; "schemaKey"
+%vol = sys.divd %raw_vol "volume"   ; 0.0〜1.0にクランプ、nullならdefault=0.5
+#bpm = sys.divd #raw_bpm "bpm"     ; 20〜300にクランプ
+#w   = sys.divd #raw_w   "width"   ; 1〜7680にクランプ
+</pre>
+
+<h3>動作規則</h3>
+<table>
+<tr><th>入力値</th><th>結果</th></tr>
+<tr><td>null / undefined</td><td>schema.default（未定義なら0）</td></tr>
+<tr><td>範囲内の値</td><td>そのまま返す</td></tr>
+<tr><td>min未満</td><td>min にクランプ</td></tr>
+<tr><td>max超過</td><td>max にクランプ</td></tr>
+<tr><td>schemaKey未登録</td><td>入力値をそのまま返す（スルー）</td></tr>
+</table>
+
+<h3>EXT実装パターン</h3>
+<pre>
+// JS側: EXT mount時にスキーマを登録（D層）
+sph.mount('sound', {
+  api: {
+    volume: async (v) => {
+      // sys.divd を通して安全な値を取得
+      const safe = await sph.call('sys.divd', [v, 'volume']);
+      _vol = safe;
+    }
+  }
+});
+// mount前にスキーマ定義
+sph.call('sys.divd.define', ['volume', { min:0, max:1, default:0.5 }]);
+</pre>
+</div>
 </script>
 
 <script type="sph/tab" data-tab-name="std" data-tab-type="lib" data-tab-order="1">
@@ -5724,6 +5793,19 @@ bridge.buf.write  "shared" 0 42   ; [0] = 42
   #_n = #_n - 1
   -> @
 
+; ── DIVD helpers ──────────────────────────────────
+; f64 safe resolve: injection || default, clamped to schema
+&divd [%_v, $_key]
+  -> sys.divd %_v $_key
+
+; i32 safe resolve: cast result to int
+&idivd [#_v, $_key]
+  -> sys.divd #_v $_key
+
+; JS側から sys.divd.define を呼ぶ慣用パターン:
+;   sph.call('sys.divd.define', ['volume', {min:0, max:1, default:0.5}])
+; DSL側での定義は sys.f 経由で行う:
+;   sys.f "sph.call('sys.divd.define',['bpm',{min:20,max:300,default:120}])"
 </script>
 
 </body>
