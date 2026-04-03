@@ -451,6 +451,26 @@ class Compiler{
       if(mm){this.memOpts[mm[1]]=parseInt(mm[2]);continue;}
       const mb=line.trim().match(/^mem\s+(\d+)$/);
       if(mb){const kb=parseInt(mb[1]);if(!this.memOpts.i32)this.memOpts.i32=kb;if(!this.memOpts.f64)this.memOpts.f64=kb;if(!this.memOpts.u64)this.memOpts.u64=kb;continue;}
+      // ── schema: D層スキーマ定義キーワード ───────────────────────────
+      // schema "key", min, max, default[, type:"T"]
+      // → sys.divd.define "key" "{min:...,max:...,default:...,type:...}"
+      const ms=line.trim().match(/^schema\s+"([^"]+)"\s*,\s*([^,]+),\s*([^,]+),\s*([^,\n]+)(?:,\s*(.*))?$/);
+      if(ms){
+        const[,key,mn,mx,def,extra]=ms;
+        const tyM=extra?.match(/type\s*:\s*"?(\w+)"?/);
+        const ty=tyM?`,"type":"${tyM[1]}"`:',"type":"number"';
+        rest.push(`sys.divd.define "${key}" "{min:${mn.trim()},max:${mx.trim()},default:${def.trim()}${ty}}"`);
+        continue;
+      }
+      // ── IN_LAYER X: ABCD層明示宣言 ─────────────────────────────────
+      // IN_LAYER D: body  → コメント記録 + body をそのまま展開
+      const layM=line.trim().match(/^IN_LAYER\s+([ABCD])\s*:\s*(.*)/);
+      if(layM){
+        const[,cat,body]=layM;
+        rest.push(`; [LAYER ${cat}] ${body}`);
+        if(body.trim())rest.push(body.trim());
+        continue;
+      }
       rest.push(line);
     }
     return[...rest,...libSrcs].join('\n');
@@ -590,10 +610,44 @@ function _registerSys(mem,signal,logFn,docs){
     'sys.dom.mount':(docName,parentId)=>{const html=docs[docName];if(!html)return;const parent=parentId==='body'?document.body:document.getElementById(String(parentId));if(!parent)return;const tmp=document.createElement('div');tmp.innerHTML=html;for(const s of tmp.querySelectorAll('style'))document.head.appendChild(s.cloneNode(true));while(tmp.firstChild)parent.appendChild(tmp.firstChild);},
     'sys.section.show':(id)=>_setSection(id),
     'sys.section.get':()=>_curSection,
-    // ── DIVD: Definition / Injection / Validation / Default ──────────────
-    'sys.divd':(v,k,s=_reg.get('divd.schema.'+k)??{})=>
-      (v??=s.default??0,Math.max(s.min??-1/0,Math.min(s.max??1/0,v))),
-    'sys.divd.define':(k,schema)=>_reg.set('divd.schema.'+k,schema),
+    // ── DIVD v2: Definition / Injection / Validation / Default ─────────
+    // schema引数は オブジェクト or JSON文字列 どちらも受け付ける
+    'sys.divd.define':(k,schema)=>{
+      const s=typeof schema==='string'?JSON.parse(schema.replace(/'/g,'"')):schema;
+      _reg.set('divd.schema.'+k,s);
+      // キャッシュも更新
+      if(window._divdCache)window._divdCache.set(k,s);
+    },
+    'sys.divd':(v,k,opts)=>{
+      // キャッシュ優先でスキーマ取得
+      if(!window._divdCache)window._divdCache=new Map();
+      let s=window._divdCache.get(k);
+      if(!s){s=_reg.get('divd.schema.'+k)??{};if(Object.keys(s).length)window._divdCache.set(k,s);}
+      const strict=opts?.strict??_reg.get('divd.strict')??false;
+      // Phase 1: Injection
+      if(v===undefined||v===null)v=s.default??0;
+      // Phase 2: Type coercion
+      if(s.type==='number'&&typeof v!=='number'){const n=+(v);v=isNaN(n)?s.default??0:n;}
+      else if(s.type==='string'&&typeof v!=='string')v=String(v);
+      else if(s.type==='boolean'&&typeof v!=='boolean')v=Boolean(v);
+      // Phase 3: Enum
+      if(s.enum&&!s.enum.includes(v)){if(strict)throw new Error(`[DIVD] "${v}" not in enum for "${k}"`);v=s.enum[0]??s.default??v;}
+      // Phase 4: Pattern
+      if(s.pattern&&typeof v==='string'){const r=s.pattern instanceof RegExp?s.pattern:new RegExp(s.pattern);if(!r.test(v)){if(strict)throw new Error(`[DIVD] pattern fail for "${k}"`);v=s.default??v;}}
+      // Phase 5: Range clamp
+      if(typeof v==='number'){
+        const lo=s.min??-1/0,hi=s.max??1/0;
+        if(strict&&(v<lo||v>hi))throw new Error(`[DIVD] ${v} out of range [${lo},${hi}] for "${k}"`);
+        v=Math.max(lo,Math.min(hi,v));
+      }
+      // Phase 6: Custom validate
+      if(s.validate&&typeof s.validate==='function'){if(!s.validate(v)){if(strict)throw new Error(`[DIVD] ${s.validateMessage||'custom validation failed'} for "${k}"`);v=s.default??v;}}
+      return v;
+    },
+    'sys.divd.inject':(k,v)=>{const s=_reg.get('divd.schema.'+k)??{};return(v===undefined||v===null)?s.default??null:v;},
+    'sys.divd.strict':(en)=>_reg.set('divd.strict',Boolean(en)),
+    'sys.divd.schema':(k)=>_reg.get('divd.schema.'+k)??null,
+    'sys.divd.cache.clear':()=>{if(window._divdCache)window._divdCache.clear();},
   };
   for(const[n,f]of Object.entries(sys))_reg.set(n,f);
 }
@@ -5802,10 +5856,138 @@ sph.call('sys.divd.define', ['volume', { min:0, max:1, default:0.5 }]);
 &idivd [#_v, $_key]
   -> sys.divd #_v $_key
 
+
 ; JS側から sys.divd.define を呼ぶ慣用パターン:
 ;   sph.call('sys.divd.define', ['volume', {min:0, max:1, default:0.5}])
-; DSL側での定義は sys.f 経由で行う:
-;   sys.f "sph.call('sys.divd.define',['bpm',{min:20,max:300,default:120}])"
+; DSL側での定義は schema キーワードで:
+;   schema "volume", 0.0, 1.0, 0.5
+</script>
+
+<!-- ⬡ AI_CONNECT EXT (v1.1 fixed) -->
+<script type="sph/meta" data-ext-id="ai_connect">
+{
+  "cat": "C",
+  "version": "1.1",
+  "label": "AI CONNECT",
+  "icon": "🧠",
+  "consumes": ["bridge", "abcd"],
+  "produces": ["ai_state"],
+  "signals": ["ai:command_received", "ai:state_reported"],
+  "permissions": ["dom"]
+}
+</script>
+
+<script type="sph/ext" data-ext-id="ai_connect">
+(function(){
+'use strict';
+var _reportCount=0,_lastReport=null,_cmdLog=[];
+function _relay(type,payload){
+  window.postMessage({type:'IDE_TO_BRIDGE',cls:'info',log:{ai_bridge:type,data:payload,ts:Date.now()}},'*');
+}
+window.addEventListener('message',function(e){
+  if(e.source!==window)return;
+  var d=e.data;
+  if(!d||d.type!=='BRIDGE_TO_IDE')return;
+  var cmd=d.cmd;if(!cmd||!cmd.name)return;
+  _cmdLog.unshift({name:cmd.name,args:cmd.args,ts:Date.now()});
+  if(_cmdLog.length>20)_cmdLog.pop();
+  sph.emit('ai:command_received',cmd);
+  sph.call('ide.log',['[AI] cmd: '+cmd.name+(cmd.args?' '+JSON.stringify(cmd.args):'')]);
+  if(cmd.name==='run'&&cmd.args)sph.call('ide.run',[cmd.args]).catch(function(){});
+});
+function _refreshUI(){
+  var c=document.getElementById('aic-count');
+  var l=document.getElementById('aic-last');
+  var d=document.getElementById('aic-cmds');
+  if(c)c.textContent=_reportCount;
+  if(l)l.textContent=_lastReport?JSON.stringify(_lastReport).slice(0,80)+'...':'--';
+  if(d)d.innerHTML=_cmdLog.length
+    ?_cmdLog.slice(0,5).map(function(x){return'<div>cmd: '+x.name+'</div>';}).join('')
+    :'--';
+}
+var _panel=function(){return sph.ui.panel('ai_connect',
+  sph.ui.section('Bridge Status',
+    '<div class="sph-row"><label>Reports</label><span id="aic-count" class="sph-body">0</span></div>'+
+    '<div class="sph-row"><label>Last sent</label><span id="aic-last" class="sph-meta" style="font-size:9px;word-break:break-all">--</span></div>'
+  )+
+  sph.ui.section('Recent Commands',
+    '<div id="aic-cmds" class="sph-meta" style="font-size:9px;line-height:1.8">--</div>'
+  )+
+  sph.ui.section('Test',
+    '<button class="sph-btn sph-btn-ok" onclick="sph.call(\'ai_connect.ping\')">Ping AI</button>'
+  )
+);}
+sph.mount('ai_connect','AI CONNECT','🧠',{
+  panel:_panel,
+  commands:[
+    {name:'ai_connect.report', desc:'Send state to AI', args:'data:object'},
+    {name:'ai_connect.ping',   desc:'Ping AI bridge'},
+    {name:'ai_connect.status', desc:'Get bridge status'},
+    {name:'ai_connect.consume',desc:'ABCD receive',     args:'data,from'},
+    {name:'ai_connect.produce',desc:'ABCD export state'},
+  ],
+  api:{
+    report:function(data){
+      _reportCount++;_lastReport=data;
+      _relay('SENSE',data);
+      sph.emit('ai:state_reported',data);
+      requestAnimationFrame(_refreshUI);
+      return true;
+    },
+    ping:function(){
+      _relay('PING',{ts:Date.now(),from:'sapphire'});
+      sph.call('ide.log',['[AI] PING sent']);
+      return true;
+    },
+    status:function(){
+      return{connected:true,report_count:_reportCount,last_report:_lastReport,cmd_queue:_cmdLog.length};
+    },
+    consume:function(data,from){
+      if(data&&data.command)sph.call('ide.log',['[AI] consume from '+from+': '+data.command]);
+    },
+    produce:function(){return{report_count:_reportCount,last_report:_lastReport};},
+    describe:function(){return{cat:'C',version:'1.1',
+      consumes:['bridge','abcd'],produces:['ai_state'],
+      signals:['ai:command_received','ai:state_reported']};},
+  },
+  on:{
+    'ide-ready':function(){
+      sph.call('abcd.register',['ai_connect','C']);
+      sph.call('ide.log',['[AI_CONNECT] Neural Bridge active']);
+    },
+    'frame-mounted':function(e){if(e.id==='ai_connect')_refreshUI();},
+  },
+});
+})();
+</script>
+
+<script type="sph/tab" data-tab-name="ai_lib" data-tab-type="lib">
+; lib ai_lib
+; AI連携ヘルパー — sys.f経由でオブジェクトを安全に渡す
+
+; 数値をキー付きでAIへ送信
+!ai_send_num [$_key, %_val]
+  sys.f "sph.call('ai_connect.report',[{key:str[0],val:f64[0],ts:Date.now()}])"
+  sys.stop
+
+; AI疎通確認
+!ai_ping
+  ai_connect.ping
+  sys.stop
+</script>
+
+<script type="sph/doc" data-doc-ext="ai_connect">
+{
+  "title": "AI CONNECT — Neural Bridge",
+  "icon": "🧠",
+  "version": "1.1",
+  "description": "Sapphire IDE ↔ AI Agent の双方向ブリッジ。window.postMessage で content_sapphire 拡張と連携します。",
+  "api": [
+    { "method": "ai_connect.report", "args": "data:object", "returns": "boolean", "description": "状態をAIへ送信（SENSE）。同期でboolを返す — Promise問題なし。" },
+    { "method": "ai_connect.ping",   "args": "", "returns": "boolean", "description": "PING送信。" },
+    { "method": "ai_connect.status", "args": "", "returns": "object",  "description": "接続統計。" }
+  ]
+}
 </script>
 
 </body>
