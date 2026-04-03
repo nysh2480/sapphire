@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Sapphire Bridge Pro",
+  "version": "1.5",
+  "description": "CSP-Safe Bridge for Sapphire IDE",
+  "permissions": ["tabs", "scripting"],
+  "host_permissions": [
+    "file:///*",
+    "https://claude.ai/*",
+    "https://aistudio.google.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://claude.ai/*", "https://aistudio.google.com/*"],
+      "js": ["content_llm.js"],
+      "css": ["bridge.css"]
+    }
+  ]
+}
