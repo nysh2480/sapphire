@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="sph-ext" content="ai_connect">
+  <title>AI Connect Extension</title>
+</head>
+<body>
+
+<!-- ⬡ ABCD Meta Definition -->
+<script type="sph/meta" data-ext-id="ai_connect">
+{
+  "cat": "C",
+  "version": "1.0",
+  "label": "AI CONNECT",
+  "icon": "🧠",
+  "consumes": ["bridge", "abcd"],
+  "produces": ["ai_state"],
+  "signals": ["ai:command_received", "ai:state_reported"],
+  "permissions": ["dom"]
+}
+</script>
+
+<!-- 🧠 Extension Logic -->
+<script type="sph/ext" data-ext-id="ai_connect">
+(function(){
+'use strict';
+
+// ── 内部状態 ──────────────────────────────────────────────
+let _lastReportTime = 0;
+let _reportCount = 0;
+
+// ── ユーティリティ ──────────────────────────────────────────
+const relayToAI = (type, payload) => {
+  // ブラウザ拡張機能(content_sapphire)が拾えるように標準メッセージを発火
+  window.postMessage({ 
+    type: 'IDE_TO_BRIDGE', 
+    cls: 'info', 
+    log: { ai_bridge: type, data: payload } 
+  }, '*');
+};
+
+// ── API定義 ──────────────────────────────────────────────
+const api = {
+  /**
+   * AIに現在の状態を送信する（感覚）
+   * @param {Object} data - 送信するJSONデータ
+   */
+  report: (data) => {
+    _lastReportTime = Date.now();
+    _reportCount++;
+    relayToAI('SENSE', data);
+    sph.emit('ai:state_reported', data);
+    return true;
+  },
+
+  /**
+   * AIからの接続状態を確認
+   */
+  status: () => {
+    return {
+      connected: true,
+      last_report: _lastReportTime,
+      total_reports: _reportCount
+    };
+  },
+
+  /**
+   * ABCD標準: 外部からのデータ注入
+   */
+  consume: (data, from) => {
+    if (data?.command) {
+      sph.call('ide.log', [`[AI_CONNECT] Command from ${from}: ${data.command}`]);
+    }
+  },
+
+  /**
+   * ABCD標準: 現在の状態出力
+   */
+  produce: () => {
+    return api.status();
+  },
+
+  describe: () => ({
+    cat: 'C',
+    desc: 'Bidirectional Neural Bridge for AI Agents'
+  })
+};
+
+// ── 登録 ──────────────────────────────────────────────────
+sph.mount('ai_connect', 'AI CONNECT', '🧠', {
+  api: api,
+  on: {
+    'ide-ready': () => {
+      sph.call('abcd.register', ['ai_connect', 'C']);
+      sph.call('ide.log', ['[AI_CONNECT] Neural Bridge Active. Waiting for AI...']);
+    },
+    // ブラウザ拡張からの実行命令が来た時の処理
+    'ai:command_received': (cmd) => {
+      sph.call('ide.log', [`[AI_CONNECT] AI executing: ${cmd.name}`]);
+    }
+  }
+});
+
+})();
+</script>
+
+<!-- 📚 Built-in Library (DSL Helpers) -->
+<script type="sph/tab" data-tab-name="ai_lib" data-tab-type="lib">
+; lib ai_lib
+; AI連携用の高レベル命令セット
+
+; AIに現在の状況を報告する（感覚の送信）
+!ai_report [$label, #val]
+  ai_connect.report { type: $label, value: #val, time: sys.f "Date.now()" }
+  sys.stop
+
+; ゲームマスター用：状況をまとめてAIに送る
+!ai_sync_gm [#player_hp, #enemy_hp, $stage]
+  ai_connect.report {
+    role: "GM",
+    state: {
+      p_hp: #player_hp,
+      e_hp: #enemy_hp,
+      map: $stage
+    }
+  }
+  sys.stop
+
+; AIの判断を待つためのウェイト（擬似的な思考同期）
+!ai_wait_decision
+  sys.print "[AI] Thinking..."
+  sys.wait_frames 30
+  sys.stop
+</script>
+
+<!-- 📖 Documentation -->
+<script type="sph/doc" data-doc-ext="ai_connect">
+{
+  "title": "AI CONNECT - Neural Bridge",
+  "icon": "🧠",
+  "description": "AI（LLM）とSapphire IDEを接続する双方向インターフェース。AIにゲームの状態を『報告』し、AIからのDSLを『実行』することで、自律エージェントやAIゲームマスターを実現します。",
+  "api": [
+    {
+      "method": "ai_connect.report",
+      "args": "data: object",
+      "returns": "boolean",
+      "description": "現在のゲーム状態をJSON形式でAI（ブラウザ拡張のモニターパネル）へ送信します。"
+    },
+    {
+      "method": "ai_connect.status",
+      "args": "",
+      "returns": "object",
+      "description": "接続の統計情報（最終送信時刻など）を返します。"
+    }
+  ],
+  "usage": "DSL内で 'lib ai_lib' を読み込み、'!ai_report' 命令を使用してAIにデータを送信してください。"
+}
+</script>
+
+</body>
+</html>
