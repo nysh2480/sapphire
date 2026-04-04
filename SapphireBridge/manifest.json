@@ -7,14 +7,18 @@
   "host_permissions": [
     "file:///*",
     "https://claude.ai/*",
-    "https://aistudio.google.com/*"
+    "https://aistudio.google.com/*",
+    "https://grok.com/*",
+    "https://grok.x.ai/*",
+    "https://x.com/grok*",
+    "https://x.com/i/grok*"
   ],
   "background": {
     "service_worker": "background.js"
   },
   "content_scripts": [
     {
-      "matches": ["https://claude.ai/*", "https://aistudio.google.com/*"],
+      "matches": ["https://claude.ai/*", "https://aistudio.google.com/*","https://grok.com/*","https://grok.x.ai/*","https://x.com/grok*","https://x.com/i/grok*"],
       "js": ["content_llm.js"],
       "css": ["bridge.css"]
     }
