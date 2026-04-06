@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "Sapphire Bridge Pro",
-  "version": "1.5",
-  "description": "CSP-Safe Bridge for Sapphire IDE",
-  "permissions": ["tabs", "scripting"],
+  "version": "2.0",
+  "description": "CSP-Safe Bridge for Sapphire IDE (file:// + LLM sites) with Memory Bank",
+  "permissions": ["tabs", "scripting", "storage"],
   "host_permissions": [
     "file:///*",
     "https://claude.ai/*",
@@ -18,9 +18,23 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://claude.ai/*", "https://aistudio.google.com/*","https://grok.com/*","https://grok.x.ai/*","https://x.com/grok*","https://x.com/i/grok*"],
+      "matches": [
+        "file:///*",
+        "https://claude.ai/*",
+        "https://aistudio.google.com/*",
+        "https://grok.com/*",
+        "https://grok.x.ai/*",
+        "https://x.com/grok*",
+        "https://x.com/i/grok*"
+      ],
       "js": ["content_llm.js"],
-      "css": ["bridge.css"]
+      "css": ["bridge.css"],
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["file:///*"],
+      "js": ["content_sapphire.js"],
+      "run_at": "document_idle"
     }
   ]
 }
