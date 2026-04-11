@@ -2,8 +2,8 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="sapphire-version" content="ng-0.3">
-<title>Sapphire NG 0.3 +DIVD</title>
+<meta name="sapphire-version" content="ng-0.4-v16">
+<title>Sapphire NG v16</title>
 <script>
 // ── SAB/crossOriginIsolated via inline ServiceWorker ─────────────
 // COOP + COEP ヘッダをServiceWorkerで注入することでfile://でもSABが使用可能になる
@@ -273,7 +273,7 @@ body[data-view="doc"] #logo{color:var(--sph-ok)}
 
 <!-- ── TOOLBAR ── -->
 <div id="toolbar">
-  <div id="logo" title="Export doc">◆ SAPPHIRE <span style="font-size:9px;opacity:.5">0.3</span></div>
+  <div id="logo" title="Export doc">◆ SAPPHIRE <span style="font-size:9px;opacity:.5">v16</span></div>
   <div id="tab-bar"></div>
   <div id="actions">
     <div id="stat"></div>
@@ -303,7 +303,14 @@ body[data-view="doc"] #logo{color:var(--sph-ok)}
   </div>
 </div>
 
-<!-- ??? sph-core: Compiler + Runtime + Registry ??? -->
+<!-- ??? sph-core: Compiler + Runtime + Registry [v16] ??? -->
+<!-- v16 追加: SAFE_MATH / SAFE_EXPR / _safeEval / _evalCache (セキュア数式評価)
+               ALLOWED_EXT + sph.ext.allow/isAllowed (EXTホワイトリスト)
+               ext.math.exec (_registerSys内で登録)
+               sph._extCall (ホワイトリスト検証付きEXT呼び出し)
+               _inferType / _checkType / W-TYPE (静的型チェック警告)
+               W-EXT (ブロックされたEXT呼び出し警告)
+               qlit (Literal Array — createMem/_build/sandbox/DSL_GLOBALS_ALLOW) -->
 <script id="sph-core">
 
 (function(){
@@ -328,12 +335,52 @@ async function call(name,args=[]){
 function emit(name,detail={}){
   document.dispatchEvent(new CustomEvent('sph:'+name,{detail}));
 }
-function createMem(o={}){
+// ── [v16] セキュア数式評価 ───────────────────────────────────────────────
+// ext.math.exec / sys.f の安全な実行に使用
+// グローバルアクセスを遮断し SAFE_MATH 関数のみ注入
+const SAFE_EXPR=/^[0-9+\-*/%().,<>!=&|#%$ _a-zA-Z\[\]'"`]+$/;
+const SAFE_MATH=Object.freeze({
+  sin:Math.sin,cos:Math.cos,tan:Math.tan,atan2:Math.atan2,
+  sqrt:Math.sqrt,pow:Math.pow,abs:Math.abs,sign:Math.sign,
+  min:Math.min,max:Math.max,floor:Math.floor,ceil:Math.ceil,
+  round:Math.round,trunc:Math.trunc,log:Math.log,log2:Math.log2,
+  exp:Math.exp,hypot:Math.hypot,PI:Math.PI,E:Math.E,
+});
+const _evalCache=new Map();
+function _safeEval(expr,vars){
+  if(!SAFE_EXPR.test(expr)||/[=;{}]/.test(expr))return NaN;
+  // 括弧カウント検証
+  let depth=0;
+  for(const c of expr){if(c==='(')depth++;else if(c===')'){depth--;if(depth<0)return NaN;}}
+  if(depth!==0)return NaN;
+  try{
+    let fn=_evalCache.get(expr);
+    if(!fn){
+      const body=expr.replace(/([#%$][a-zA-Z_]\w*)/g,m=>`vars["${m}"]`);
+      fn=new Function('Math','vars',`"use strict";return(${body});`);
+      if(_evalCache.size>500)_evalCache.clear();
+      _evalCache.set(expr,fn);
+    }
+    const result=fn(SAFE_MATH,vars??{});
+    if(typeof result==='number'&&!Number.isFinite(result))return NaN;
+    return result;
+  }catch(_){return NaN;}
+}
+// ── [v16] EXT ホワイトリスト ────────────────────────────────────────────
+// DSLからのEXT呼び出しを制限する。sph.ext.allow(name)で追加可能。
+const ALLOWED_EXT=new Set([
+  'ext.math.exec',
+]);
+
   // str上限: o.str > sph.register("sph.mem.strCap") > 1000 の優先順
   const strMax=o.str??(_reg.get('sph.mem.strCap')??1000);
   const strArr=[];
-  // str配列をProxyでラップして上限を強制
+  // str配列をProxyでラップして上限を強制 + 未初期化は '' を返す (3-3)
   const strProxy=new Proxy(strArr,{
+    get(t,k){
+      if(typeof k==='string'&&!isNaN(k))return t[k]??'';
+      return typeof t[k]==='function'?t[k].bind(t):t[k];
+    },
     set(t,k,v){
       if(typeof k==='string'&&!isNaN(k)&&Number(k)>=strMax){
         emit('warn',{code:'W008',args:[Number(k),strMax],severity:'warn',phase:'runtime'});
@@ -342,11 +389,22 @@ function createMem(o={}){
       t[k]=v;return true;
     }
   });
+  // q_slot: フリーリスト方式でスロットを再利用 (2.6)
+  const q_slot={
+    '#':{cur:0,free:[]},
+    '%':{cur:0,free:[]},
+    '$':{cur:0,free:[]},
+    '~':{cur:0,free:[]},
+  };
   return{
     i32:new Int32Array(((o.i32||16)*1024/4)|0),
     f64:new Float64Array(((o.f64||16)*1024/8)|0),
     u64:new BigUint64Array(((o.u64||4)*1024/8)|0),
     str:strProxy,
+    q:new Map(),       // ?型: id → {schema, idx}
+    qschema:{},        // ?型: name → [{type,field,slot}]
+    q_slot,            // フリーリスト方式スロットカウンタ
+    qlit:new Map(),    // ?型 Literal Array: name → any[]
   };
 }
 // ── LL(1) Stream Compiler ? no intermediate AST ──────────────────────────────
@@ -354,31 +412,77 @@ function createMem(o={}){
 // Block type: & = pure(sync), ! = action(async), @ = loop(async+guard)
 // Produces a registry of {body, type, isPub, hasAsync} directly.
 // ─────────────────────────────────────────────────────────────────────────────
-const ASYNC_SYS=new Set(['wait','section.show','net.connect','net.recv','net.send']);
+const ASYNC_SYS=new Set(['wait','section.show',...(_reg.get('sph.async.sys')||[])]);
 class Compiler{
   constructor(){this._reset();}
   _reset(){
     this.sym={'#':{},'%':{},'~':{},'$':{},'?':{}};
     this.slot={'#':0,'%':0,'~':0,'$':0,'?':0};
+    this.len={'#':{},'%':{},'~':{},'$':{}};
     this.memOpts={};this.docs=[];this.errors=[];this.warns=[];
-    this._pubs=[];this._locals=new Set();this._btype={};
+    this._pubs=[];this._locals=new Map();this._btype={};
+    this._blockNames=new Set(); // duplicate block detection (2-2)
   }
   _err(code,args=[]){this.errors.push({code,args,severity:'error',phase:'compile'});}
   _warn(code,args=[]){this.warns.push({code,args,severity:'warn',phase:'compile'});}
+  // ── [v16] Static Type Inference & W-TYPE warning ──────────────────
+  // 式の型をシジルから静的に推測し、明らかな型不一致を警告する
+  _inferType(e){
+    e=e.trim();
+    if(e.startsWith('"')||e.startsWith(':'))return'$';
+    if(/^-?\d+(\.\d+)?$/.test(e))return'#';
+    if(/^[#%~]/.test(e))return'#';
+    if(e.startsWith('$'))return'$';
+    return'u'; // unknown
+  }
+  _checkType(lhs,rhs,ln){
+    const lt=lhs[0],rt=this._inferType(rhs);
+    if(rt==='u')return; // 不明な型はスキップ
+    if((lt==='#'||lt==='%'||lt==='~')&&rt==='$')
+      this._warn('W-TYPE',[ln,`Cannot assign String to Numeric ${lhs}`]);
+    if(lt==='$'&&rt==='#')
+      this._warn('W-TYPE',[ln,`Assigning Number to String ${lhs}`]);
+  }
   _castI(expr,vn){
     if(/^-?\d+$/.test(expr.trim())||/^i32\[/.test(expr.trim()))return`(${expr})|0`;
-    return`((_w=+(${expr})),(_w!==(_w|0)||Number.isNaN(_w))&&sph._runtimeWarn&&sph._runtimeWarn('W003',['${vn}',String(${expr}),String((_w|0))]),(${expr})|0)`;
+    // _w に1回だけ評価し、警告チェックも _w を使う (1-1: double-eval fix)
+    return`((_w=+(${expr})),(_w!==(_w|0)||Number.isNaN(_w))&&sph._runtimeWarn&&sph._runtimeWarn('W003',['${vn}',String(_w),String((_w|0))]),(_w|0))`;
   }
   _castF(expr,vn){
     if(/^-?\d+(\.\d+)?$/.test(expr.trim())||/^f64\[/.test(expr.trim()))return`+(${expr})`;
-    return`((_w=+(${expr})),Number.isNaN(_w)&&sph._runtimeWarn&&sph._runtimeWarn('W003',['${vn}',String(${expr}),'NaN']),_w)`;
+    // _w に1回だけ評価 (1-1: double-eval fix)
+    return`((_w=+(${expr})),Number.isNaN(_w)&&sph._runtimeWarn&&sph._runtimeWarn('W003',['${vn}',String(_w),'NaN']),_w)`;
   }
   _slot(s,n,l=1){if(n.startsWith('_'))return null;if(this.sym[s][n]===undefined){this.sym[s][n]=this.slot[s];this.slot[s]+=l;}return this.sym[s][n];}
-  _ta(s,i){switch(s){case'#':return`i32[${i}]`;case'%':return`f64[${i}]`;case'~':return`u64[${i}]`;case'$':return`str[${i}]`;case'?':return`q[${i}]`;}}
-  _addr(tok){const s=tok[0];if(tok[1]==='_'&&!tok.includes('['))return tok.slice(1);const bi=tok.indexOf('[');if(bi!==-1){const n=tok.slice(1,bi),ie=tok.slice(bi+1,tok.lastIndexOf(']')),base=this._slot(s,n),ij=this._expr(ie);return this._ta(s,`${base}+(${ij})|0`);}return this._ta(s,this._slot(s,tok.slice(1)));}
+  _ta(s,i){switch(s){case'#':return`i32[${i}]`;case'%':return`f64[${i}]`;case'~':return`u64[${i}]`;case'$':return`str[${i}]`;case'?':return`q.get(${i})`;}}
+  // local variable JS name: type-prefixed to avoid cross-sigil collision (3-1)
+  _localName(s,jn){
+    const pfx={'#':'_i','%':'_f','$':'_s','~':'_b','?':'_q'};
+    return(pfx[s]||'_u')+jn.slice(1);
+  }
+  _addr(tok){
+    const s=tok[0];
+    // local variable: _name → type-prefixed JS name
+    if(tok[1]==='_'&&!tok.includes('[')){return this._localName(s,tok.slice(1));}
+    const bi=tok.indexOf('[');
+    if(bi!==-1){
+      const n=tok.slice(1,bi),ie=tok.slice(bi+1,tok.lastIndexOf(']'));
+      // ローカル配列アクセスはエラー (3-2 / E015)
+      if(n.startsWith('_')){this._err('E015',[n]);return'/* LOCAL_ARRAY */';}
+      const base=this._slot(s,n),ij=this._expr(ie),ta=this._ta(s,`${base}+(${ij})|0`);
+      const len=this.len[s]?.[n];
+      if(len!==undefined)return`(((${ij})|0)>=0&&((${ij})|0)<${len})?${ta}:sph._throwOOB('${n}',${ij},${len})`;
+      return ta;
+    }
+    return this._ta(s,this._slot(s,tok.slice(1)));
+  }
   _findOp(e,op){let d=0,inS=false;for(let i=e.length-1;i>=0;i--){const c=e[i];if(c==='"')inS=!inS;if(inS)continue;if(c===')'||c===']')d++;if(c==='('||c==='[')d--;if(d===0&&e.slice(i,i+op.length)===op)return i;}return -1;}
   _expr(e){
     if(!e)return'0';e=e.trim();
+    // ?name[id].slot 読み取り
+    const qr=e.match(/^\?([a-zA-Z_]\w*)\[([^\]]+)\]\.(\d+)$/);
+    if(qr){const[,qn,idR,sl]=qr;const ij=this._expr(idR);
+      return`(()=>{const _qi=(${ij})|0,_qs=qschema['${qn}'],_qi2=q.get(_qi)?.idx;if(!_qs||_qi2==null)return 0;const _t=_qs[${sl}]?.type;return _t==='#'?i32[_qi2[${sl}]]:_t==='%'?f64[_qi2[${sl}]]:_t==='$'?str[_qi2[${sl}]]:_t==='~'?Number(u64[_qi2[${sl}]]):0;})()`;}
     if(e.startsWith('"')&&e.endsWith('"'))return JSON.stringify(e.slice(1,-1));
     if(e.startsWith(':'))return JSON.stringify(e.slice(1));
     if(/^-?\d+(\.\d+)?$/.test(e))return e;
@@ -386,7 +490,8 @@ class Compiler{
     if(/^[#%~$?][a-zA-Z_]\w*\[/.test(e)){const ob=e.indexOf('[');let d=0;for(let i=ob;i<e.length;i++){if(e[i]==='[')d++;else if(e[i]===']'){d--;if(d===0&&i===e.length-1)return this._addr(e);break;}}}
     if(e.startsWith('sys.'))return this._sys(e).replace(/;$/,'');
     if(e.startsWith('call '))return this._callExpr(e);
-    const ops=[['&&','&&'],['||','||'],['|','|'],['^','^'],['<=','<='],['>=','>='],['!=','!=='],['==','==='],['<<','<<'],['>>>','>>>'],['>>','>>'],['>',' >'],['<','<'],['+',' +'],['?','-'],['*','*'],['/','/'],['%','%'],['band','&']];
+    // 演算子優先順位: 低→高の順。|| > && (1-2修正)。? 減算演算子を削除 (1-3)
+    const ops=[['||','||'],['&&','&&'],['|','|'],['^','^'],['<=','<='],['>=','>='],['!=','!=='],['==','==='],['<<','<<'],['>>>','>>>'],['>>','>>'],['>',' >'],['<','<'],['+',' +'],['*','*'],['/','/'],['%','%'],['band','&']];
     for(const[op,jo]of ops){const i=this._findOp(e,op);if(i!==-1){const L=this._expr(e.slice(0,i).trim()),R=this._expr(e.slice(i+op.length).trim());return op==='%'?`((${L})%(${R}))`:`(${L}${jo}${R})`;}}
     if(e.startsWith('!'))return`!(${this._expr(e.slice(1).trim())})`;
     if(e.startsWith('-')&&e.length>1&&/[#%~\d]/.test(e[1]))return`-(${this._expr(e.slice(1).trim())})`;
@@ -394,14 +499,39 @@ class Compiler{
   }
   _callExpr(e){const rest=e.slice(5).trim(),bi=rest.indexOf('['),traw=bi>=0?rest.slice(0,bi).trim():rest,tgt=traw.replace(/^[&!@]/,'');if(bi>=0){const ar=rest.slice(bi+1,rest.lastIndexOf(']')),args=ar.split(',').map(a=>this._expr(a.trim())).filter(a=>a!=='');return`(await callBlock("${tgt}",[${args.join(',')}]))`;}return`(await callBlock("${tgt}",[]))`;}
   _tok(raw){const t=[];let c='',inS=false;for(const ch of raw){if(ch==='"')inS=!inS;if(!inS&&ch===' '&&c.trim()){t.push(c.trim());c='';}else c+=ch;}if(c.trim())t.push(c.trim());return t.map(x=>x.replace(/,+$/,''));}
-  _sys(line){const m=line.match(/^sys\.([\w.]+)\s*(.*)?$/);if(!m)return`/* bad sys */`;const fn=m[1],raw=(m[2]||'').trim();if(fn==='f'){if(!raw.startsWith('"'))return`/* sys.f: string literal required */`;const inner=raw.slice(1,raw.lastIndexOf('"'));return`(${inner.replace(/[#%~$?][a-zA-Z_]\w*/g,t=>this._addr(t))})`;}const args=this._tok(raw).map(t=>this._expr(t));return`${ASYNC_SYS.has(fn)?'await ':''}sph.call("sys.${fn}",[${args.join(',')}])`;}
+  _sys(line){
+    const m=line.match(/^sys\.([\w.]+)\s*(.*)?$/);if(!m)return`/* bad sys */`;
+    const fn=m[1],raw=(m[2]||'').trim();
+    if(fn==='f'){
+      if(!raw.startsWith('"'))return`/* sys.f: string literal required */`;
+      // 対応するダブルクォートを正しく探す (4-2: inner quote fix)
+      let depth=0,inQ=false,endIdx=-1;
+      for(let i=0;i<raw.length;i++){
+        if(raw[i]==='"'&&(i===0||raw[i-1]!=='\\')){
+          if(!inQ){inQ=true;}else{endIdx=i;break;}
+        }
+      }
+      const inner=endIdx>0?raw.slice(1,endIdx):raw.slice(1,raw.lastIndexOf('"'));
+      return`(${inner.replace(/[#%~$?][a-zA-Z_]\w*/g,t=>this._addr(t))})`;
+    }
+    const args=this._tok(raw).map(t=>this._expr(t));
+    return`${ASYNC_SYS.has(fn)?'await ':''}sph.call("sys.${fn}",[${args.join(',')}])`;
+  }
   _jump(line){const t=line.slice(2).trim();if(t==='@')return'continue;';if(t==='0'||t==='null')return'return null;';if(t.startsWith(':'))return`return "${t.slice(1)}";`;if(t.startsWith('-')&&/^-[#%~?]/.test(t))return`return -(${this._addr(t.slice(1))});`;if(/^[#%~$?]/.test(t))return`return ${this._addr(t)};`;if(/^[@!&]/.test(t))return`return "${t.slice(1)}";`;if(t.startsWith('sys.f '))return`return ${this._sys(t)};`;if(t.startsWith('call '))return`return ${this._callExpr(t)};`;if(/^-?[\d.]/.test(t))return`return (${this._expr(t)});`;return`return "${t}";`;}
   _parseIf(lines,i){let text='',d=0,inS=false;while(i<lines.length){const l=this._strip(lines[i]).trim();text+=l+' ';for(const c of l){if(c==='"')inS=!inS;if(!inS&&c==='{')d++;if(!inS&&c==='}')d--;}if(d<=0&&text.trim().length>3)break;i++;}return{text:text.trim(),end:i};}
   _splitComma(s){const p=[];let c='',d=0,inS=false;for(const ch of s){if(ch==='"')inS=!inS;if(!inS&&ch==='{')d++;if(!inS&&ch==='}')d--;if(!inS&&d===0&&ch===','){p.push(c.trim());c='';}else c+=ch;}if(c.trim())p.push(c.trim());return p;}
   _splitStmts(text){const st=[];let rest=text.trim();const isS=(s,inR)=>{if(!inR&&(/^(sys\.|call\s|RET\b)/.test(s)||/^[a-z]\w+\.[a-z]\w*/.test(s)))return true;return/^->/.test(s)||/^[#%~$?][a-zA-Z_]\w*\s*=(?!=)/.test(s);};while(rest.length>0){if(!isS(rest,false)){st.push(rest);break;}let end=-1,inS=false,inR=false,pos=1;while(pos<rest.length){const c=rest[pos];if(c==='"')inS=!inS;if(!inS){if(c==='='&&rest[pos+1]!=='='&&rest[pos-1]!=='!'&&rest[pos-1]!=='<'&&rest[pos-1]!=='>')inR=true;if((c===' '||c==='\t')&&isS(rest.slice(pos+1),inR)){end=pos;break;}}pos++;}if(end>0){st.push(rest.slice(0,end).trim());rest=rest.slice(end).trim();}else{st.push(rest.trim());break;}}return st.filter(s=>s&&!s.startsWith(';'));}
   _translateIf(text,bt,bn,ln){const m=text.match(/^\s*if\s+/);if(!m)return'/* bad if */';const after=text.slice(m[0].length);let bO=-1,inS=false;for(let i=0;i<after.length;i++){if(after[i]==='"')inS=!inS;if(!inS&&after[i]==='{'){bO=i;break;}}if(bO<0)return'/* no { */';const cond=after.slice(0,bO).trim();let bC=-1;inS=false;for(let i=after.length-1;i>=bO;i--){if(after[i]==='"')inS=!inS;if(!inS&&after[i]==='}'){bC=i;break;}}if(bC<0)return'/* no } */';const inner=after.slice(bO+1,bC).trim(),condJ=this._expr(cond);const branches=this._splitComma(inner).filter(b=>b.trim());const isJT=branches.length>1&&branches.every(b=>/^\s*(\d+|\*)\s*:/.test(b));if(isJT){let out=`switch(${condJ}){\n`;for(const br of branches){let ci=-1,inS=false;for(let i=0;i<br.length;i++){if(br[i]==='"')inS=!inS;if(!inS&&br[i]===':'){ci=i;break;}}if(ci<0)continue;const k=br.slice(0,ci).trim(),act=br.slice(ci+1).trim(),cl=k==='*'?'default':`case ${k}`,tr=act.startsWith('->')?this._jump(act):(this._line(act,bt,bn,ln)||act+';');out+=`  ${cl}: ${tr} break;\n`;}return out+'}';}const stmts=this._splitStmts(inner);let body='';for(const s of stmts){const t=this._line(s,bt,bn,ln);if(t)body+=`\n  ${t}`;}return`if(${condJ}){${body}\n}`;}
   _strip(raw){let inS=false;for(let i=0;i<raw.length;i++){if(raw[i]==='"')inS=!inS;if(!inS&&raw[i]===';')return raw.slice(0,i);}return raw;}
-  // ── &pure バリデーション ──────────────────────────────────────────
+  // &pure ホワイトリスト: sys.f 内で許可される純粋パターン (5-1)
+  _isSysFPure(expr){
+    // 禁止パターンの検出
+    const forbidden=[/\blocalStorage\b/,/\bsessionStorage\b/,/\bfetch\b/,/\bdocument\b/,
+      /\bsph\.call\b/,/\bsph\._safeCall\b/,/\bsys\.screen\.poke\b/,
+      /=[^=]/,/\beval\b/,/\bFunction\b/];
+    for(const p of forbidden)if(p.test(expr))return false;
+    return true;
+  }
   _checkPure(line,bn,ln){
     const bad=[/\.push\(/,/\.pop\(/,/\.splice\(/,/localStorage/,/sessionStorage/,/sph\.call\(/,/sph\._safeCall\(/,/console\./,/fetch\(/,/XMLHttpRequest/];
     for(const p of bad)if(p.test(line)){this._warn('W010',[ln,bn,p.source]);break;}
@@ -410,34 +540,61 @@ class Compiler{
   }
   _line(raw,bt,bn,ln){
     const line=this._strip(raw).trim();if(!line||line==='}')return null;
-    const pOk=/^sys\.(f|input\.|screen\.(width|height|idx|poke))\b/.test(line);
+    // sys.screen.poke を purity ホワイトリストから削除 (5-2)
+    const pOk=/^sys\.(f|input\.|screen\.(width|height|idx))\b/.test(line);
     if(bt==='&'&&line.startsWith('sys.')&&!pOk){this._err('E001',[ln,bn]);return'/* PURITY */';}
+    // sys.f の内容を純粋性検査 (5-1)
+    if(bt==='&'&&line.startsWith('sys.f ')){
+      const m2=line.match(/^sys\.f\s+"(.*)"$/);
+      if(m2&&!this._isSysFPure(m2[1])){this._err('E001',[ln,bn]);return'/* PURITY:sys.f */';}
+    }
     if(bt==='&')this._checkPure(line,bn,ln);
     if(line.startsWith('->'))return this._jump(line);
     if(line.startsWith('sys.'))return this._sys(line)+';';
     if(line==='RET')return'pc_ret=null; break;';
     if(line.startsWith('RET '))return`pc_ret=${this._expr(line.slice(4).trim())}; break;`;
-    if(line.startsWith('call ')){const rest=line.slice(5).trim(),bi=rest.indexOf('['),traw=bi>=0?rest.slice(0,bi).trim():rest,tgt=traw.replace(/^[&!@]/,'');if(bi>=0){const ar=rest.slice(bi+1,rest.lastIndexOf(']')),args=ar.split(',').map(a=>this._expr(a.trim())).filter(a=>a!=='');return`pc_ret=await callBlock("${tgt}",[${args.join(',')}]);`;}return`pc_ret=await callBlock("${tgt}",[]);`;}
-    // ext.method $arg1 $arg2  →  await sph.call('ext.method',[arg1,arg2])
-    // $result = ext.method $arg  →  戻り値代入
+    // call &pure を同期で扱う: &pureブロックから&pureを呼ぶ場合はawait不要 (2-1)
+    if(line.startsWith('call ')){
+      const rest2=line.slice(5).trim(),bi2=rest2.indexOf('['),traw2=bi2>=0?rest2.slice(0,bi2).trim():rest2,tgt2=traw2.replace(/^[&!@]/,'');
+      const isPureCall=bt==='&'&&this._btype[tgt2]==='&';
+      const aw=isPureCall?'':'await ';
+      if(bi2>=0){const ar2=rest2.slice(bi2+1,rest2.lastIndexOf(']')),args2=ar2.split(',').map(a=>this._expr(a.trim())).filter(a=>a!=='');return`pc_ret=(${aw}callBlock("${tgt2}",[${args2.join(',')}]));`;}
+      return`pc_ret=(${aw}callBlock("${tgt2}",[]));`;
+    }
+    // if文のネストをサポート: ブロック内のインラインifは _translateIf に委譲 (4-1)
+    if(line.match(/^if\b/)&&line.includes('{')){
+      return this._translateIf(line,bt,bn,ln);
+    }
     const extAssign=line.match(/^([#%~$?][a-zA-Z_]\w*)\s*=\s*([a-z]\w+\.[a-z]\w*(?:\.[a-z]\w*)?)(.*)/s);
     if(extAssign){
       const[,lhs,api,rawArgs]=extAssign;
       const args=this._tok(rawArgs.trim()).map(t=>this._expr(t));
       const callExpr=`(await sph._safeCall("${api}",[${args.join(',')}]))`;
       const lj=this._addr(lhs),s=lhs[0];
-      switch(s){case'#':return`${lj}=${this._castI(callExpr,lhs.slice(1))};`;case'$':return`${lj}=String(${callExpr}??'');`;case'%':return`${lj}=${this._castF(callExpr,lhs.slice(1))};`;case'?':return`${lj}=+(${callExpr}??0);`;}
+      switch(s){case'#':return`${lj}=${this._castI(callExpr,lhs.slice(1))};`;case'$':return`${lj}=String(${callExpr}??'');`;case'%':return`${lj}=${this._castF(callExpr,lhs.slice(1))};`;case'?':return`${lj}=${callExpr}??null;`;}
     }
     if(/^[a-z]\w+\.[a-z]\w*/.test(line)){const dot=line.indexOf('.'),ns=line.slice(0,dot),rest=line.slice(dot+1),sp=rest.search(/\s/),cmd=sp>=0?rest.slice(0,sp):rest,raw2=sp>=0?rest.slice(sp+1).trim():'',args=raw2?this._tok(raw2).map(a=>this._expr(a)):[];return`await sph._safeCall("${ns}.${cmd}",[${args.join(',')}]);`;}
     if(/^@[A-Za-z_][\w.]*/.test(line)){const m2=line.match(/^@([A-Za-z_][\w.]*)(?:\s*\[([^\]]*)\])?$/);if(m2){const a2=m2[2]?m2[2].split(',').map(a=>this._expr(a.trim())).filter(a=>a!==''):[];return a2.length?`pc_ret=await callBlock("${m2[1]}",[${a2.join(',')}]);`:`pc_ret=await callBlock("${m2[1]}",[]);`;}}
     const am=line.match(/^([#%~$?][a-zA-Z_]\w*)\s*=\s*\[([^\]]*)\]/);
     if(am){const s=am[1][0],n=am[1].slice(1),els=am[2].split(',').map(e=>e.trim()).filter(e=>e!==''),base=this._slot(s,n,els.length);return els.map((el,i)=>{const sl=base+i,ej=this._expr(el);switch(s){case'#':return`i32[${sl}]=${this._castI(ej,n+'['+i+']')};`;case'$':return`str[${sl}]=(${ej});`;case'%':return`f64[${sl}]=${this._castF(ej,n+'['+i+']')};`;case'~':return`u64[${sl}]=BigInt(${ej});`;}}).join('\n  ');}
+    const qw=line.match(/^\?([a-zA-Z_]\w*)\[([^\]]+)\]\.(\d+)\s*=(?!=)\s*(.*)/s);
+    if(qw){const[,qn,idR,sl,rR]=qw;const ij=this._expr(idR),rj=this._expr(rR.trim());
+      return`{const _qi=(${ij})|0,_qs=qschema['${qn}'],_qi2=q.get(_qi)?.idx;if(_qs&&_qi2!=null){const _t=_qs[${sl}]?.type;if(_t==='#')i32[_qi2[${sl}]]=${this._castI(rj,'?field')};else if(_t==='%')f64[_qi2[${sl}]]=${this._castF(rj,'?field')};else if(_t==='$')str[_qi2[${sl}]]=${rj};else if(_t==='~')u64[_qi2[${sl}]]=BigInt(${rj});}}`;}
+    const qc=line.match(/^\?([a-zA-Z_]\w*)\[([^\]]+)\]\s*=(?!=)\s*(.*)/s);
+    if(qc){const[,qn,idR]=qc;const ij=this._expr(idR);
+      return`{const _qi=(${ij})|0;if(qschema['${qn}'])q.set(_qi,{schema:qschema['${qn}'],idx:_q_alloc(qschema['${qn}'],q_slot)});}`;}
     const dm=line.match(/^([#%~$?])([a-zA-Z_]\w*)\[([^\]]+)\]\s*=(?!=)\s*(.*)/s);
     if(dm){const[,s,n,iR,rR]=dm,base=this._slot(s,n),ij=this._expr(iR),rj=this._expr(rR.trim());switch(s){case'#':return`i32[${base}+(${ij})|0]=${this._castI(rj,n)};`;case'$':return`str[${base}+(${ij})|0]=(${rj});`;case'%':return`f64[${base}+(${ij})|0]=${this._castF(rj,n)};`;case'~':return`u64[BigInt(${base})+BigInt(${ij})]=BigInt(${rj});`;}}
+    // ローカル変数: 型プレフィックス付きJS変数名で衝突を防ぐ (3-1)
     const lv=line.match(/^([#%~$?])(_[a-zA-Z]\w*)\s*=(?!=)\s*(.*)/s);
-    if(lv){const[,s,jn,rR]=lv,rj=this._expr(rR.trim()),d=this._locals.has(jn)?'':'let ';if(!this._locals.has(jn))this._locals.add(jn);switch(s){case'#':return`${d}${jn}=${this._castI(rj,jn)};`;case'$':return`${d}${jn}=String(${rj});`;case'%':return`${d}${jn}=${this._castF(rj,jn)};`;case'~':return`${d}${jn}=BigInt(${rj});`;}}
+    if(lv){
+      const[,s,jn,rR]=lv,rj=this._expr(rR.trim());
+      const jvn=this._localName(s,jn); // 型プレフィックス付き
+      const d=this._locals.has(jvn)?'':'let ';if(!this._locals.has(jvn))this._locals.set(jvn,s);
+      switch(s){case'#':return`${d}${jvn}=${this._castI(rj,jn)};`;case'$':return`${d}${jvn}=String(${rj});`;case'%':return`${d}${jvn}=${this._castF(rj,jn)};`;case'~':return`${d}${jvn}=BigInt(${rj});`;}
+    }
     const sa=line.match(/^([#%~$?][a-zA-Z][a-zA-Z0-9_]*)\s*=(?!=)\s*(.*)/s);
-    if(sa){const lhs=sa[1],rhs=sa[2].trim(),lj=this._addr(lhs),rj=this._expr(rhs),s=lhs[0];switch(s){case'#':return`${lj}=${this._castI(rj,lhs.slice(1))};`;case'$':return`${lj}=String(${rj});`;case'%':return`${lj}=${this._castF(rj,lhs.slice(1))};`;case'~':return`${lj}=BigInt(${rj});`;case'?':return`${lj}=+(${rj});`;}}
+    if(sa){const lhs=sa[1],rhs=sa[2].trim();this._checkType(lhs,rhs,ln);const lj=this._addr(lhs),rj=this._expr(rhs),s=lhs[0];switch(s){case'#':return`${lj}=${this._castI(rj,lhs.slice(1))};`;case'$':return`${lj}=String(${rj});`;case'%':return`${lj}=${this._castF(rj,lhs.slice(1))};`;case'~':return`${lj}=BigInt(${rj});`;case'?':return`${lj}=${rj}??null;`;}}
     this._warn('W004',[ln,line.slice(0,40)]);return`/* unknown */`;
   }
   _resolve(src,libs,docs){
@@ -449,6 +606,21 @@ class Compiler{
       if(md){if(docs?.[md[1]])this.docs.push(md[1]);else this._warn('W002',[md[1]]);continue;}
       const mm=line.trim().match(/^mem\.(i32|f64|u64)\s+(\d+)$/);
       if(mm){this.memOpts[mm[1]]=parseInt(mm[2]);continue;}
+      // ── =: 配列サイズ宣言: #name =: [N] / %name =: [N] / ~name =: [N] / $name =: [N] ──
+      const mz=line.trim().match(/^([#%~$])([a-zA-Z_]\w*)\s*=:\s*\[(\d+)\]$/);
+      if(mz){const[,s,n,sz]=mz;this._slot(s,n,+sz);this.len[s][n]=+sz;continue;}
+      // ── =: 動的サイズ宣言: %name =: [?unknown] など ──────────────────────
+      const md2=line.trim().match(/^([#%~$])([a-zA-Z_]\w*)\s*=:\s*\[\?(\w+)\]$/);
+      if(md2){const[,s,n]=md2;this._slot(s,n,1);this.len[s][n]=null;continue;}// null=動的
+      // ── ?型スキーマ宣言: ?name =: [#f1, %f2, ...] ────────────────────────
+      const mq=line.trim().match(/^(\?)([a-zA-Z_]\w*)\s*=:\s*\[(.*)\]$/);
+      if(mq){
+        const[,,qn,raw]=mq;
+        const fields=raw.split(',').map(f=>f.trim()).filter(Boolean);
+        const schema=fields.map((f,i)=>({type:f[0],field:f.slice(1),slot:i}));
+        rest.push(`qschema['${qn}']=${JSON.stringify(schema)};`);
+        continue;
+      }
       const mb=line.trim().match(/^mem\s+(\d+)$/);
       if(mb){const kb=parseInt(mb[1]);if(!this.memOpts.i32)this.memOpts.i32=kb;if(!this.memOpts.f64)this.memOpts.f64=kb;if(!this.memOpts.u64)this.memOpts.u64=kb;continue;}
       // ── schema: D層スキーマ定義キーワード ───────────────────────────
@@ -473,7 +645,7 @@ class Compiler{
       }
       rest.push(line);
     }
-    return[...rest,...libSrcs].join('\n');
+    return[...libSrcs,...rest].join('\n'); // lib を先頭に展開してスキーマ即時利用可 (4-4)
   }
   // ── LL(1) single-pass streaming compile ─────────────────────────────────
   // No AST constructed ? each line is emitted directly to the target block buffer.
@@ -482,7 +654,6 @@ class Compiler{
   //   !name  → action block   (async, side-effects allowed)
   //   @name  → loop block     (async, wrapped in while+guard)
   compile(src,libs={},docs={}){
-    emit('compile-start',{src,libs});
     this._reset();
     src=this._resolve(src,libs,docs);
     const lines=src.split('\n');
@@ -493,7 +664,8 @@ class Compiler{
       if(!cb.length)return;
       const body=cb.join('\n');
       const isPub=this._pubs.includes(cn);
-      const hasAsync=body.includes('await ');
+      // hasAsync: 実際のawaitトークンで判定。sys.f "await ..." の誤検知を防ぐ (4-3)
+      const hasAsync=/\bawait\s+/.test(body);
       // &pure + async is an error
       if(ct==='&'&&hasAsync){this._err('E006',[cn]);}
       // Append to __top__ if already exists (multi-segment)
@@ -502,8 +674,11 @@ class Compiler{
               before=ri>=0?ex.slice(0,ri):ex,after=ri>=0?ex.slice(ri):'';
         registry['__top__'].body=before+body+'\n'+after;
       } else {
-        // @loop: body wrapped with sph._loop guard + yield
-        // Uses named loop ID for external break support
+        // ブロック重複定義チェック (2-2)
+        if(cn!=='__top__'&&this._blockNames.has(cn)){
+          this._warn('W013',[cn]);
+        }
+        this._blockNames.add(cn);
         let blockBody=body;
         if(ct==='@'){
           blockBody=`const _loopId=${JSON.stringify(cn)};while(await sph._loop(_loopId,signal)){\n${body}\n}`;
@@ -516,9 +691,13 @@ class Compiler{
     for(let i=0;i<lines.length;i++){
       const raw=lines[i];
       const s=this._strip(raw).trim();
-      // PUB declaration
+      // PUB declaration (トップレベルのみ有効、インデント行は W014)
       if(!raw.match(/^\s/)&&s.match(/^PUB\s+/)){
         const pn=s.slice(4).trim();if(pn)this._pubs.push(pn);continue;
+      }
+      // PUB がインデントされていたら無視 + W014 (2-4)
+      if(raw.match(/^\s/)&&s.match(/^PUB\s+/)){
+        this._warn('W014',[i+1,s.slice(4).trim()]);continue;
       }
       // Block header: &name, !name, @name
       if(!raw.match(/^\s/)&&s.match(/^[&!@]/)){
@@ -527,17 +706,18 @@ class Compiler{
         const decl=s.slice(1),argsM=decl.match(/\[([^\]]*)\]/);
         cn=decl.replace(/\s*\{.*/,'').trim().replace(/\[.*\]/,'').trim();
         cb=[];this._locals=new Set();
-        // Arg unpacking ? emitted directly as JS let statements
+        // Arg unpacking: type-prefixed JS names to prevent cross-sigil collision (3-1)
         if(argsM){
           argsM[1].split(',').map(a=>a.trim()).filter(a=>a).forEach((tok,ai)=>{
             const sg=tok[0],jn=tok.slice(1);
-            this._locals.add(jn);
+            const jvn=this._localName(sg,jn); // 型プレフィックス付き
+            this._locals.set(jvn,sg);
             switch(sg){
-              case'#':cb.push(`  let ${jn}=(_args[${ai}]|0);`);break;
-              case'$':cb.push(`  let ${jn}=String(_args[${ai}]??'');`);break;
-              case'%':cb.push(`  let ${jn}=+(_args[${ai}]??0);`);break;
-              case'~':cb.push(`  let ${jn}=BigInt(_args[${ai}]??0);`);break;
-              default:cb.push(`  let ${jn}=_args[${ai}]??0;`);
+              case'#':cb.push(`  let ${jvn}=(_args[${ai}]|0);`);break;
+              case'$':cb.push(`  let ${jvn}=String(_args[${ai}]??'');`);break;
+              case'%':cb.push(`  let ${jvn}=+(_args[${ai}]??0);`);break;
+              case'~':cb.push(`  let ${jvn}=BigInt(_args[${ai}]??0);`);break;
+              default:cb.push(`  let ${jvn}=_args[${ai}]??0;`);
             }
           });
         }
@@ -556,14 +736,14 @@ class Compiler{
       if(js)cb.push('  '+js);
     }
     commit();
-    if(!registry['__top__']?.body.includes('return '))this._err('E002',[]);
+    // E002: エントリポイント検査をsys.stopも含めて強化 (4-5)
+    const topBody=registry['__top__']?.body||'';
+    if(!topBody.includes('return ')&&!topBody.includes('sph.call("sys.stop"'))this._err('E002',[]);
     const mo=this.memOpts;
     if((this.slot['#']||0)>((mo.i32||16)*1024/4|0))this._warn('W005',['i32']);
     if((this.slot['%']||0)>((mo.f64||16)*1024/8|0))this._warn('W005',['f64']);
-    const result={registry,memOpts:mo,docs:this.docs,errors:this.errors,warnings:this.warns};
-    emit('compile-done',{errors:this.errors,warnings:this.warns,ok:this.errors.length===0});
-    for(const e of this.errors)emit('error',e);
-    for(const w of this.warns)emit('warn',w);
+    if((this.slot['~']||0)>((mo.u64||4)*1024/8|0))this._warn('W005',['u64']); // (3-4)
+    const result={registry,memOpts:mo,docs:this.docs,errors:this.errors,warnings:this.warns,sym:this.sym,len:this.len};
     return result;
   }
 }
@@ -602,12 +782,27 @@ function _registerSys(mem,signal,logFn,docs){
     'sys.input.any_key':()=>Input.keys.size>0?1:0,
     'sys.input.mouse_x':()=>Input.mouseX,
     'sys.input.mouse_y':()=>Input.mouseY,
+    // ── sys.screen.*: ゴーストAPI実体化 (2.13) ─────────────────
+    'sys.screen.width': ()=>window.innerWidth,
+    'sys.screen.height':()=>window.innerHeight,
+    'sys.screen.idx':   ()=>_curSection,
+    // sys.screen.poke は purity違反のため削除 (5-2)
+    // ── sys.dom.* ───────────────────────────────────────────────
     'sys.dom.set_text':(id,v)=>{const el=document.getElementById(String(id));if(el)el.textContent=String(v);},
     'sys.dom.show':(id)=>{const el=document.getElementById(String(id));if(el)el.style.display='';},
     'sys.dom.hide':(id)=>{const el=document.getElementById(String(id));if(el)el.style.display='none';},
     'sys.dom.get_val':(id)=>{const el=document.getElementById(String(id));return el?el.value:'';},
     'sys.dom.set_val':(id,v)=>{const el=document.getElementById(String(id));if(el)el.value=String(v);},
-    'sys.dom.mount':(docName,parentId)=>{const html=docs[docName];if(!html)return;const parent=parentId==='body'?document.body:document.getElementById(String(parentId));if(!parent)return;const tmp=document.createElement('div');tmp.innerHTML=html;for(const s of tmp.querySelectorAll('style'))document.head.appendChild(s.cloneNode(true));while(tmp.firstChild)parent.appendChild(tmp.firstChild);},
+    // sys.dom.mount: parentId が渡された場合はそのIDに対してマウント (2.14)
+    'sys.dom.mount':(docName,parentId)=>{
+      const html=docs[docName];if(!html)return;
+      const parent=parentId==='body'?document.body
+        :(parentId?document.getElementById(String(parentId)):null)
+        ||(document.getElementById('run-mount')||document.body);
+      const tmp=document.createElement('div');tmp.innerHTML=html;
+      for(const s of tmp.querySelectorAll('style'))document.head.appendChild(s.cloneNode(true));
+      while(tmp.firstChild)parent.appendChild(tmp.firstChild);
+    },
     'sys.section.show':(id)=>_setSection(id),
     'sys.section.get':()=>_curSection,
     // ── DIVD v2: Definition / Injection / Validation / Default ─────────
@@ -650,9 +845,44 @@ function _registerSys(mem,signal,logFn,docs){
     'sys.divd.cache.clear':()=>{if(window._divdCache)window._divdCache.clear();},
   };
   for(const[n,f]of Object.entries(sys))_reg.set(n,f);
+  // ── [v16] ext.math.exec: 安全な数式評価 EXT ─────────────────────────
+  // DSLから sys.f の代わりに使う安全な数値演算エンドポイント
+  // グローバル遮断・括弧カウント検証・有限値チェック付き
+  _reg.set('ext.math.exec',(expr,vars)=>{
+    if(typeof expr!=='string')throw new Error('ext.math.exec: expr must be string');
+    const result=_safeEval(expr,vars);
+    if(Number.isNaN(result))throw new Error(`ext.math.exec: Invalid expression: ${String(expr).slice(0,40)}`);
+    return result;
+  });
+  // ext.math.exec をホワイトリストに追加（_registerSys呼び出し時に確実に登録）
+  ALLOWED_EXT.add('ext.math.exec');
 }
 function _build(registry,mem,logFn,debug=false,signal=null){
-  const cache={};const{i32,f64,u64,str}=mem;
+  const cache={};const{i32,f64,u64,str,q,qschema,q_slot,qlit}=mem;
+  // ── _q_alloc: フリーリスト方式スロット確保 (2.6) ──────────────
+  // ループ外で1回だけ定義（v14の毎回再定義バグを修正）
+  const _q_alloc=(schema,qs)=>{
+    const idx={};
+    for(let i=0;i<schema.length;i++){
+      const{type}=schema[i];
+      if(qs[type]!==undefined){
+        // フリーリストがあれば再利用、なければ新規確保
+        idx[i]=qs[type].free.length>0?qs[type].free.pop():qs[type].cur++;
+      }
+    }
+    return{schema,idx};
+  };
+  // sys.q.free: オブジェクトのスロットを解放してフリーリストに戻す
+  _reg.set('sys.q.free',(id)=>{
+    const entry=q.get(id);
+    if(!entry)return;
+    const{schema,idx}=entry;
+    for(let i=0;i<schema.length;i++){
+      const{type}=schema[i];
+      if(idx[i]!==undefined&&q_slot[type])q_slot[type].free.push(idx[i]);
+    }
+    q.delete(id);
+  });
   // ── sph._loop: @loop ブロックの安全なループ制御 ──────────────
   const _loopState=new Map();
   sph._loop=async(id,sig)=>{
@@ -695,7 +925,8 @@ function _build(registry,mem,logFn,debug=false,signal=null){
     if(name==='__params')continue;
     try{
       const _sphDSL=_makeSphForDSL();
-      const _sandbox=_makeDSLSandbox({i32,f64,u64,str,sph:_sphDSL,callBlock,signal});
+      // _q_alloc は外で1回定義済み（v14の毎回再定義バグ修正）
+      const _sandbox=_makeDSLSandbox({i32,f64,u64,str,q,qschema,q_slot,qlit,_q_alloc,sph:_sphDSL,callBlock,signal});
       // with(sandbox) でグローバルを遮断しつつ、関数本体は strict で実行
       cache[name]=new Function('__sb',
         `return with(__sb){(${block.hasAsync===false?'function':'async function'} _${name.replace(/\W/g,'_')}(..._args){"use strict";let pc_ret=null,_w=0;while(true){\n${block.body}\nbreak;}return pc_ret;})}`
@@ -718,18 +949,36 @@ function _runtimeWarn(code,args){
   _warnedCasts.add(key);
   emit('warn',{code,args,severity:'warn',phase:'runtime'});
 }
+function _throwOOB(name,idx,size){
+  const e={code:'E014',args:[name,idx,size],severity:'error',phase:'runtime'};
+  emit('error',e);
+  throw new Error('E014');
+}
 async function run(registry,opts={}){
   const signal={stopped:false};_curSignal=signal;
   _warnedCasts.clear();
+  _callDepthCurrent=0; // reset depth on new run
   const logFn=opts.log||((cls,msg)=>console.log(`[sph:${cls}]`,msg));
   const mem=createMem(opts.mem||{});
-  _registerSys(mem,signal,logFn,opts.docs||{},opts.debug||false);
-  const{cache}=_build(registry,mem,logFn,opts.debug||false,signal);
+  _registerSys(mem,signal,logFn,opts.docs||{});
+  // debug: trueを明示的に渡してブロックトレースを有効化 (2.15)
+  const debugMode=opts.debug??(_reg.get('sph.debug.enabled')??false);
+  const{cache}=_build(registry,mem,logFn,debugMode,signal);
   if(!registry['__top__']){
     const e={code:'E002',args:[],severity:'error',phase:'runtime'};
     emit('error',e);logFn('err',e);return false;
   }
   emit('run-start',{entry:'__top__'});
+  // dsl.trigger: EXTからDSLの公開ブロックを呼ぶ正式API
+  // 実行中のみ有効。停止後は自動で解除される
+  sph.register('dsl.trigger',async(blockName,args=[])=>{
+    if(signal.stopped)return null;
+    const fn=cache[blockName];
+    if(!fn){emit('warn',{code:'W010',args:['dsl.trigger:'+blockName],severity:'warn',phase:'runtime'});return null;}
+    try{return await fn(...args);}catch(e){
+      if(e?.message==='E014'){signal.stopped=true;return null;}
+      emit('error',{code:'E004',args:[blockName,e.message],severity:'error',phase:'runtime'});return null;}
+  });
   let current='__top__';
   while(current){
     if(signal.stopped){logFn('ok','STOP');break;}
@@ -741,12 +990,14 @@ async function run(registry,opts={}){
     try{current=await fn();}
     catch(e){
       if(e?.message==='STOP'){logFn('ok','STOP');signal.stopped=true;break;}
+      if(e?.message==='E014'){signal.stopped=true;break;}
       const ev={code:'E004',args:[current,e.message],severity:'error',phase:'runtime'};
       emit('error',ev);logFn('err',ev);break;
     }
   }
   const result=signal.stopped?'stopped':true;
   emit('run-end',{result});
+  sph.register('dsl.trigger',()=>null); // 実行終了で無効化
   return result;
 }
 function stop(){if(_curSignal)_curSignal.stopped=true;}
@@ -901,10 +1152,11 @@ register('sph.loop.maxIter',  1000000); // @loop 反復上限
 register('sph.loop.maxMs',    10000);   // @loop タイムアウト(ms)
 register('sph.ext.timeout',   5000);    // _safeCall タイムアウト(ms)
 register('sph.mem.strCap',    1000);    // str[] 上限スロット数
+register('sph.debug.enabled', false);   // DEBUG EXT が true にする (2.15)
 
 // ── sph._safeCall: DSLからのEXT API呼び出し用 安全ラッパー ──────
-// タイムアウト(デフォルト5秒)付き、エラーはsph:errorに集約、暴走しない
-// sph.register('sph.ext.timeout', 8000) で上書き可
+// タイムアウト(デフォルト5秒)付き、callDepth監視付き (2.15)
+let _callDepthCurrent=0;
 async function _safeCall(name,args=[]){
   const v=_reg.get(name);
   if(v===undefined){
@@ -912,15 +1164,21 @@ async function _safeCall(name,args=[]){
     return null;
   }
   if(typeof v!=='function')return v;
+  const _maxDepth=_reg.get('sph.ext.callDepth')??32;
+  if(_callDepthCurrent>=_maxDepth){
+    emit('error',{code:'E016',args:[name,_callDepthCurrent],severity:'error',phase:'ext.call'});
+    return null;
+  }
   const _extTimeout=_reg.get('sph.ext.timeout')??5000;
   let timer;
   const timeoutP=new Promise((_,rej)=>{timer=setTimeout(()=>rej(new Error('EXT_TIMEOUT')),_extTimeout);});
+  _callDepthCurrent++;
   try{
     const r=v(...args);
     const result=await Promise.race([r instanceof Promise?r:Promise.resolve(r),timeoutP]);
-    clearTimeout(timer);return result;
+    clearTimeout(timer);_callDepthCurrent--;return result;
   }catch(e){
-    clearTimeout(timer);
+    clearTimeout(timer);_callDepthCurrent=Math.max(0,_callDepthCurrent-1);
     const code=e?.message==='EXT_TIMEOUT'?'E012':'E011';
     const eArgs=code==='E012'?[name,_extTimeout]:[name,e?.message??String(e)];
     emit('error',{code,args:eArgs,severity:'error',phase:'ext.call'});
@@ -929,8 +1187,22 @@ async function _safeCall(name,args=[]){
 }
 window.sph={compile:(src,libs,docs)=>compiler.compile(src,libs,docs),run,stop,register,call,get,emit,
   mount,unmount,ui:sph_ui,_safeCall,
-  runtimeSrc:()=>document.getElementById('sph-core')?.textContent||'',_reg,_mounts,_runtimeWarn,
-  _loopBreak:null,_loopStop:null,_loopStopAll:null};
+  runtimeSrc:()=>document.getElementById('sph-core')?.textContent||'',_reg,_mounts,_runtimeWarn,_throwOOB,
+  _loopBreak:null,_loopStop:null,_loopStopAll:null,
+  // [v16] EXT ホワイトリスト管理
+  ext:{
+    allow:(name)=>ALLOWED_EXT.add(name),
+    isAllowed:(name)=>ALLOWED_EXT.has(name),
+  },
+  // [v16] ホワイトリスト検証付きEXT呼び出し（DSLブロック内から使用）
+  _extCall:async(name,args)=>{
+    if(!ALLOWED_EXT.has(name)){
+      emit('warn',{code:'W-EXT',args:[name,'Blocked EXT call — use sph.ext.allow(name) to permit'],severity:'warn',phase:'runtime'});
+      return null;
+    }
+    return _safeCall(name,args);
+  },
+};
 
 // ── _sphForDSL: DSL実行用の制限版sphプロキシ ────────────────────
 // DSLブロックには sph._reg / register / compile / run / mount を渡さない
@@ -951,6 +1223,7 @@ function _makeSphForDSL(){
     _loopStop:   (...a)=>sph._loopStop?.(...a),
     _loopStopAll:(...a)=>sph._loopStopAll?.(...a),
     _runtimeWarn:(...a)=>_runtimeWarn?.(...a),
+    _throwOOB:   (name,idx,size)=>_throwOOB(name,idx,size),
     // _reg / register / compile / run / mount は渡さない
   });
 }
@@ -974,7 +1247,7 @@ const _DSL_GLOBALS_ALLOW=new Set([
   'setTimeout','clearTimeout','requestAnimationFrame','cancelAnimationFrame',
   'queueMicrotask','structuredClone',
   // SAPPHIREスコープ変数（引数として渡されるもの）
-  'i32','f64','u64','str','sph','callBlock','signal',
+  'i32','f64','u64','str','q','qschema','q_slot','qlit','_q_alloc','sph','callBlock','signal',
   // ループ用ローカル
   'pc_ret','_w','_args',
 ]);
@@ -1055,21 +1328,32 @@ async function resolveSrc(src){if(!src)return null;if(src.startsWith('local:')){
 // Parse EXT HTML and inject parts into the IDE (shared logic)
 function injectExtDoc(doc,extId,srcUrl){
   const env=_extEnvWithPerms(extId);
+  // sph/tab (DSL/LIB/DOC) をIDEのタブシステムに追加
+  for(const s of doc.querySelectorAll('script[type="sph/tab"]')){
+    const n=s.dataset.tabName,t=s.dataset.tabType||'dsl';
+    if(n)sph.call('ide.tab.add',[t,n,s.textContent,extId]);
+  }
+  for(const s of doc.querySelectorAll('section[id]')){
+    sph.call('ide.tab.add',['section',s.id,s.outerHTML,extId]);
+  }
+  // sph/ext JS を実行
   for(const s of doc.querySelectorAll('script[type="sph/ext"]')){
     try{new Function('sph','$id','$','$$','mk','on',s.textContent)
         (window.sph,env.$id,env.$,env.$$,env.mk,env.on);}
     catch(e){console.warn(`[sph-boot] ext "${extId}" error`,e.name||e);}
   }
-  // Fire event with src → extmgr registers as builtin=false
+  // consumes検証: sph/metaのconsumesに列挙されたEXTがmount済みかチェック
+  const metaEl=doc.querySelector(`script[type="sph/meta"]`);
+  if(metaEl){try{
+    const consumes=(JSON.parse(metaEl.textContent).consumes)||[];
+    for(const dep of consumes){
+      if(!_reg.has(dep+'.label'))
+        emit('warn',{code:'W012',args:[extId,dep],severity:'warn',phase:'ext-load'});
+    }
+  }catch(_){}}
   sph.emit('ext-loaded',{id:extId, src:srcUrl||null});
 }
-function _extEnv(){return{
-  $id:id=>document.getElementById(id),
-  $:s=>document.querySelector(s),
-  $$:s=>[...document.querySelectorAll(s)],
-  mk:tag=>document.createElement(tag),
-  on:(el,ev,fn)=>el?.addEventListener(ev,fn),
-};}
+function _extEnv(){return{$id,$ ,$$,mk,on:(el,ev,fn)=>el?.addEventListener(ev,fn)};}
 
 // ── EXT用Proxyビルダー: sph/metaのpermissionsに基づき制限 ────
 // permissions に宣言されていない機能はundefinedを返す
@@ -1168,6 +1452,17 @@ document.addEventListener('DOMContentLoaded',async()=>{
   if(!stateData&&params.src)stateData=await resolveSrc(params.src);
   const extList=params.ext.length>0?params.ext:[...document.querySelectorAll('script[type="sph/ext"][data-ext-id]')].map(e=>e.dataset.extId);
   for(const id of extList){if(id.startsWith('url:')||id.startsWith('http'))await loadExtUrl(id);else loadExtInline(id);}
+  // consumes一括検証: 全EXTロード後に依存関係をチェック
+  for(const el of document.querySelectorAll('script[type="sph/meta"][data-ext-id]')){
+    try{
+      const eid=el.dataset.extId;
+      const consumes=(JSON.parse(el.textContent).consumes)||[];
+      for(const dep of consumes){
+        if(!_reg.has(dep+'.label'))
+          emit('warn',{code:'W012',args:[eid,dep],severity:'warn',phase:'boot'});
+      }
+    }catch(_){}
+  }
   if(typeof sphIdeInit==='function')sphIdeInit(stateData,params);
   // Expose encodeCfg to Registry (callable from APPEARANCE EXT)
   sph.register('ide.url.copy',async()=>{
@@ -1431,13 +1726,17 @@ async function runDSL(){
     btn.textContent='? RUN';btn.classList.remove('running');stat.className='';
     _exitRun();sph.emit('stop',{result:'user'});return;
   }
-  const{registry,memOpts,errors,warnings}=sph.compile(src,getLibs(),getDocs());
+  const libs=getLibs(),docs=getDocs();
+  emit('compile-start',{src,libs});
+  const{registry,memOpts,errors,warnings,sym}=sph.compile(src,libs,docs);
+  emit('compile-done',{errors,warnings,ok:errors.length===0});
+  for(const e of errors)emit('error',e);
+  for(const w of warnings)emit('warn',w);
   for(const w of warnings)log('warn',w);
   if(errors.length){for(const e of errors)log('err',e);stat.className='err';return;}
   _enterRun();
   // Redirect sys.dom.mount to run-mount (only during RUN)
   const savedMount=sph._reg.get('sys.dom.mount');
-  const docs=getDocs();
   // Pre-expand section tabs into run-mount (targets of sys.section.show)
   const rm=$id('run-mount');
   if(rm){
@@ -1463,7 +1762,7 @@ async function runDSL(){
   });
   btn.textContent='■ STOP';btn.classList.add('running');stat.className='ok';
   sph.emit('run',{tab:Tabs.active});
-  _vm=sph.run(registry,{mem:memOpts,docs,log});
+  _vm=sph.run(registry,{mem:memOpts,docs,log,debug:_reg.get('sph.debug.enabled')??false});
   const result=await _vm;
   if(savedMount)sph.register('sys.dom.mount',savedMount);
   _vm=null;btn.textContent='? RUN';btn.classList.remove('running');
@@ -1561,10 +1860,21 @@ async function exportApp(tabName,opts={}){
   if(!src){sph.call('ide.log',['APP EXPORT: DSL source not found']);return;}
   const libs=getLibs();
   const docs=getDocs();
+  emit('compile-start',{src,libs});
   const result=sph.compile(src,libs,docs);
+  emit('compile-done',{errors:result.errors,warnings:result.warnings,ok:!result.errors?.length});
+  for(const e of result.errors||[])emit('error',e);
+  for(const w of result.warnings||[])emit('warn',w);
   if(result.errors?.length){sph.call('ide.log',['APP EXPORT: Compile error ? '+result.errors[0].code]);return;}
   const coreSrc=sph.runtimeSrc();
-  const registryJson=JSON.stringify([...result.registry.entries()].map(([k,v])=>[k,v.toString()]));
+  // opts.includeRuntimeExts=true のとき cat='B' のEXT(meta+ext)を実行ファイルに含める
+  const runtimeExtHtml=(opts.includeRuntimeExts?[...document.querySelectorAll('script[type="sph/meta"][data-ext-id]')]
+    .filter(el=>{try{return JSON.parse(el.textContent).cat==='B';}catch{return false;}})
+    .map(el=>{const id=el.dataset.extId;
+      const extEl=document.querySelector(`script[type="sph/ext"][data-ext-id="${id}"]`);
+      return (el.outerHTML||'')+'\n'+(extEl?.outerHTML||'');
+    }).join('\n'):'');
+  const registryJson=JSON.stringify(Object.entries(result.registry));
   const memOptsJson=JSON.stringify(result.memOpts||{});
   const docsJson=JSON.stringify(docs);
   // Output section tabs directly as HTML
@@ -1606,7 +1916,21 @@ ${s1}
 ${coreSrc}
 ${s2}
 ${s1}
+const $id=id=>document.getElementById(id);
+const $=s=>document.querySelector(s);
+const $$=s=>[...document.querySelectorAll(s)];
+const mk=tag=>document.createElement(tag);
+${s2}
+${runtimeExtHtml}
+${s1}
 (async()=>{
+  // runtime EXTをロード（sph/metaを先に解析してからsph/extを実行）
+  for(const el of document.querySelectorAll('script[type="sph/ext"][data-ext-id]')){
+    try{const id=el.dataset.extId;
+      new Function('sph','$id','$','$$','mk','on',el.textContent)
+        (window.sph,$id,$,$$,mk,(e,ev,fn)=>e?.addEventListener(ev,fn));}
+    catch(e){console.warn('[app-boot] ext error',e.message);}
+  }
   const _docs=${docsJson};
   function log(cls,msg){
     const el=$id('app-log');if(!el)return;
@@ -1629,7 +1953,7 @@ ${s1}
   });
   sph.register('sys.section.get',()=>_sec);
   const _entries=${registryJson};
-  const registry=new Map(_entries.map(([k,v])=>[k,new Function('return ('+v+')')()]));
+  const registry=Object.fromEntries(_entries);
   await sph.run(registry,{mem:${memOptsJson},docs:_docs,log});
 })();
 ${s2}
@@ -1646,7 +1970,7 @@ ${s2}
 // body[data-frame-b] = "log"|extId
 // _frameOwner: id of EXT currently mounted into frame-a (null = editor/run)
 let _frameOwner=null;
-let _prevFrame='V'; // remembered when EXT goes fullscreen
+
 
 function _setCSS(prop,val){document.documentElement.style.setProperty(prop,val);}
 
@@ -2139,11 +2463,21 @@ const _errMessages={
   'W007': a=>`@loop "${a[0]}" timed out`,
   'W008': a=>`str[] overflow: index ${a[0]} >= limit ${a[1]} — value dropped`,
   'W010': a=>`[L${a[0]}] &pure side-effect in "${a[1]}": ${a[2]}`,
-  'E010': a=>`sph.call: undefined API "${a[0]}"`,
+  'W011': a=>`Sandbox: blocked global access "${a[0]}" — add permission to sph/meta`,
+  'W012': a=>`EXT "${a[0]}": dependency "${a[1]}" not mounted`,
+  'W013': a=>`Block "${a[0]}" redefined — previous definition overwritten`,
+  'W-TYPE': a=>`[L${a[0]}] Type mismatch: ${a[1]}`,
+  'W-EXT':  a=>`EXT call blocked: "${a[0]}" — ${a[1]}`,
+  'W014': a=>`[L${a[0]}] PUB "${a[1]}" inside indented block — ignored (must be top-level)`,
+  'E014': a=>`Array out of bounds: ${a[0]}[${a[1]}] (size ${a[2]})`,
+  'E015': a=>`Local array access "${a[0]}[...]" not supported — use global array`,
+  'E016': a=>`Stack overflow: "${a[0]}" at depth ${a[1]} (max sph.ext.callDepth)`,
   'E011': a=>`sph.call: error in "${a[0]}": ${a[1]}`,
   'E012': a=>`ext.call: "${a[0]}" timed out after ${a[1]}ms`,
   'E013': a=>`Sandbox: prototype mutation blocked: ${a[0]}`,
+  'E014': a=>`Out of bounds: ${a[0]}[${a[1]}] — declared size=${a[2]}`,
   'W011': a=>`Sandbox: blocked global access "${a[0]}" — add permission to sph/meta`,
+  'W012': a=>`EXT "${a[0]}" consumes "${a[1]}" but it is not loaded`,
 
 };
 
@@ -5370,8 +5704,8 @@ sph.mount('compute', 'COMPUTE ENGINE', '[C]', {
 #guide td:first-child{color:var(--sph-accent);white-space:nowrap;font-weight:700}
 </style>
 <div id="guide">
-<h1>◆ SAPPHIRE NG</h1>
-<p style="font-size:var(--sph-sz-md);color:var(--sph-dim)">A DSL + IDE in one HTML file.</p>
+<h1>◆ SAPPHIRE NG 0.4 (v15)</h1>
+<p style="font-size:var(--sph-sz-md);color:var(--sph-dim)">A DSL + IDE in one HTML file. — v15: stability, purity, memory fixes</p>
 
 <h2>DSL Syntax</h2>
 
@@ -5524,7 +5858,50 @@ sph.mount('myext', {
   api: { ... }
 });</pre>
 
-<h2>ng-0.3 New Features</h2>
+<h2>v15 Changes</h2>
+<table>
+<tr><th>ID</th><th>Category</th><th>Fix</th></tr>
+<tr><td>1-1</td><td>Compiler</td><td>Double evaluation in _castI/_castF eliminated — _w used once</td></tr>
+<tr><td>1-2</td><td>Compiler</td><td>Operator precedence corrected: || &gt; &amp;&amp; (was reversed)</td></tr>
+<tr><td>1-3</td><td>Compiler</td><td>? as subtraction operator removed (conflicts with ?-sigil)</td></tr>
+<tr><td>2-1</td><td>Blocks</td><td>&amp;pure → &amp;pure call is now sync (no E006)</td></tr>
+<tr><td>2-2</td><td>Blocks</td><td>Duplicate block definition emits W013</td></tr>
+<tr><td>2-4</td><td>Blocks</td><td>PUB inside indented block emits W014 and is ignored</td></tr>
+<tr><td>3-1</td><td>Memory</td><td>Local variable type-prefixed: #_v→_iv, %_v→_fv, $_v→_sv</td></tr>
+<tr><td>3-2</td><td>Memory</td><td>Local array access (e.g. #_arr[i]) now E015 compile error</td></tr>
+<tr><td>3-3</td><td>Memory</td><td>str[] uninitialized slots return '' via Proxy get</td></tr>
+<tr><td>3-4</td><td>Memory</td><td>u64 slot overflow detected as W005</td></tr>
+<tr><td>4-1</td><td>Parser</td><td>if nesting supported: _line delegates to _translateIf</td></tr>
+<tr><td>4-2</td><td>Parser</td><td>sys.f inner double-quote handling fixed</td></tr>
+<tr><td>4-3</td><td>Parser</td><td>hasAsync via /\bawait\s+/ token — sys.f "await..." no longer triggers</td></tr>
+<tr><td>4-4</td><td>Parser</td><td>lib expands before user code (schema immediately available)</td></tr>
+<tr><td>4-5</td><td>Parser</td><td>E002 detection includes sys.stop, not just return</td></tr>
+<tr><td>5-1</td><td>Purity</td><td>sys.f content inspected for forbidden patterns in &amp;pure</td></tr>
+<tr><td>5-2</td><td>Purity</td><td>sys.screen.poke removed from purity whitelist (ghost entry)</td></tr>
+<tr><td>2.6</td><td>Memory</td><td>q_slot uses freelist — sys.q.free releases slots for reuse</td></tr>
+<tr><td>2.13</td><td>sys</td><td>sys.screen.width/height/idx implemented (ghost APIs resolved)</td></tr>
+<tr><td>2.14</td><td>sys</td><td>sys.dom.mount with parentId no longer shadowed by IDE override</td></tr>
+<tr><td>2.15</td><td>IDE</td><td>Debug mode wired: sph.debug.enabled=true enables block trace. callDepth enforced (E016)</td></tr>
+</table>
+
+<h3>Subtraction operator change</h3>
+<p>The <code>?</code> operator as subtraction has been removed to avoid collision with the <code>?</code>-sigil (unknown type). Use <code>-</code> for subtraction: <code>#x = #a - #b</code></p>
+
+<h3>Local variable naming (v15)</h3>
+<pre>#_v   → JS: _iv   (integer)
+%_v   → JS: _fv   (float)
+$_v   → JS: _sv   (string)
+~_v   → JS: _bv   (bigint)</pre>
+<p>This prevents #_tmp and %_tmp from sharing the same JS variable <code>_tmp</code>.</p>
+
+<h3>freelist q_slot</h3>
+<pre>; create entity
+?unit[42] = 42
+; ... use ...
+; release slots back to freelist
+sys.q.free 42</pre>
+
+<h2>v15 Changes</h2>
 <h3>Compiler: LL(1) single-pass stream</h3>
 <p>No intermediate AST. Each source line is emitted directly to the block buffer in a single pass.</p>
 <table>
