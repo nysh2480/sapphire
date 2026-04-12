@@ -1082,6 +1082,38 @@ function _jsdoc(fn){
 }
 
 function mount(id,...args){
+  // ═══════════════════════════════════════════════════════════════════
+  // [v16.2] EXT シングルトン管理 - 改善版
+  // ═══════════════════════════════════════════════════════════════════
+  // 
+  // v16.2での改善:
+  //   1. return型を統一（常に文字列id）
+  //   2. グローバルイベントリスナーの確実な削除
+  //   3. descriptor のディープコピー
+  //   4. コアEXT重複登録警告
+  //
+  // ═══════════════════════════════════════════════════════════════════
+  
+  // ✅ v16.2: コア EXT のリスト定義
+  const CORE_EXTS=new Set([
+    'err','edit','debug','tester','key','bridge',
+    'worker','sound','extmgr','appearance','file','abcd'
+  ]);
+  
+  // ═══════════════════════════════════════════════════════════════════
+  // シングルトン管理: 既に登録されているEXTは上書き禁止
+  // ═══════════════════════════════════════════════════════════════════
+  if(_mounts.has(id)){
+    if(CORE_EXTS.has(id)){
+      console.warn('[sph.mount] Cannot override core EXT "'+id+'". '
+        +'These EXTs are loaded at startup. Use sph.unmount() first if you need to modify them.');
+    } else {
+      console.warn('[sph.mount] EXT "'+id+'" is already registered (singleton). Mount skipped.');
+    }
+    // ✅ v16.2: return型を統一（常に文字列idを返す）
+    return id;
+  }
+  
   // M1: positional ? mount(id, 'LABEL', desc) or mount(id, desc)
   // icon引数は廃止 — シンプル・コンパクト・速さ・安全性を軸に
   let descriptor={};
@@ -1117,18 +1149,53 @@ function mount(id,...args){
       else globalOn[ev]=fn;
     }
     if(Object.keys(frameOn).length) mreg(id+'._on', frameOn);
-    // wire global events immediately
+    // ✅ v16.2: グローバルリスナーをハンドラ参照付きで登録
+    const listeners={};
     for(const[ev,fn] of Object.entries(globalOn)){
+      listeners[ev]=fn;
       document.addEventListener('sph:'+ev, e=>fn(e.detail));
-      keys.add(id+'._global_'+ev); // track for unmount cleanup
+      keys.add(id+'._global_'+ev);
     }
+    _globalListeners.set(id, listeners);  // リスナー参照を保持
   }
   _mounts.set(id,keys);
+  
+  // ═══════════════════════════════════════════════════════════════════
+  // シングルトン識別子を記録
+  // ═══════════════════════════════════════════════════════════════════
+  // ✅ v16.2: descriptor の深いコピーを作成
+  const deepCopyDescriptor={
+    label:descriptor.label,
+    panel:descriptor.panel,
+    subPanel:descriptor.subPanel,
+    layout:descriptor.layout?{...descriptor.layout}:undefined,
+    api:descriptor.api?{...descriptor.api}:undefined,
+    commands:descriptor.commands?[...descriptor.commands]:undefined,
+    on:descriptor.on?{...descriptor.on}:undefined
+  };
+  
+  mreg(id+'._singleton', {
+    mounted:true,
+    mountTime:Date.now(),
+    descriptor:deepCopyDescriptor,  // ← ディープコピーを使用
+    keys:new Set(keys)              // ← keys のコピーを作成
+  });
+  
   return id;
 }
 function unmount(id){
   const keys=_mounts.get(id);
   if(!keys)return false;
+  
+  // ✅ v16.2: グローバルイベントリスナーをクリーンアップ
+  const listeners=_globalListeners.get(id);
+  if(listeners){
+    for(const[ev,fn] of Object.entries(listeners)){
+      document.removeEventListener('sph:'+ev,fn);
+    }
+    _globalListeners.delete(id);
+  }
+  
   for(const k of keys)_reg.delete(k);
   _mounts.delete(id);
   emit('ext-unmounted',{id});
@@ -1189,6 +1256,58 @@ window.sph={compile:(src,libs,docs)=>compiler.compile(src,libs,docs),run,stop,re
   mount,unmount,ui:sph_ui,_safeCall,
   runtimeSrc:()=>document.getElementById('sph-core')?.textContent||'',_reg,_mounts,_runtimeWarn,_throwOOB,
   _loopBreak:null,_loopStop:null,_loopStopAll:null,
+  // ═══════════════════════════════════════════════════════════════════
+  // [v16.1] シングルトン管理API
+  // ═══════════════════════════════════════════════════════════════════
+  singleton:{
+    // シングルトン情報を取得
+    getInfo:(extId)=>{
+      return _reg.get(extId+'._singleton')||null;
+    },
+    // EXTが既にマウント済みか確認
+    isMounted:(extId)=>{
+      return _mounts.has(extId);
+    },
+    // 登録済みの全EXT一覧を取得（シングルトン情報付き）
+    list:()=>{
+      const result=[];
+      for(const [id, keys] of _mounts.entries()){
+        result.push({
+          id:id,
+          label:_reg.get(id+'.label'),
+          mounted:true,
+          singleton:_reg.get(id+'._singleton')??null,
+          keyCount:keys.size
+        });
+      }
+      return result;
+    },
+    // シングルトンの詳細情報を取得
+    getDetail:(extId)=>{
+      if(!_mounts.has(extId))return null;
+      const singletonData=_reg.get(extId+'._singleton');
+      // ✅ v16.2: singletonData が null の場合を処理
+      if(!singletonData){
+        console.warn('[sph.singleton.getDetail] Singleton data not found for',extId);
+        return null;
+      }
+      return {
+        id:extId,
+        label:_reg.get(extId+'.label'),
+        mounted:true,
+        singleton:singletonData,
+        commands:_reg.get(extId+'.commands')||[],
+        hasPanel:_reg.has(extId+'.panel'),
+        hasSubPanel:_reg.has(extId+'.subPanel'),
+        apiMethods:Object.keys((_reg.get(extId+'.commands')||[])
+          .reduce((acc,cmd)=>{
+            const method=cmd.name?.split('.')[1];
+            if(method)acc[method]=true;
+            return acc;
+          },{}))
+      };
+    }
+  },
   // [v16] EXT ホワイトリスト管理
   ext:{
     allow:(name)=>ALLOWED_EXT.add(name),
@@ -4500,6 +4619,10 @@ sph.mount('file','FILES',{
 // ABCDEntry: { id, cat, version, label, icon, consumes, produces, signals, registeredAt }
 const _registry = new Map();
 
+// ✅ v16.2: グローバルイベントリスナーの参照を保持（cleanup用）
+// Map<extId, {eventName → handler}>
+const _globalListeners = new Map();
+
 // シグナル購読者
 // Map<signalName, Set<{extId, fn}>>
 const _subscribers = new Map();
@@ -6253,13 +6376,19 @@ sph.mount('ai_connect','AI CONNECT',{
   },
   on:{
     'ide-ready':function(){
+      // シングルトン状態を確認してログ出力
+      var singletonInfo=sph.singleton.getInfo('ai_connect');
+      if(singletonInfo){
+        sph.call('ide.log',['[AI_CONNECT] Singleton instance active (mounted at '+new Date(singletonInfo.mountTime).toISOString()+')']);
+      }
       sph.call('abcd.register',['ai_connect','C']);
       sph.call('ide.log',['[AI_CONNECT] Neural Bridge active']);
     },
-    'frame-mounted':function(e){if(e.id==='ai_connect')_refreshUI();},
+    'frame-mounted':function(e){if(e.id==='ai_connect'){_refreshUI();sph.call('ide.log',['[AI_CONNECT] Frame mounted']);}}
   },
 });
 })();
+
 </script>
 
 <script type="sph/tab" data-tab-name="ai_lib" data-tab-type="lib">
