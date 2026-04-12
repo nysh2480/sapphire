@@ -20,7 +20,7 @@ Instead of asking AI to generate thousands of lines of code, SAPPHIRE uses an **
 
 ## ⬡ How to Use
 
-1. Download `sapphire_ng_v16_2_fixed.html`.
+1. Download `sapphire_ide.html`.
 2. Open it directly in Chrome or Edge (no server needed for basic use).
 3. Write DSL in the editor, or load an EXT from the EXT panel (⚙ EXT button).
 4. Press **Ctrl+Enter** to run, **Escape** to stop.
