@@ -1082,17 +1082,17 @@ function _jsdoc(fn){
 }
 
 function mount(id,...args){
-  // M1: positional ? mount(id, 'LABEL','icon', desc) or mount(id, desc)
+  // M1: positional ? mount(id, 'LABEL', desc) or mount(id, desc)
+  // icon引数は廃止 — シンプル・コンパクト・速さ・安全性を軸に
   let descriptor={};
-  if(args.length>=3&&typeof args[0]==='string'&&typeof args[1]==='string'){
-    descriptor=Object.assign({},args[2]||{},{label:args[0],icon:args[1]});
+  if(args.length>=2&&typeof args[0]==='string'&&typeof args[args.length-1]==='object'){
+    descriptor=Object.assign({},args[args.length-1]||{},{label:args[0]});
   } else if(args.length>=1){
     descriptor=args[args.length-1]||{};
   }
   const keys=new Set();
   const mreg=(k,v)=>{_reg.set(k,v);keys.add(k);};
   mreg(id+'.label', descriptor.label??id.toUpperCase());
-  mreg(id+'.icon',  descriptor.icon ??'?');
   if(descriptor.panel)    mreg(id+'.panel',    descriptor.panel);
   if(descriptor.subPanel) mreg(id+'.subPanel', descriptor.subPanel);
   if(descriptor.layout)   mreg(id+'.layout',   descriptor.layout);
@@ -1776,10 +1776,9 @@ function saveHTML(){
   _dl(document.documentElement.outerHTML,'sapphire.html','text/html');
   sph.emit('save',{type:'html'});
 }
-function exportEXT(tabNames,extId,extLabel,extIcon){
+function exportEXT(tabNames,extId,extLabel){
   const id=extId||'myext';
   const label=extLabel||id.toUpperCase();
-  const icon=extIcon||'?';
 
   // Resolve selected tab + collect EXT script tabs
   let resolved=[];
@@ -1817,7 +1816,7 @@ function exportEXT(tabNames,extId,extLabel,extIcon){
     : `${s1} type="sph/ext" data-ext-id="${id}">
 (function(){
 // ── ${label} EXT ──────────────────────────────────────────
-sph.mount('${id}','${label}','${icon}',{
+sph.mount('${id}','${label}',{
   panel: ()=>sph.ui.panel('${id}',
     '<p class=\"sph-meta\">Settings for ${id}</p>'
   ),
@@ -2156,7 +2155,7 @@ sph.register('ide.log.clear',     ()=>{const el=$id('log');if(el)el.innerHTML=''
 sph.register('ide.run',           ()=>runDSL());
 sph.register('ide.stop',          ()=>sph.stop());
 sph.register('ide.save',          ()=>saveHTML());
-sph.register('ide.export.ext',    (tabs,id,label,icon)=>exportEXT(tabs,id,label,icon));
+sph.register('ide.export.ext',    (tabs,id,label)=>exportEXT(tabs,id,label));
 sph.register('ide.export.app',    (tab,opts)=>exportApp(tab,opts));
 // Doc view: render tab list and registry names in #view-doc, then switch view
 sph.register('ide.doc.export', ()=>{
@@ -2171,7 +2170,7 @@ sph.register('ide.doc.export', ()=>{
     const cmds =sph.get(id+'.commands')||[];
     // If no commands, auto-collect id.* keys
     const autoKeys=regs.filter(k=>k.startsWith(id+'.')&&!k.endsWith('.label')
-      &&!k.endsWith('.icon')&&!k.endsWith('.builtin')&&!k.endsWith('.panel')
+      &&!k.endsWith('.builtin')&&!k.endsWith('.panel')
       &&!k.endsWith('.commands')&&!k.startsWith('sph.ext.cleanup'));
     return{id,label,cmds,autoKeys};
   });
@@ -2441,7 +2440,6 @@ window.sphIdeAddTab=function(name,type,extGroup){buildPanel(name);renderTabBar()
   "cat": "D",
   "version": "1.0",
   "label": "ERR",
-  "icon": "⚠️",
   "consumes": [],
   "produces": [],
   "signals": [],
@@ -2523,7 +2521,7 @@ const _errPanelHtml='<div style="font-size:var(--sph-sz-lg);color:var(--sph-text
   +'<div style="margin-top:12px;font-size:var(--sph-sz-md);color:var(--sph-dim)">Converts error/warning codes to messages in the IDE log.</div>'
   +'</div>';
 
-sph.mount('err','ERR','⚠',{
+sph.mount('err','ERR',{
   panel:()=>sph.ui.panel('err',
     '<div id="err-list" style="font-size:var(--sph-sz-md);line-height:1.8"></div>'
     +'<p style="font-size:var(--sph-sz-md);color:var(--sph-dim);margin-top:8px">Converts error/warning codes to messages in the IDE log.</p>'
@@ -2554,7 +2552,6 @@ sph.register('err.format',(obj)=>{
   "cat": "A",
   "version": "1.0",
   "label": "EDIT",
-  "icon": "✏️",
   "consumes": [
     "appearance"
   ],
@@ -2683,7 +2680,7 @@ const _editPanelHtml='<div style="font-size:var(--sph-sz-lg);color:var(--sph-tex
   +'</div>'
   +'<p style="font-size:var(--sph-sz-md);color:var(--sph-dim);line-height:1.7">Provides preview / edit panel for DOC / EXT / SECTION tabs.<br>API: edit.open(tabName, div, isHtml, opts)</p>'
   +'</div>';
-sph.mount('edit','EDIT','✎',{
+sph.mount('edit','EDIT',{
   panel:()=>_editPanelHtml,
   commands:[
     {name:'edit.open',   desc:'Build an editor panel for a tab. Delegated from buildPanel',args:'tabName, containerDiv, isHtml, opts'},
@@ -2704,7 +2701,6 @@ sph.mount('edit','EDIT','✎',{
   "cat": "C",
   "version": "1.0",
   "label": "DEBUG",
-  "icon": "🔍",
   "consumes": [],
   "produces": [],
   "signals": [
@@ -2864,7 +2860,7 @@ const _dbgPanel=
 
 // _dbgTab → sph.register経由 (window.* 不要)
 
-sph.mount('debug','DEBUG','🔍',{
+sph.mount('debug','DEBUG',{
   panel:()=>_dbgPanel,
   commands:[
     {name:'debug.enable',     desc:'Enable block call tracing'},
@@ -2901,7 +2897,6 @@ sph.mount('debug','DEBUG','🔍',{
   "cat": "C",
   "version": "1.0",
   "label": "TESTER",
-  "icon": "🧪",
   "consumes": [],
   "produces": [],
   "signals": [
@@ -2950,7 +2945,7 @@ const _tstPanel=
   +'<div id="tst-results" style="flex:1;overflow-y:auto"></div>'
   +'</div>';
 
-sph.mount('tester','TESTER','✓',{
+sph.mount('tester','TESTER',{
   panel:()=>_tstPanel,
   commands:[
     {name:'test.add',     desc:'Register a test case',args:'name, fn: async({assert,run,compile,log})=>void'},
@@ -2996,7 +2991,6 @@ sph.mount('tester','TESTER','✓',{
   "cat": "B",
   "version": "1.0",
   "label": "KEY",
-  "icon": "🔑",
   "consumes": [],
   "produces": [],
   "signals": [],
@@ -3071,7 +3065,7 @@ const _panel=()=>sph.ui.panel('key',
   )
 );
 
-sph.mount('key','KEY_EXT','\uD83D\uDD12',{
+sph.mount('key','KEY_EXT',{
   panel:_panel,
   builtin:true,
   commands:[
@@ -3106,7 +3100,6 @@ sph.mount('key','KEY_EXT','\uD83D\uDD12',{
   "cat": "B",
   "version": "1.0",
   "label": "BRIDGE",
-  "icon": "🌉",
   "consumes": [],
   "produces": [],
   "signals": [
@@ -3187,7 +3180,7 @@ function _refreshBridgePanel(){
     ).join('');
 }
 
-sph.mount('bridge','BRIDGE_EXT','\uD83C\uDF09',{
+sph.mount('bridge','BRIDGE_EXT',{
   builtin:true,
   panel:()=>sph.ui.panel('bridge',
     sph.ui.section('Status','<div id="bridge-status" class="sph-meta">No channels</div>')+
@@ -3253,7 +3246,6 @@ sph.mount('bridge','BRIDGE_EXT','\uD83C\uDF09',{
   "cat": "B",
   "version": "1.0",
   "label": "WORKER",
-  "icon": "⚡",
   "consumes": [],
   "produces": [],
   "signals": [],
@@ -3341,7 +3333,7 @@ function _refreshWorkerPanel(){
     [..._workers.keys()].map(id=>`<div style="font-size:9px;color:var(--sph-dim);margin-top:2px">\u2699\uFE0F ${id}</div>`).join('');
 }
 
-sph.mount('worker','WORKER_EXT','\u26A1',{
+sph.mount('worker','WORKER_EXT',{
   builtin:true,
   panel:()=>sph.ui.panel('worker',
     sph.ui.section('Status','<div id="worker-status" class="sph-meta">No workers</div>')+
@@ -3401,7 +3393,6 @@ sph.mount('worker','WORKER_EXT','\u26A1',{
   "cat": "A",
   "version": "1.0",
   "label": "SOUND",
-  "icon": "🔊",
   "consumes": [
     "appearance"
   ],
@@ -3539,7 +3530,7 @@ function _panel(){
   );
 }
 
-sph.mount('sound','SOUND','\uD83D\uDD0A',{
+sph.mount('sound','SOUND',{
   panel:_panel,
   commands:[
     {name:'sound.beep',          desc:'Play a beep tone',args:'freq:number, dur:number'},
@@ -3615,7 +3606,6 @@ sph.mount('sound','SOUND','\uD83D\uDD0A',{
   "cat": "C",
   "version": "1.0",
   "label": "EXTMGR",
-  "icon": "🧩",
   "consumes": [],
   "produces": [],
   "signals": [
@@ -3645,7 +3635,6 @@ const _emHtml=`<style>
 .em-row{display:flex;align-items:center;gap:12px;padding:10px 12px;
   border-bottom:1px solid var(--sph-border);transition:background .1s}
 .em-row:hover{background:var(--sph-surface)}
-.em-icon{font-size:16px;width:24px;text-align:center;flex-shrink:0}
 .em-info{flex:1;min-width:0}
 .em-name{font-size:11px;font-weight:700;color:var(--sph-text)}
 .em-id{font-size:var(--sph-sz-sm);color:var(--sph-dim);margin-top:1px}
@@ -3698,7 +3687,6 @@ function _emRender(){
     return{
       id,
       label  :sph.get(id+'.label')||id.toUpperCase(),
-      icon   :sph.get(id+'.icon') ||'?',
       builtin:builtin.has(id),
     };
   }).sort((a,b)=>{
@@ -3706,7 +3694,7 @@ function _emRender(){
     return a.id.localeCompare(b.id);
   });
 
-  for(const{id,label,icon,builtin}of entries){
+  for(const{id,label,builtin}of entries){
     const row=mk('div');row.className='em-row';
     const badge=builtin?'<span class="em-badge">built-in</span>':'';
     // Show RELOAD / REMOVE buttons only for external EXTs
@@ -3714,7 +3702,6 @@ function _emRender(){
       `<button class="em-reload" title="Remove then reload EXT">↺ Reload</button>`+
       `<button class="em-remove" title="Remove this EXT">✕ Remove</button>`;
     row.innerHTML=
-      `<div class="em-icon">${icon}</div>`+
       `<div class="em-info">`+
         `<div class="em-name">${label}${badge}</div>`+
         `<div class="em-id">${id} <span style="opacity:.5">(${[...sph._mounts.get(id)||[]].length} keys)</span></div>`+
@@ -3737,7 +3724,7 @@ function _emRender(){
 
 // ide-ready handled via on:{} in sph.mount below
 // ext lifecycle events handled via on:{} in sph.mount above
-sph.mount('extmgr','EXT','⊞',{
+sph.mount('extmgr','EXT',{
   panel:()=>_emHtml,
   commands:[
     {name:'extmgr.refresh',desc:'Re-render the EXT manager list'},
@@ -3779,7 +3766,6 @@ sph.mount('extmgr','EXT','⊞',{
   "cat": "D",
   "version": "1.0",
   "label": "APPEARANCE",
-  "icon": "🎨",
   "consumes": [],
   "produces": [],
   "signals": [
@@ -3825,7 +3811,6 @@ const _cfgHtml=`
 
 .cfg-layout-btns{display:flex;gap:6px;margin-bottom:8px}
 
-.cfg-layout-icon{display:block;font-size:16px;margin-bottom:2px}
 .cfg-slider-wrap{display:flex;align-items:center;gap:8px}
 .cfg-slider-wrap input[type=range]{flex:1;accent-color:var(--sph-accent)}
 .cfg-slider-val{font-size:var(--sph-sz-md);color:var(--sph-text);width:36px;text-align:right;flex-shrink:0}
@@ -3858,13 +3843,13 @@ const _cfgHtml=`
       <!-- Layout picker -->
       <div class="cfg-layout-btns" id="cfg-layout-btns">
         <button class="sph-btn sph-layout-btn" data-layout="V">
-          <span class="cfg-layout-icon">⬒</span>Split V
+Split V
         </button>
         <button class="sph-btn sph-layout-btn" data-layout="H">
-          <span class="cfg-layout-icon">⬓</span>Split H
+Split H
         </button>
         <button class="sph-btn sph-layout-btn" data-layout="S">
-          <span class="cfg-layout-icon">□</span>Full
+Full
         </button>
       </div>
       <!-- Split ratio slider (frame-a proportion, works in V and H) -->
@@ -3878,7 +3863,7 @@ const _cfgHtml=`
     </div>
   </div>
   <div class="cfg-actions">
-    <button class="cfg-ab primary" id="cfg-apply">✓ Apply</button>
+    <button class="cfg-ab primary" id="cfg-apply">Apply</button>
   </div>
 </div>`;
 
@@ -3985,7 +3970,7 @@ function _initLayoutUI(){
 
 let _currentTheme='dark';
 
-sph.mount('appearance','APPEARANCE','◈',{
+sph.mount('appearance','APPEARANCE',{
   panel:()=>_cfgHtml,
   commands:[
     {name:'appearance.theme', desc:'Apply a preset theme (dark/light/nord/mocha)',args:'name: string'},
@@ -4055,7 +4040,6 @@ sph.mount('appearance','APPEARANCE','◈',{
   "cat": "C",
   "version": "1.0",
   "label": "FILES",
-  "icon": "📁",
   "consumes": [],
   "produces": [],
   "signals": [
@@ -4169,7 +4153,6 @@ table.ft tr:hover td{background:var(--sph-surface)}
     <label>Label:</label>
     <input type="text" id="fv-ext-label" value="" placeholder="MY EXT" style="width:80px">
     <label>Icon:</label>
-    <input type="text" id="fv-ext-icon" value="?" placeholder="?" style="width:36px;text-align:center">
     <button class="fab ok" id="fv-ext-out">↑ Export EXT</button>
   </div>
 </div>`;
@@ -4290,7 +4273,7 @@ sph.register('file._fvNewExt',()=>{
   const n=name.trim().replace(/\s+/g,'_').toLowerCase();
   // ABCD category selection
   const cat=prompt('ABCD category (A=Action/B=Base/C=Control/D=Definition)','A')?.toUpperCase()||'A';
-  const icon=prompt('Icon (emoji)','⚙️')||'⚙️';
+
   const tmpl=`<!DOCTYPE html>
 <html><head>
 <meta charset="UTF-8">
@@ -4303,7 +4286,6 @@ sph.register('file._fvNewExt',()=>{
   "cat":      "${cat}",
   "version":  "1.0",
   "label":    "${n.toUpperCase()}",
-  "icon":     "${icon}",
   "consumes": [],
   "produces": [],
   "signals":  []
@@ -4336,7 +4318,7 @@ const _panel = () => sph.ui.panel('${n}',
 );
 
 // ── sph.mount ──────────────────────────────────────────
-sph.mount('${n}', '${n.toUpperCase()}', '${icon}', {
+sph.mount('${n}', '${n.toUpperCase()}', {
   panel: _panel,
   commands: [
     { name: '${n}.hello',    desc: 'Say hello',         args: '' },
@@ -4373,7 +4355,6 @@ sph.register('sph.ext.cleanup.${n}', () => {
 \x3cscript type="sph/doc" data-doc-ext="${n}">
 {
   "title": "${n.toUpperCase()} Extension",
-  "icon": "${icon}",
   "description": "${n} — ABCD[${cat}] extension",
   "version": "1.0",
   "api": [
@@ -4435,7 +4416,7 @@ sph.register('file._fvDel',function(name){
   sph.emit('tab-deleted',{name});
 });
 
-sph.mount('file','FILES','⊟',{
+sph.mount('file','FILES',{
   panel:()=>_fileHtml,
   api:{
     /** Re-render the file list table */
@@ -4464,7 +4445,6 @@ sph.mount('file','FILES','⊟',{
         const checks=$$('.fv-chk:checked').map(e=>e.dataset.name);
         const eid=$id('fv-ext-id')?.value.trim()||'myext';
         const lbl=$id('fv-ext-label')?.value.trim()||eid.toUpperCase();
-        const ico=$id('fv-ext-icon')?.value.trim()||'?';
         if(!checks.length){sph.call('ide.log',['EXT Export: select files first']);return;}
         sph.call('ide.export.ext',[checks,eid,lbl,ico]);
       });
@@ -4487,7 +4467,6 @@ sph.mount('file','FILES','⊟',{
   "cat": "C",
   "version": "1.0",
   "label": "ABCD",
-  "icon": "⬡",
   "consumes": [],
   "produces": [],
   "signals": [
@@ -4527,10 +4506,10 @@ const _subscribers = new Map();
 
 // ── カテゴリ定義 ────────────────────────────────────────────────
 const CATS = {
-  A: { name: 'Action',     icon: '⚡', desc: 'UI・末端実行系',      color: 'var(--sph-accent)' },
-  B: { name: 'Base',       icon: '🔧', desc: 'リソース・通信基盤',   color: 'var(--sph-ok)'     },
-  C: { name: 'Control',    icon: '⚙',  desc: '管理・監視・フロー',   color: 'var(--sph-warn)'   },
-  D: { name: 'Definition', icon: '📐', desc: '設定・スキーマ・定義', color: 'var(--sph-dim)'    },
+  A: { name: 'Action',     desc: 'UI・末端実行系',      color: 'var(--sph-accent)' },
+  B: { name: 'Base',       desc: 'リソース・通信基盤',   color: 'var(--sph-ok)'     },
+  C: { name: 'Control',    desc: '管理・監視・フロー',   color: 'var(--sph-warn)'   },
+  D: { name: 'Definition', desc: '設定・スキーマ・定義', color: 'var(--sph-dim)'    },
 };
 
 // ── sph/meta タグの自動収集 ─────────────────────────────────────
@@ -4558,7 +4537,6 @@ function _register(id, cat, meta = {}) {
     cat,
     version:      meta.version  || '1.0',
     label:        meta.label    || id.toUpperCase(),
-    icon:         meta.icon     || CATS[cat].icon,
     consumes:     Array.isArray(meta.consumes) ? meta.consumes : [],
     produces:     Array.isArray(meta.produces) ? meta.produces : [],
     signals:      Array.isArray(meta.signals)  ? meta.signals  : [],
@@ -4676,7 +4654,6 @@ function _renderPanel() {
     Object.entries(CATS).map(([cat, info]) =>
       `<div style="flex:1;background:var(--sph-surface);border:1px solid var(--sph-border);` +
       `border-top:3px solid ${info.color};border-radius:4px;padding:8px;text-align:center">` +
-      `<div style="font-size:18px;margin-bottom:2px">${info.icon}</div>` +
       `<div style="font-weight:700;color:${info.color};font-size:var(--sph-sz-lg)">[${cat}]</div>` +
       `<div style="font-size:var(--sph-sz-sm);color:var(--sph-dim)">${info.name}</div>` +
       `<div style="font-size:20px;font-weight:700;margin-top:4px;color:var(--sph-text)">${counts[cat]}</div>` +
@@ -4701,7 +4678,6 @@ function _renderPanel() {
         return (
           `<div style="display:flex;align-items:flex-start;gap:10px;padding:7px 0;` +
           `border-bottom:1px solid var(--sph-border)22">` +
-          `<div style="width:22px;text-align:center;font-size:14px;flex-shrink:0">${e.icon}</div>` +
           `<div style="flex:1;min-width:0">` +
           `<div style="font-weight:700;font-size:var(--sph-sz-md)">${e.label}` +
           `<span style="color:var(--sph-dim);font-weight:400;font-size:var(--sph-sz-sm)"> ${e.id}</span>` +
@@ -4740,7 +4716,7 @@ const _panel = () => sph.ui.panel('abcd',
 );
 
 // ── sph.mount ───────────────────────────────────────────────────
-sph.mount('abcd', 'ABCD', '\u2B21', {
+sph.mount('abcd', 'ABCD', {
   panel: _panel,
   commands: [
     { name: 'abcd.register',    desc: 'Register EXT to ABCD category',           args: 'extId, cat(A/B/C/D), meta?' },
@@ -4780,7 +4756,7 @@ sph.mount('abcd', 'ABCD', '\u2B21', {
       _collectMeta();
       // abcd 自身を登録
       _register('abcd', 'C', {
-        version: '1.0', label: 'ABCD Runtime', icon: '⬡',
+        version: '1.0', label: 'ABCD Runtime',
         signals: ['abcd:registered', 'abcd:signal', 'abcd:pipe'],
       });
     },
@@ -4798,7 +4774,6 @@ sph.mount('abcd', 'ABCD', '\u2B21', {
 <script type="sph/doc" data-doc-ext="abcd">
 {
   "title": "ABCD - EXT Structure Runtime",
-  "icon": "⬡",
   "description": "ABCD category system runtime. Classifies EXTs into Action/Base/Control/Definition and provides inter-EXT communication via pipe, signal, and flow.",
   "version": "1.0",
   "api": [
@@ -4881,7 +4856,6 @@ The ABCD runtime auto-collects these on <code>ide-ready</code>.</p>
   "cat":      "A",
   "version":  "1.0",
   "label":    "SOUND",
-  "icon":     "🔊",
   "consumes": ["appearance"],
   "produces": ["storage"],
   "signals":  ["sound:played"]
@@ -4952,7 +4926,6 @@ await sph.call('abcd.flow', [[
   "cat": "A",
   "version": "1.1",
   "label": "MONITOR",
-  "icon": "📺",
   "consumes": [
     "bridge",
     "timeline"
@@ -5054,7 +5027,7 @@ var _panel = function() {
 };
 
 // ── sph.mount ────────────────────────────────────────────────────
-sph.mount('monitor', 'MONITOR', '📺', {
+sph.mount('monitor', 'MONITOR', {
   panel: _panel,
   commands: [
     { name: 'monitor.attach',  desc: 'Attach to bridge.buf video_main' },
@@ -5138,7 +5111,6 @@ sph.mount('monitor', 'MONITOR', '📺', {
 <script type="sph/doc" data-doc-ext="monitor">
 {
   "title": "MONITOR Extension",
-  "icon": "📺",
   "description": "High-performance canvas display. Reads pixel data from bridge.buf 'video_main' and renders via requestAnimationFrame. Supports SAB (SharedArrayBuffer) for zero-copy Worker→Canvas pipeline when crossOriginIsolated is true.",
   "version": "1.1",
   "api": [
@@ -5159,7 +5131,6 @@ sph.mount('monitor', 'MONITOR', '📺', {
   "cat": "C",
   "version": "1.1",
   "label": "TIMELINE",
-  "icon": "⏳",
   "consumes": [
     "bridge"
   ],
@@ -5236,7 +5207,7 @@ function _updateStateDisplay(s) {
 }
 
 // ── sph.mount ────────────────────────────────────────────────────
-sph.mount('timeline', 'TIMELINE', '⏳', {
+sph.mount('timeline', 'TIMELINE', {
   panel: _panel,
   commands: [
     { name: 'timeline.play',     desc: 'Start playback' },
@@ -5319,7 +5290,6 @@ sph.mount('timeline', 'TIMELINE', '⏳', {
 <script type="sph/doc" data-doc-ext="timeline">
 {
   "title": "TIMELINE Extension",
-  "icon": "⏳",
   "description": "Transport control [C]. Manages playback time, BPM, and broadcasts timeline:tick signals via abcd.signal. Sends sync commands to B-layer via bridge.channel 'timeline:sync'.",
   "version": "1.1",
   "api": [
@@ -5341,7 +5311,6 @@ sph.mount('timeline', 'TIMELINE', '⏳', {
   "cat": "B",
   "version": "1.2",
   "label": "COMPUTE ENGINE",
-  "icon": "[C]",
   "consumes": [
     "bridge"
   ],
@@ -5405,7 +5374,7 @@ function terminateWorker(id) {
   }
 }
 
-sph.mount('compute', 'COMPUTE ENGINE', '[C]', {
+sph.mount('compute', 'COMPUTE ENGINE', {
   api: {
     /**
      * setup: Initializes a worker using the Injection || Default pattern.
@@ -5510,7 +5479,6 @@ sph.mount('compute', 'COMPUTE ENGINE', '[C]', {
 <script type="sph/doc" data-doc-ext="compute">
 {
   "title": "COMPUTE - Safe High-Performance Runtime",
-  "icon": "[C]",
   "description": "WASM/WebGPU execution layer with mandatory timeout guards and auto-termination to prevent browser freezing.",
   "api": [
     { "method": "compute.setup", "args": "config", "description": "Initializes a worker thread. Uses default ID if config is missing." },
@@ -5552,7 +5520,6 @@ sph.mount('compute', 'COMPUTE ENGINE', '[C]', {
   "cat": "A",
   "version": "1.0",
   "label": "MEDIA STUDIO",
-  "icon": "🎵",
   "consumes": [
     "media_core",
     "find"
@@ -5576,7 +5543,7 @@ sph.mount('compute', 'COMPUTE ENGINE', '[C]', {
     sph.ui.section('Monitor', '<div id="ms-monitor" class="sph-meta">Ready</div>')
   );
 
-  sph.mount('media_studio', 'MEDIA STUDIO', '🎵', {
+  sph.mount('media_studio', 'MEDIA STUDIO', {
     panel: _panel,
     commands: [
       { name: 'media_studio.apply',   desc: 'Parse and play MML input' },
@@ -5857,7 +5824,7 @@ sph.ui.section(title, body)         <span class="cm">// titled card</span></pre>
 <p>An EXT can declare its preferred frame layout. It is applied automatically on <code>ide.frame.mount</code>.</p>
 <pre><span class="cm">&lt;!-- myext.ext.html --&gt;</span>
 sph.mount('myext', {
-  label: 'MY EXT', icon: '?',
+  label: 'MY EXT',
   layout: 'H',          <span class="cm">// preferred layout: S | V | H</span>
   panel:    () =&gt; mainHTML,
   subPanel: () =&gt; toolHTML,  <span class="cm">// shown in frame-b when layout is V or H</span>
@@ -6204,7 +6171,6 @@ sph.call('sys.divd.define', ['volume', { min:0, max:1, default:0.5 }]);
   "cat": "C",
   "version": "1.1",
   "label": "AI CONNECT",
-  "icon": "🧠",
   "consumes": ["bridge", "abcd"],
   "produces": ["ai_state"],
   "signals": ["ai:command_received", "ai:state_reported"],
@@ -6252,7 +6218,7 @@ var _panel=function(){return sph.ui.panel('ai_connect',
     '<button class="sph-btn sph-btn-ok" onclick="sph.call(\'ai_connect.ping\')">Ping AI</button>'
   )
 );}
-sph.mount('ai_connect','AI CONNECT','🧠',{
+sph.mount('ai_connect','AI CONNECT',{
   panel:_panel,
   commands:[
     {name:'ai_connect.report', desc:'Send state to AI', args:'data:object'},
@@ -6314,7 +6280,6 @@ sph.mount('ai_connect','AI CONNECT','🧠',{
 <script type="sph/doc" data-doc-ext="ai_connect">
 {
   "title": "AI CONNECT — Neural Bridge",
-  "icon": "🧠",
   "version": "1.1",
   "description": "Sapphire IDE ↔ AI Agent の双方向ブリッジ。window.postMessage で content_sapphire 拡張と連携します。",
   "api": [
