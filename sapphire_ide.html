@@ -371,7 +371,7 @@ function _safeEval(expr,vars){
 const ALLOWED_EXT=new Set([
   'ext.math.exec',
 ]);
-
+function createMem(o={}){
   // str上限: o.str > sph.register("sph.mem.strCap") > 1000 の優先順
   const strMax=o.str??(_reg.get('sph.mem.strCap')??1000);
   const strArr=[];
@@ -5704,8 +5704,8 @@ sph.mount('compute', 'COMPUTE ENGINE', '[C]', {
 #guide td:first-child{color:var(--sph-accent);white-space:nowrap;font-weight:700}
 </style>
 <div id="guide">
-<h1>◆ SAPPHIRE NG 0.4 (v15)</h1>
-<p style="font-size:var(--sph-sz-md);color:var(--sph-dim)">A DSL + IDE in one HTML file. — v15: stability, purity, memory fixes</p>
+<h1>◆ SAPPHIRE NG 0.4 (v16)</h1>
+<p style="font-size:var(--sph-sz-md);color:var(--sph-dim)">A DSL + IDE in one HTML file. — v16: SAFE_MATH / EXT whitelist / static type check</p>
 
 <h2>DSL Syntax</h2>
 
