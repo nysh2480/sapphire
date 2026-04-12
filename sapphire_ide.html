@@ -2178,8 +2178,14 @@ sph.register('ide.doc.export', ()=>{
   // Render doc into frame-a-ext
   const el=$id('frame-a-ext');
   if(!el)return;
+  // _frameOwner='doc' をセット → frameUnmount() / Escape / logo が機能するようにする
+  if(_frameOwner&&_frameOwner!=='doc')_wireOn(_frameOwner,false);
+  _frameOwner='doc';
   document.body.dataset.frameA='ext:doc';
   document.body.dataset.frameB='log';
+  // frame-a-ext に直接書き込み（_writePane はstyleをheadに移動するため使わない）
+  // マウントアニメーションは手動で起動
+  el.classList.add('sph-mounting');
   el.innerHTML=`
 <style>
 #_doc{font-family:var(--sph-font);font-size:var(--sph-font-size);
@@ -2211,7 +2217,7 @@ sph.register('ide.doc.export', ()=>{
 </style>
 <div id="_doc">
   <div class="dh">
-    <h1>◆ SAPPHIRE NG 0.3 — DOC</h1>
+    <h1>◆ SAPPHIRE NG 0.4 v16 — DOC</h1>
     <button onclick="sph.call('ide.frame.unmount')">← Editor</button>
   </div>
   <p class="meta">${now} &nbsp;|&nbsp; Files: ${tabs.length} &nbsp;|&nbsp; EXTs: ${extIds.length} &nbsp;|&nbsp; Registry: ${regs.length}</p>
@@ -2237,6 +2243,7 @@ sph.register('ide.doc.export', ()=>{
   ${regs.map(r=>`<tr><td>${r}</td></tr>`).join('')}
   </table>
 </div>`;
+  requestAnimationFrame(()=>requestAnimationFrame(()=>el.classList.remove('sph-mounting')));
   sph.emit('doc-view',{tabs:tabs.length,regs:regs.length});
 });
 // View interface (legacy compat)
@@ -2350,7 +2357,7 @@ window.sphIdeInit=function(stateData,params){
     else sph.call('extmgr.open');
   });
   on($id('logo'),'click',()=>{
-    if(getView()==='doc'){setView('editor');}
+    if(_frameOwner==='doc'){frameUnmount();}
     else{sph.call('ide.doc.export');}
   });
   on(document,'keydown',e=>{
@@ -2447,18 +2454,27 @@ window.sphIdeAddTab=function(name,type,extGroup){buildPanel(name);renderTabBar()
 // Error code → human-readable message table
 const _errMessages={
   // compile errors
-  'E001': a=>`[L${a[0]}] Purity Violation: sys.* used inside pure block &${a[1]}`,
+  'E001': a=>a[2]==='sys.f'
+    ?`[L${a[0]}] Purity Violation: sys.f expr not in pure allowlist in &${a[1]} — use !action for side-effects`
+    :`[L${a[0]}] Purity Violation: sys.* used inside pure block &${a[1]}`,
   'E002': ()=>`No entry point ? write: -> BlockName`,
   'E003': a=>`Undefined block: "${a[0]}"`,
   'E004': a=>`[${a[0]}] Runtime error: ${a[1]}`,
   'E005': a=>`[${a[0]}] Compile error: ${a[1]}`,
+  'E006': a=>`&pure block "${a[0]}" must not use await ? use !action or @loop for async`,
+  'E010': a=>`sph.call: undefined API "${a[0]}"`,
+  'E011': a=>`sph.call: error in "${a[0]}": ${a[1]}`,
+  'E012': a=>`ext.call: "${a[0]}" timed out after ${a[1]}ms`,
+  'E013': a=>`Sandbox: prototype mutation blocked: ${a[0]}`,
+  'E014': a=>`Array out of bounds: ${a[0]}[${a[1]}] (size ${a[2]})`,
+  'E015': a=>`Local array access "${a[0]}[...]" not supported — use global array`,
+  'E016': a=>`Stack overflow: "${a[0]}" at depth ${a[1]} (max sph.ext.callDepth)`,
   // compile warnings
   'W001': a=>`lib "${a[0]}" not found`,
   'W002': a=>`doc "${a[0]}" not found`,
   'W003': a=>`Falsy cast: ${a[0]} value "${a[1]}" became ${a[2]}`,
   'W004': a=>`[L${a[0]}] Unknown syntax: ${a[1]}`,
   'W005': a=>`${a[0]} slot overflow ? increase mem.${a[0]}`,
-  'E006': a=>`&pure block "${a[0]}" must not use await ? use !action or @loop for async`,
   'W006': a=>`@loop "${a[0]}" stopped after ${a[1]} iterations (limit reached)`,
   'W007': a=>`@loop "${a[0]}" timed out`,
   'W008': a=>`str[] overflow: index ${a[0]} >= limit ${a[1]} — value dropped`,
@@ -2466,19 +2482,9 @@ const _errMessages={
   'W011': a=>`Sandbox: blocked global access "${a[0]}" — add permission to sph/meta`,
   'W012': a=>`EXT "${a[0]}": dependency "${a[1]}" not mounted`,
   'W013': a=>`Block "${a[0]}" redefined — previous definition overwritten`,
+  'W014': a=>`[L${a[0]}] PUB "${a[1]}" inside indented block — ignored (must be top-level)`,
   'W-TYPE': a=>`[L${a[0]}] Type mismatch: ${a[1]}`,
   'W-EXT':  a=>`EXT call blocked: "${a[0]}" — ${a[1]}`,
-  'W014': a=>`[L${a[0]}] PUB "${a[1]}" inside indented block — ignored (must be top-level)`,
-  'E014': a=>`Array out of bounds: ${a[0]}[${a[1]}] (size ${a[2]})`,
-  'E015': a=>`Local array access "${a[0]}[...]" not supported — use global array`,
-  'E016': a=>`Stack overflow: "${a[0]}" at depth ${a[1]} (max sph.ext.callDepth)`,
-  'E011': a=>`sph.call: error in "${a[0]}": ${a[1]}`,
-  'E012': a=>`ext.call: "${a[0]}" timed out after ${a[1]}ms`,
-  'E013': a=>`Sandbox: prototype mutation blocked: ${a[0]}`,
-  'E014': a=>`Out of bounds: ${a[0]}[${a[1]}] — declared size=${a[2]}`,
-  'W011': a=>`Sandbox: blocked global access "${a[0]}" — add permission to sph/meta`,
-  'W012': a=>`EXT "${a[0]}" consumes "${a[1]}" but it is not loaded`,
-
 };
 
 // Convert error code object to string
@@ -5884,74 +5890,26 @@ sph.mount('myext', {
 <tr><td>2.15</td><td>IDE</td><td>Debug mode wired: sph.debug.enabled=true enables block trace. callDepth enforced (E016)</td></tr>
 </table>
 
-<h3>Subtraction operator change</h3>
-<p>The <code>?</code> operator as subtraction has been removed to avoid collision with the <code>?</code>-sigil (unknown type). Use <code>-</code> for subtraction: <code>#x = #a - #b</code></p>
-
-<h3>Local variable naming (v15)</h3>
-<pre>#_v   → JS: _iv   (integer)
-%_v   → JS: _fv   (float)
-$_v   → JS: _sv   (string)
-~_v   → JS: _bv   (bigint)</pre>
-<p>This prevents #_tmp and %_tmp from sharing the same JS variable <code>_tmp</code>.</p>
-
-<h3>freelist q_slot</h3>
-<pre>; create entity
-?unit[42] = 42
-; ... use ...
-; release slots back to freelist
-sys.q.free 42</pre>
-
-<h2>v15 Changes</h2>
-<h3>Compiler: LL(1) single-pass stream</h3>
-<p>No intermediate AST. Each source line is emitted directly to the block buffer in a single pass.</p>
+<h2>v16 Changes</h2>
 <table>
-<tr><th>Prefix</th><th>Type</th><th>Guarantee</th></tr>
-<tr><td>&amp;</td><td>pure</td><td>Sync only. Side-effect patterns warn W010.</td></tr>
-<tr><td>!</td><td>action</td><td>Async, side-effects allowed.</td></tr>
-<tr><td>@</td><td>loop</td><td>Async loop: brk / stop / 10s / 1M guard.</td></tr>
+<tr><th>Feature</th><th>Category</th><th>Description</th></tr>
+<tr><td>SAFE_MATH / _safeEval</td><td>Security</td><td>ext.math.exec provides sandboxed numeric expression evaluation — replaces raw sys.f for math</td></tr>
+<tr><td>ALLOWED_EXT whitelist</td><td>Security</td><td>DSL EXT calls restricted to whitelist. Use sph.ext.allow(name) to permit additional EXTs</td></tr>
+<tr><td>sph._extCall</td><td>Security</td><td>Whitelist-checked EXT call entry for DSL sandbox</td></tr>
+<tr><td>W-TYPE warning</td><td>Compiler</td><td>Static type inference: warns on obvious sigil mismatches at compile time</td></tr>
+<tr><td>W-EXT warning</td><td>Runtime</td><td>Blocked EXT call emits W-EXT with the blocked name and reason</td></tr>
+<tr><td>E016</td><td>Runtime</td><td>Stack overflow guard: _safeCall depth tracked, E016 on exceeding sph.ext.callDepth</td></tr>
+<tr><td>sph.ext.allow/isAllowed</td><td>API</td><td>Public API to manage EXT whitelist from JS side</td></tr>
+<tr><td>q_slot freelist</td><td>Memory</td><td>Freelist-based slot reuse ({cur, free[]} per type) replaces simple counter</td></tr>
 </table>
 
-<h3>Loop control DSL</h3>
-<pre>sys.loop.break "myloop"     <span class="cm">; break a named @loop</span>
-sys.loop.stop "myloop"      <span class="cm">; stop a named @loop</span>
-sys.loop.stop_all           <span class="cm">; stop all running @loops</span></pre>
+<h3>ext.math.exec — 安全な数式評価</h3>
+<pre><span class="cm">; DSLから安全に数式を評価</span>
+%result = ext.math.exec "sin(#angle) * 100"
+sys.print %result
 
-<h3>Built-in EXTs (ng-0.3)</h3>
-<table>
-<tr><th>EXT</th><th>Key APIs</th></tr>
-<tr><td>key</td><td>key.enable/disable, key.block/unblock, key.inject/eject</td></tr>
-<tr><td>bridge</td><td>bridge.channel.*, bridge.sync.*, bridge.buf.*</td></tr>
-<tr><td>worker</td><td>worker.create/post/send/terminate, worker.audio.*</td></tr>
-<tr><td>sound</td><td>sound.beep, sound.volume, sound.synth.* (AudioWorklet)</td></tr>
-</table>
-
-<h3>SOUND ? AudioWorklet Synth</h3>
-<pre><span class="cm">; beep (OscillatorNode fallback)</span>
-sound.beep 440, 0.2
-
-<span class="cm">; AudioWorklet synth (sine/square/sawtooth/triangle)</span>
-sound.synth.freq 440
-sound.synth.wave 1      <span class="cm">; 0=sine 1=square 2=saw 3=tri</span>
-sound.synth.on          <span class="cm">; noteOn</span>
-sound.synth.off         <span class="cm">; noteOff</span>
-sound.volume 0.7</pre>
-
-<h3>BRIDGE_EXT ? Channel messaging</h3>
-<pre>bridge.channel.create "mychan", "async"
-bridge.channel.publish "mychan", "hello"
-
-<span class="cm">; Sync point ? wait for 3 participants</span>
-bridge.sync.create "barrier", 3
-bridge.sync.arrive "barrier", "task1"
-bridge.sync.wait "barrier"</pre>
-
-<h3>WORKER_EXT ? Web Workers</h3>
-<pre><span class="cm">; create a worker (via JS)</span>
-sph.call('worker.create', ['calc', {
-  handlers: { add: async(d) => d.a + d.b }
-}])
-<span class="cm">; call from DSL</span>
-worker.post "calc", "add", "{a:1,b:2}"</pre>
+<span class="cm">; sph.ext.allow で追加EXTを許可（JS側から）</span>
+sph.ext.allow('myext.compute')</pre>
 </div>
 <style>
 .v06-section{margin-top:20px;padding:16px;background:var(--sph-surface);border-left:3px solid var(--sph-accent);border-radius:0 4px 4px 0}
