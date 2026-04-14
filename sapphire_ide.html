@@ -467,7 +467,7 @@ class Compiler{
     if(!entry||!entry.args)return; // エントリなし or args 未定義 → スキップ
     // args 文字列を解析
     // 1. '→' / '->' 以降の戻り値記述を除去
-    const argsRaw=entry.args.replace(/[→-]>.*/,'').trim();
+    const argsRaw=entry.args.replace(/(→|->).*/,'').trim();
     if(!argsRaw)return;
     // 2. カンマ分割・整形
     const argDefs=argsRaw.split(',').map(s=>s.trim()).filter(Boolean);
@@ -534,7 +534,19 @@ class Compiler{
     }
     return this._ta(s,this._slot(s,tok.slice(1)));
   }
-  _findOp(e,op){let d=0,inS=false;for(let i=e.length-1;i>=0;i--){const c=e[i];if(c==='"')inS=!inS;if(inS)continue;if(c===')'||c===']')d++;if(c==='('||c==='[')d--;if(d===0&&e.slice(i,i+op.length)===op)return i;}return -1;}
+  _findOp(e,op){
+    let d=0,inS=false;
+    for(let i=e.length-1;i>=0;i--){
+      const c=e[i];
+      // エスケープクォートを無視 (C-2 fix)
+      if(c==='"'&&(i===0||e[i-1]!=='\\'))inS=!inS;
+      if(inS)continue;
+      if(c===')'||c===']')d++;
+      if(c==='('||c==='[')d--;
+      if(d===0&&e.slice(i,i+op.length)===op)return i;
+    }
+    return -1;
+  }
   _expr(e){
     if(!e)return'0';e=e.trim();
     // ?name[id].slot 読み取り
@@ -556,7 +568,19 @@ class Compiler{
     return e;
   }
   _callExpr(e){const rest=e.slice(5).trim(),bi=rest.indexOf('['),traw=bi>=0?rest.slice(0,bi).trim():rest,tgt=traw.replace(/^[&!@]/,'');if(bi>=0){const ar=rest.slice(bi+1,rest.lastIndexOf(']')),args=ar.split(',').map(a=>this._expr(a.trim())).filter(a=>a!=='');return`(await callBlock("${tgt}",[${args.join(',')}]))`;}return`(await callBlock("${tgt}",[]))`;}
-  _tok(raw){const t=[];let c='',inS=false;for(const ch of raw){if(ch==='"')inS=!inS;if(!inS&&ch===' '&&c.trim()){t.push(c.trim());c='';}else c+=ch;}if(c.trim())t.push(c.trim());return t.map(x=>x.replace(/,+$/,''));}
+  _tok(raw){
+    // スペース区切りトークナイザ。ダブルクォート内のスペースを保持。
+    // 末尾カンマの除去は文字列リテラル外のトークンのみに適用 (C-6 fix)
+    const t=[];let c='',inS=false;
+    for(const ch of raw){
+      if(ch==='"')inS=!inS;
+      if(!inS&&ch===' '&&c.trim()){t.push(c.trim());c='';}
+      else c+=ch;
+    }
+    if(c.trim())t.push(c.trim());
+    // 文字列リテラルでないトークンの末尾カンマのみ除去
+    return t.map(x=>x.startsWith('"')?x:x.replace(/,+$/,''));
+  }
   _sys(line){
     const m=line.match(/^sys\.([\w.]+)\s*(.*)?$/);if(!m)return`/* bad sys */`;
     const fn=m[1],raw=(m[2]||'').trim();
@@ -580,7 +604,16 @@ class Compiler{
   _splitComma(s){const p=[];let c='',d=0,inS=false;for(const ch of s){if(ch==='"')inS=!inS;if(!inS&&ch==='{')d++;if(!inS&&ch==='}')d--;if(!inS&&d===0&&ch===','){p.push(c.trim());c='';}else c+=ch;}if(c.trim())p.push(c.trim());return p;}
   _splitStmts(text){const st=[];let rest=text.trim();const isS=(s,inR)=>{if(!inR&&(/^(sys\.|call\s|RET\b)/.test(s)||/^[a-z]\w+\.[a-z]\w*/.test(s)))return true;return/^->/.test(s)||/^[#%~$?][a-zA-Z_]\w*\s*=(?!=)/.test(s);};while(rest.length>0){if(!isS(rest,false)){st.push(rest);break;}let end=-1,inS=false,inR=false,pos=1;while(pos<rest.length){const c=rest[pos];if(c==='"')inS=!inS;if(!inS){if(c==='='&&rest[pos+1]!=='='&&rest[pos-1]!=='!'&&rest[pos-1]!=='<'&&rest[pos-1]!=='>')inR=true;if((c===' '||c==='\t')&&isS(rest.slice(pos+1),inR)){end=pos;break;}}pos++;}if(end>0){st.push(rest.slice(0,end).trim());rest=rest.slice(end).trim();}else{st.push(rest.trim());break;}}return st.filter(s=>s&&!s.startsWith(';'));}
   _translateIf(text,bt,bn,ln){const m=text.match(/^\s*if\s+/);if(!m)return'/* bad if */';const after=text.slice(m[0].length);let bO=-1,inS=false;for(let i=0;i<after.length;i++){if(after[i]==='"')inS=!inS;if(!inS&&after[i]==='{'){bO=i;break;}}if(bO<0)return'/* no { */';const cond=after.slice(0,bO).trim();let bC=-1;inS=false;for(let i=after.length-1;i>=bO;i--){if(after[i]==='"')inS=!inS;if(!inS&&after[i]==='}'){bC=i;break;}}if(bC<0)return'/* no } */';const inner=after.slice(bO+1,bC).trim(),condJ=this._expr(cond);const branches=this._splitComma(inner).filter(b=>b.trim());const isJT=branches.length>1&&branches.every(b=>/^\s*(\d+|\*)\s*:/.test(b));if(isJT){let out=`switch(${condJ}){\n`;for(const br of branches){let ci=-1,inS=false;for(let i=0;i<br.length;i++){if(br[i]==='"')inS=!inS;if(!inS&&br[i]===':'){ci=i;break;}}if(ci<0)continue;const k=br.slice(0,ci).trim(),act=br.slice(ci+1).trim(),cl=k==='*'?'default':`case ${k}`,tr=act.startsWith('->')?this._jump(act):(this._line(act,bt,bn,ln)||act+';');out+=`  ${cl}: ${tr} break;\n`;}return out+'}';}const stmts=this._splitStmts(inner);let body='';for(const s of stmts){const t=this._line(s,bt,bn,ln);if(t)body+=`\n  ${t}`;}return`if(${condJ}){${body}\n}`;}
-  _strip(raw){let inS=false;for(let i=0;i<raw.length;i++){if(raw[i]==='"')inS=!inS;if(!inS&&raw[i]===';')return raw.slice(0,i);}return raw;}
+  _strip(raw){
+    let inS=false;
+    for(let i=0;i<raw.length;i++){
+      const c=raw[i];
+      // エスケープクォートを無視 (C-3 fix)
+      if(c==='"'&&(i===0||raw[i-1]!=='\\'))inS=!inS;
+      if(!inS&&c===';')return raw.slice(0,i);
+    }
+    return raw;
+  }
   // &pure ホワイトリスト: sys.f 内で許可される純粋パターン (5-1)
   _isSysFPure(expr){
     // 禁止パターンの検出
@@ -775,7 +808,7 @@ class Compiler{
         ct=s[0];
         const decl=s.slice(1),argsM=decl.match(/\[([^\]]*)\]/);
         cn=decl.replace(/\s*\{.*/,'').trim().replace(/\[.*\]/,'').trim();
-        cb=[];this._locals=new Set();
+        cb=[];this._locals=new Map();
         // Arg unpacking: type-prefixed JS names to prevent cross-sigil collision (3-1)
         if(argsM){
           argsM[1].split(',').map(a=>a.trim()).filter(a=>a).forEach((tok,ai)=>{
