@@ -51,6 +51,7 @@ self.addEventListener('fetch',e=>{
   --sph-err:     #f05575;
   --sph-warn:    #f5c842;
   --sph-border:  #1a2a3a;
+  --sph-surface2:#111e2d;
   --sph-font:    'Space Mono', monospace;
   --sph-font-size: 12px;
   /* ── size scale (derived) ── */
@@ -316,7 +317,16 @@ body[data-view="doc"] #logo{color:var(--sph-ok)}
 (function(){
 'use strict';
 const _reg=new Map();
-function register(name,fn){_reg.set(name,fn);}  // fn | value both OK ? sph.call normalizes
+function register(name,fn){
+  // [v16.3 E017] 既存キーの上書きを拒否してカーネル保護
+  if(_reg.has(name)){
+    emit('error',{code:'E017',args:[name],severity:'error',phase:'sph.register'});
+    return false;
+  }
+  _reg.set(name,fn);return true;
+}
+// 内部専用: 上書き許可版（IDEカーネル初期化・unmount後の再登録にのみ使用）
+function _regForce(name,fn){_reg.set(name,fn);}
 async function call(name,args=[]){
   const v=_reg.get(name);
   if(v===undefined){
@@ -437,11 +447,59 @@ class Compiler{
   }
   _checkType(lhs,rhs,ln){
     const lt=lhs[0],rt=this._inferType(rhs);
-    if(rt==='u')return; // 不明な型はスキップ
+    if(rt==='u')return;
     if((lt==='#'||lt==='%'||lt==='~')&&rt==='$')
       this._warn('W-TYPE',[ln,`Cannot assign String to Numeric ${lhs}`]);
     if(lt==='$'&&rt==='#')
       this._warn('W-TYPE',[ln,`Assigning Number to String ${lhs}`]);
+  }
+  // ── [v16.3] E019: メタデータ駆動型 API シグネチャ検証 ──────────────
+  // id.commands の args 定義と実引数を照合してコンパイル時に E019 を発火
+  // args 文字列例: "freq:number, dur:number" → 期待2引数
+  // args 文字列例: "data:object" → 期待1引数
+  // args が未定義 or 空 → チェックスキップ（任意引数扱い）
+  _checkApiSig(api, actualArgs, ln){
+    // api の先頭 namespace で commands を取得
+    const ns=api.slice(0,api.indexOf('.'));
+    const allCmds=_reg.get(ns+'.commands');
+    if(!Array.isArray(allCmds))return; // commands 未登録 → スキップ
+    const entry=allCmds.find(c=>c&&c.name===api);
+    if(!entry||!entry.args)return; // エントリなし or args 未定義 → スキップ
+    // args 文字列を解析
+    // 1. '→' / '->' 以降の戻り値記述を除去
+    const argsRaw=entry.args.replace(/[→-]>.*/,'').trim();
+    if(!argsRaw)return;
+    // 2. カンマ分割・整形
+    const argDefs=argsRaw.split(',').map(s=>s.trim()).filter(Boolean);
+    if(!argDefs.length)return;
+    // 3. 必須 / optional を分類（末尾 '?' は省略可能）
+    const required=argDefs.filter(s=>!s.endsWith('?'));
+    const total=argDefs.length;
+    const got=actualArgs.length;
+    // 引数数チェック: required <= got <= total
+    if(got<required.length||got>total){
+      const expect=required.length===total
+        ?String(total)
+        :`${required.length}-${total}`;
+      this._err('E019',[api,argDefs.join(', '),actualArgs.join(', ')||'(none)']);
+      return;
+    }
+    // 4. 型チェック: "freq:number" などのヒントとシジルを照合
+    for(let i=0;i<got;i++){
+      const def=argDefs[i].replace(/\?$/,''); // optional マーカー除去
+      const colon=def.lastIndexOf(':');
+      if(colon<0)continue;
+      // 型ヒントから余分な注釈 (A/B/C/D) や (?) を除去
+      const typ=def.slice(colon+1).replace(/\(.*?\)/g,'').trim().toLowerCase();
+      if(!typ)continue;
+      const arg=actualArgs[i]?.trim()||'';
+      const inferred=this._inferType(arg);
+      if(inferred==='u')continue;
+      if((typ==='number'||typ==='int'||typ==='float')&&inferred==='$')
+        this._warn('W-TYPE',[ln,`Arg ${i+1} of "${api}": expected number, got string`]);
+      if(typ==='string'&&inferred==='#')
+        this._warn('W-TYPE',[ln,`Arg ${i+1} of "${api}": expected string, got number`]);
+    }
   }
   _castI(expr,vn){
     if(/^-?\d+$/.test(expr.trim())||/^i32\[/.test(expr.trim()))return`(${expr})|0`;
@@ -536,7 +594,7 @@ class Compiler{
     const bad=[/\.push\(/,/\.pop\(/,/\.splice\(/,/localStorage/,/sessionStorage/,/sph\.call\(/,/sph\._safeCall\(/,/console\./,/fetch\(/,/XMLHttpRequest/];
     for(const p of bad)if(p.test(line)){this._warn('W010',[ln,bn,p.source]);break;}
     // ext.method呼び出し（副作用あり）も&pureでは禁止
-    if(/^[a-z]\w+\.[a-z]\w*/.test(line)&&!line.startsWith('sys.')){this._warn('W010',[ln,bn,'ext.call in &pure']);}
+    if(/^[a-z]\w+(?:\.[a-z]\w*)+/.test(line)&&!line.startsWith('sys.')){this._warn('W010',[ln,bn,'ext.call in &pure']);}
   }
   _line(raw,bt,bn,ln){
     const line=this._strip(raw).trim();if(!line||line==='}')return null;
@@ -565,15 +623,27 @@ class Compiler{
     if(line.match(/^if\b/)&&line.includes('{')){
       return this._translateIf(line,bt,bn,ln);
     }
-    const extAssign=line.match(/^([#%~$?][a-zA-Z_]\w*)\s*=\s*([a-z]\w+\.[a-z]\w*(?:\.[a-z]\w*)?)(.*)/s);
+    // [v16.3] Deep Namespacing: $val = image.filter.blur 5 のようなネスト呼び出しに対応
+    const extAssign=line.match(/^([#%~$?][a-zA-Z_]\w*)\s*=\s*([a-z]\w+(?:\.[a-z]\w*)+)(.*)/s);
     if(extAssign){
       const[,lhs,api,rawArgs]=extAssign;
-      const args=this._tok(rawArgs.trim()).map(t=>this._expr(t));
+      const rawToks=this._tok(rawArgs.trim());
+      const args=rawToks.map(t=>this._expr(t));
+      // [v16.3 E019] API シグネチャ検証
+      this._checkApiSig(api,rawToks,ln);
       const callExpr=`(await sph._safeCall("${api}",[${args.join(',')}]))`;
       const lj=this._addr(lhs),s=lhs[0];
       switch(s){case'#':return`${lj}=${this._castI(callExpr,lhs.slice(1))};`;case'$':return`${lj}=String(${callExpr}??'');`;case'%':return`${lj}=${this._castF(callExpr,lhs.slice(1))};`;case'?':return`${lj}=${callExpr}??null;`;}
     }
-    if(/^[a-z]\w+\.[a-z]\w*/.test(line)){const dot=line.indexOf('.'),ns=line.slice(0,dot),rest=line.slice(dot+1),sp=rest.search(/\s/),cmd=sp>=0?rest.slice(0,sp):rest,raw2=sp>=0?rest.slice(sp+1).trim():'',args=raw2?this._tok(raw2).map(a=>this._expr(a)):[];return`await sph._safeCall("${ns}.${cmd}",[${args.join(',')}]);`;}
+    // [v16.3] Deep Namespacing: image.filter.blur 5 のような複数ドット呼び出しに対応
+    if(/^[a-z]\w+(?:\.[a-z]\w*)+/.test(line)){
+      const sp=line.search(/\s/),api=sp>=0?line.slice(0,sp):line,raw2=sp>=0?line.slice(sp+1).trim():'';
+      const rawToks2=raw2?this._tok(raw2):[];
+      const args=rawToks2.map(a=>this._expr(a));
+      // [v16.3 E019] API シグネチャ検証
+      this._checkApiSig(api,rawToks2,ln);
+      return`await sph._safeCall("${api}",[${args.join(',')}]);`;
+    }
     if(/^@[A-Za-z_][\w.]*/.test(line)){const m2=line.match(/^@([A-Za-z_][\w.]*)(?:\s*\[([^\]]*)\])?$/);if(m2){const a2=m2[2]?m2[2].split(',').map(a=>this._expr(a.trim())).filter(a=>a!==''):[];return a2.length?`pc_ret=await callBlock("${m2[1]}",[${a2.join(',')}]);`:`pc_ret=await callBlock("${m2[1]}",[]);`;}}
     const am=line.match(/^([#%~$?][a-zA-Z_]\w*)\s*=\s*\[([^\]]*)\]/);
     if(am){const s=am[1][0],n=am[1].slice(1),els=am[2].split(',').map(e=>e.trim()).filter(e=>e!==''),base=this._slot(s,n,els.length);return els.map((el,i)=>{const sl=base+i,ej=this._expr(el);switch(s){case'#':return`i32[${sl}]=${this._castI(ej,n+'['+i+']')};`;case'$':return`str[${sl}]=(${ej});`;case'%':return`f64[${sl}]=${this._castF(ej,n+'['+i+']')};`;case'~':return`u64[${sl}]=BigInt(${ej});`;}}).join('\n  ');}
@@ -971,7 +1041,8 @@ async function run(registry,opts={}){
   emit('run-start',{entry:'__top__'});
   // dsl.trigger: EXTからDSLの公開ブロックを呼ぶ正式API
   // 実行中のみ有効。停止後は自動で解除される
-  sph.register('dsl.trigger',async(blockName,args=[])=>{
+  // [v16.3] dsl.trigger は毎RUN更新 → _regForce で強制登録
+  sph._regForce('dsl.trigger',async(blockName,args=[])=>{
     if(signal.stopped)return null;
     const fn=cache[blockName];
     if(!fn){emit('warn',{code:'W010',args:['dsl.trigger:'+blockName],severity:'warn',phase:'runtime'});return null;}
@@ -997,7 +1068,7 @@ async function run(registry,opts={}){
   }
   const result=signal.stopped?'stopped':true;
   emit('run-end',{result});
-  sph.register('dsl.trigger',()=>null); // 実行終了で無効化
+  sph._regForce('dsl.trigger',()=>null); // 実行終了で無効化
   return result;
 }
 function stop(){if(_curSignal)_curSignal.stopped=true;}
@@ -1104,13 +1175,13 @@ function mount(id,...args){
   // シングルトン管理: 既に登録されているEXTは上書き禁止
   // ═══════════════════════════════════════════════════════════════════
   if(_mounts.has(id)){
+    // [v16.3 E018] EXT ID衝突を正式エラーとして発火
+    emit('error',{code:'E018',args:[id],severity:'error',phase:'sph.mount'});
     if(CORE_EXTS.has(id)){
-      console.warn('[sph.mount] Cannot override core EXT "'+id+'". '
-        +'These EXTs are loaded at startup. Use sph.unmount() first if you need to modify them.');
+      console.warn('[sph.mount] Cannot override core EXT "'+id+'".');
     } else {
-      console.warn('[sph.mount] EXT "'+id+'" is already registered (singleton). Mount skipped.');
+      console.warn('[sph.mount] EXT "'+id+'" is already registered (singleton).');
     }
-    // ✅ v16.2: return型を統一（常に文字列idを返す）
     return id;
   }
   
@@ -1129,14 +1200,35 @@ function mount(id,...args){
   if(descriptor.subPanel) mreg(id+'.subPanel', descriptor.subPanel);
   if(descriptor.layout)   mreg(id+'.layout',   descriptor.layout);
   const api=descriptor.api??{};
-  for(const[k,v] of Object.entries(api))mreg(id+'.'+k,v);
-  // M3: commands ? provided | JSDoc-inferred from api fns | auto-named
+  // [v16.3] Deep Namespacing: ネストオブジェクトを再帰的にフラット化して登録
+  // api:{ filter:{ blur:(v)=>... } } → 'ext.filter.blur' として登録
+  // DSLから: image.filter.blur 5.0 と呼べる
+  function _flatApi(prefix,obj){
+    for(const[k,v] of Object.entries(obj)){
+      const key=prefix+'.'+k;
+      if(v!==null&&typeof v==='object'&&!Array.isArray(v)&&typeof v!=='function'){
+        _flatApi(key,v);
+      } else {
+        mreg(key,v);
+      }
+    }
+  }
+  _flatApi(id,api);
+  // M3: commands — 提供済み or api から自動生成（フラット化後のキーを使用）
   if(descriptor.commands){
     mreg(id+'.commands', descriptor.commands);
   } else {
-    mreg(id+'.commands', Object.entries(api).map(([k,v])=>{
-      const d=_jsdoc(v);return{name:id+'.'+k,desc:d.desc,args:d.args||undefined};
-    }));
+    // フラット化後の全キーを keys Set から取り出して commands を自動生成
+    // （ネストされた sub.method も含む）
+    const autoCmds=[];
+    for(const k of keys){
+      if(k===id+'.label'||k===id+'.panel'||k===id+'.subPanel'||k===id+'.layout'||k.endsWith('._on'))continue;
+      const v=_reg.get(k);
+      if(typeof v!=='function')continue;
+      const d=_jsdoc(v);
+      autoCmds.push({name:k,desc:d.desc,args:d.args||undefined});
+    }
+    mreg(id+'.commands',autoCmds);
   }
   // M4: on:{} ? two kinds:
   //   global events (ide-ready, ext-*): wired immediately at mount time
@@ -1252,7 +1344,7 @@ async function _safeCall(name,args=[]){
     return null;
   }
 }
-window.sph={compile:(src,libs,docs)=>compiler.compile(src,libs,docs),run,stop,register,call,get,emit,
+window.sph={compile:(src,libs,docs)=>compiler.compile(src,libs,docs),run,stop,register,_regForce,call,get,emit,
   mount,unmount,ui:sph_ui,_safeCall,
   runtimeSrc:()=>document.getElementById('sph-core')?.textContent||'',_reg,_mounts,_runtimeWarn,_throwOOB,
   _loopBreak:null,_loopStop:null,_loopStopAll:null,
@@ -1872,7 +1964,8 @@ async function runDSL(){
       }
     });
   }
-  sph.register('sys.dom.mount',(docName)=>{
+  // [v16.3] E017対応: 実行中のみsys.dom.mountを上書き → _regForceで強制登録
+  sph._regForce('sys.dom.mount',(docName)=>{
     const html=docs[docName];if(!html)return;
     const rm=$id('run-mount');if(!rm)return;
     const tmp=mk('div');tmp.innerHTML=html;
@@ -1883,7 +1976,7 @@ async function runDSL(){
   sph.emit('run',{tab:Tabs.active});
   _vm=sph.run(registry,{mem:memOpts,docs,log,debug:_reg.get('sph.debug.enabled')??false});
   const result=await _vm;
-  if(savedMount)sph.register('sys.dom.mount',savedMount);
+  if(savedMount)sph._regForce('sys.dom.mount',savedMount);
   _vm=null;btn.textContent='? RUN';btn.classList.remove('running');
   stat.className=(result==='stopped'||result===true)?'ok':'err';
   _exitRun();sph.emit('stop',{result});
@@ -2341,7 +2434,7 @@ sph.register('ide.doc.export', ()=>{
   <p class="meta">${now} &nbsp;|&nbsp; Files: ${tabs.length} &nbsp;|&nbsp; EXTs: ${extIds.length} &nbsp;|&nbsp; Registry: ${regs.length}</p>
   <div class="dl">
     <button onclick="sph.call('ide.save')">↓ Save HTML</button>
-    <button onclick="sph.call('ide.url.copy')">⛓ Copy URL</button>
+    <button onclick="sph.call('ide.url.copy')">Copy URL</button>
   </div>
   <h2>Files (${tabs.length})</h2>
   <table><tr><th>Name</th><th>Type</th><th>Description</th></tr>
@@ -2586,6 +2679,10 @@ const _errMessages={
   'E014': a=>`Array out of bounds: ${a[0]}[${a[1]}] (size ${a[2]})`,
   'E015': a=>`Local array access "${a[0]}[...]" not supported — use global array`,
   'E016': a=>`Stack overflow: "${a[0]}" at depth ${a[1]} (max sph.ext.callDepth)`,
+  'E017': a=>`Duplicate registration: key "${a[0]}" is already locked. Use sph.unmount() first.`,
+  'E018': a=>`EXT ID collision: "${a[0]}" is already occupied. Use sph.unmount() first.`,
+  'E019': a=>`API Signature Mismatch: "${a[0]}" expects (${a[1]}) but got (${a[2]}).`,
+  'E020': a=>`Namespace Violation: access to restricted sub-package "${a[0]}" denied.`,
   // compile warnings
   'W001': a=>`lib "${a[0]}" not found`,
   'W002': a=>`doc "${a[0]}" not found`,
@@ -2605,13 +2702,15 @@ const _errMessages={
 };
 
 // Convert error code object to string
-sph.register('err.format',(obj)=>{
+// [v16.3] _regForce: EXT mount前に必要、かつ mount後も同じ関数 → 一度だけ登録
+function _fmtErr(obj){
   if(!obj||!obj.code)return null;
   const fn=_errMessages[obj.code];
   const msg=fn?fn(obj.args||[]):`[${obj.code}] ${(obj.args||[]).join(' ')}`;
   const phase=obj.phase?`{${obj.phase}} `:'';
   return phase+msg;
-});
+}
+sph._regForce('err.format',_fmtErr);
 
 // Listen for sph:error / sph:warn and write to IDE log (formatted by ERR EXT)
 document.addEventListener('sph:error',({detail})=>{
@@ -2640,26 +2739,16 @@ const _errPanelHtml='<div style="font-size:var(--sph-sz-lg);color:var(--sph-text
   +'<div style="margin-top:12px;font-size:var(--sph-sz-md);color:var(--sph-dim)">Converts error/warning codes to messages in the IDE log.</div>'
   +'</div>';
 
+// [v16.3] err.format は mount前に _regForce 済み → api には含めない（E017回避）
 sph.mount('err','ERR',{
   panel:()=>sph.ui.panel('err',
     '<div id="err-list" style="font-size:var(--sph-sz-md);line-height:1.8"></div>'
     +'<p style="font-size:var(--sph-sz-md);color:var(--sph-dim);margin-top:8px">Converts error/warning codes to messages in the IDE log.</p>'
   ),
-  api:{ format:(obj)=>{ // also keep direct registration below
-    if(!obj||!obj.code)return null;
-    const fn=_errMessages[obj.code];
-    const msg=fn?fn(obj.args||[]):`[${obj.code}] ${(obj.args||[]).join(' ')}`;
-    return(obj.phase?`{${obj.phase}} `:'')+msg;
+  commands:[{name:'err.format',desc:'Format error/warning object to string',args:'obj → string'}],
+  api:{
+    describe:()=>({cat:'D',version:'1.0',consumes:[],produces:[],signals:[]}),
   },
-  describe:()=>({cat:'D',version:'1.0',consumes:[],produces:[],signals:[]}),
-  },
-});
-// err.format is also needed as a direct key (called by ide before EXT is mounted)
-sph.register('err.format',(obj)=>{
-  if(!obj||!obj.code)return null;
-  const fn=_errMessages[obj.code];
-  const msg=fn?fn(obj.args||[]):`[${obj.code}] ${(obj.args||[]).join(' ')}`;
-  return(obj.phase?`{${obj.phase}} `:'')+msg;
 });
 })();
 </script>
@@ -2898,11 +2987,7 @@ window.addEventListener('unhandledrejection',e=>{
 });
 
 // ── SPH block trace ──
-
-
-
-
-
+document.addEventListener('sph:block-call',
 
 
 document.addEventListener('sph:block-call',({detail})=>{
@@ -3449,7 +3534,7 @@ function _refreshWorkerPanel(){
   el.innerHTML=
     `<div class="sph-meta">Workers: ${_workers.size}</div>`+
     `<div class="sph-meta">AudioWorklets: ${_awMgr?_awMgr._nodes.size:0}</div>`+
-    [..._workers.keys()].map(id=>`<div style="font-size:9px;color:var(--sph-dim);margin-top:2px">\u2699\uFE0F ${id}</div>`).join('');
+    [..._workers.keys()].map(id=>`<div style="font-size:9px;color:var(--sph-dim);margin-top:2px">${id}</div>`).join('');
 }
 
 sph.mount('worker','WORKER_EXT',{
@@ -3784,7 +3869,7 @@ const _emHtml=`<style>
       <button class="sph-btn" onclick="sph.call('ide.frame.unmount')">← Editor</button>
       <button class="sph-btn sph-btn-ok" id="em-load">↑ Load</button>
       <button class="sph-btn sph-btn-ok" id="em-save">↓ Save HTML</button>
-      <button class="sph-btn"    id="em-url">⛓ URL</button>
+      <button class="sph-btn"    id="em-url">URL</button>
     </div>
   </div>
   <div class="em-list" id="em-list"></div>
@@ -4041,9 +4126,10 @@ function _detectThemeName(vars){
 }
 // ── Sync layout UI state ──
 function _syncLayoutUI(){
-  const _fr=sph._reg.get('ide.frame.get')?.()??'V';const layout={'S':'1','V':'v2','H':'h2'}[_fr]||'v2';
+  const _fr=sph._reg.get('ide.frame.get')?.()??'V';
+  // [v16.3] data-layout は S/V/H、_fr も S/V/H → 直接比較
   $$('.cfg-layout-btn').forEach(b=>{
-    b.classList.toggle('active',b.dataset.layout===layout);
+    b.classList.toggle('active',b.dataset.layout===_fr);
   });
   // Sync split slider to current ratio
   const ratio=+getComputedStyle(document.documentElement).getPropertyValue('--sph-a-ratio')||0.65;
@@ -4052,7 +4138,7 @@ function _syncLayoutUI(){
   if(sv)sv.textContent=Math.round(ratio*100)+'%';
   // Hide split slider in S mode
   const splitRow=$id('cfg-split-row');
-  if(splitRow)splitRow.style.display=layout==='1'?'none':'';
+  if(splitRow)splitRow.style.display=_fr==='S'?'none':'';
 }
 // ── Apply current state to config UI ──
 function _syncConfigUI(){
@@ -4140,14 +4226,6 @@ sph.mount('appearance','APPEARANCE',{
 });
 
 // DOM is rebuilt each time open_panel fires → re-register listeners each time
-
-
-// Update color inputs and buttons on theme-change (from DSL or external)
-
-
-
-
-
 // appearance cleanup handled by sph.mount/_mounts
 })();
 </script>
@@ -4249,7 +4327,7 @@ table.ft tr:hover td{background:var(--sph-surface)}
     <button class="fab" id="fv-load">↑ Load</button>
     <button class="fab ok" id="fv-save">↓ Save HTML</button>
     <button class="fab ok" id="fv-app">↗ Export App</button>
-    <button class="fab" id="fv-url">⛓ URL</button>
+    <button class="fab" id="fv-url">URL</button>
     <button class="fab" id="fv-clr">LOG CLR</button>
   </div>
   <!-- File list -->
@@ -4271,7 +4349,6 @@ table.ft tr:hover td{background:var(--sph-surface)}
     <input type="text" id="fv-ext-id" value="myext" placeholder="ext id" style="width:80px">
     <label>Label:</label>
     <input type="text" id="fv-ext-label" value="" placeholder="MY EXT" style="width:80px">
-    <label>Icon:</label>
     <button class="fab ok" id="fv-ext-out">↑ Export EXT</button>
   </div>
 </div>`;
@@ -4565,7 +4642,7 @@ sph.mount('file','FILES',{
         const eid=$id('fv-ext-id')?.value.trim()||'myext';
         const lbl=$id('fv-ext-label')?.value.trim()||eid.toUpperCase();
         if(!checks.length){sph.call('ide.log',['EXT Export: select files first']);return;}
-        sph.call('ide.export.ext',[checks,eid,lbl,ico]);
+        sph.call('ide.export.ext',[checks,eid,lbl]);
       });
       $id('fv-chk-all')?.addEventListener('change',e=>{$$('.fv-chk').forEach(c=>c.checked=e.target.checked);});
       _renderFileTable();
@@ -4682,6 +4759,23 @@ function _query(cat = null, filter = null) {
   return entries.sort((a, b) => a.id.localeCompare(b.id));
 }
 
+// ── [v16.3] Signal Flow Monitor ─────────────────────────────────
+// abcd.signal / abcd.pipe のトレースバッファ
+// sph.register('abcd.flow.trace', true) で有効化
+const _FLOW_MAX = 80; // 最大保持件数
+const _flowLog = [];  // {ts, type:'signal'|'pipe', from, to?, name, size}
+let   _flowEnabled = false;
+
+function _flowPush(entry){
+  if(!_flowEnabled)return;
+  if(_flowLog.length>=_FLOW_MAX)_flowLog.shift();
+  _flowLog.push({ts:Date.now(),...entry});
+  sph.emit('abcd:flow',entry);
+}
+function _flowSize(payload){
+  try{return JSON.stringify(payload).length;}catch{return -1;}
+}
+
 // ── pipe: EXT間データ転送 ────────────────────────────────────────
 // fromId.produce() → data → toId.consume(data, fromId)
 async function _pipe(fromId, toId, data) {
@@ -4700,6 +4794,7 @@ async function _pipe(fromId, toId, data) {
   try {
     const r = consumeFn(payload, fromId);
     sph.emit('abcd:pipe', { from: fromId, to: toId, payload });
+    _flowPush({type:'pipe',from:fromId,to:toId,size:_flowSize(payload)});
     return r instanceof Promise ? await r : r;
   } catch (e) {
     console.error(`[abcd] pipe ${fromId}→${toId} error:`, e.message);
@@ -4710,6 +4805,7 @@ async function _pipe(fromId, toId, data) {
 // ── signal: ブロードキャスト ─────────────────────────────────────
 function _signal(signalName, payload, fromId = null) {
   sph.emit('abcd:signal', { signal: signalName, payload, from: fromId });
+  _flowPush({type:'signal',name:signalName,from:fromId??'?',size:_flowSize(payload)});
   // 購読者に配送
   const subs = _subscribers.get(signalName);
   if (subs) {
@@ -4807,7 +4903,7 @@ function _renderPanel() {
           `<span style="color:var(--sph-dim);font-size:var(--sph-sz-sm);margin-left:8px">v${e.version}</span></div>` +
           `<div style="font-size:var(--sph-sz-sm);color:var(--sph-dim);margin-top:2px">` +
           `◀ ${consumes} &nbsp;▶ ${produces}` +
-          `${e.signals.length ? ` &nbsp;📡 ${signals}` : ''}` +
+          `${e.signals.length ? ` | ${signals}` : ''}` +
           `</div></div></div>`
         );
       }).join('') +
@@ -4824,7 +4920,7 @@ function _renderPanel() {
       `ACTIVE SIGNALS</div>` +
       [..._subscribers.entries()].map(([sig, subs]) =>
         `<div style="font-size:var(--sph-sz-sm);padding:3px 0;border-bottom:1px solid var(--sph-border)22">` +
-        `<span style="color:var(--sph-accent)">📡 ${sig}</span>` +
+        `<span style="color:var(--sph-accent)">${sig}</span>` +
         `<span style="color:var(--sph-dim)"> — ${subs.size} subscriber(s)</span></div>`
       ).join('') +
       `</div>`;
@@ -4833,9 +4929,54 @@ function _renderPanel() {
   el.innerHTML = html;
 }
 
+// ── Flow Monitor パネル描画 ─────────────────────────────────────
+function _renderFlow(el){
+  if(!el)return;
+  const rows=_flowLog.slice().reverse().map(e=>{
+    const age=Date.now()-e.ts;
+    const ts=age<1000?`${age}ms ago`:`${(age/1000).toFixed(1)}s ago`;
+    const sizeStr=e.size>=0?` ${e.size}B`:'';
+    if(e.type==='signal'){
+      return `<div style="display:flex;gap:6px;padding:3px 0;border-bottom:1px solid var(--sph-border)22;font-size:var(--sph-sz-sm)">`
+        +`<span style="color:var(--sph-accent);flex-shrink:0">SIG</span>`
+        +`<span style="color:var(--sph-text);flex:1">${e.name}</span>`
+        +`<span style="color:var(--sph-dim)">${e.from}${sizeStr}</span>`
+        +`<span style="color:var(--sph-dim);flex-shrink:0">${ts}</span></div>`;
+    } else {
+      return `<div style="display:flex;gap:6px;padding:3px 0;border-bottom:1px solid var(--sph-border)22;font-size:var(--sph-sz-sm)">`
+        +`<span style="color:var(--sph-ok);flex-shrink:0">PIPE</span>`
+        +`<span style="color:var(--sph-text);flex:1">${e.from} → ${e.to}</span>`
+        +`<span style="color:var(--sph-dim)">${sizeStr}</span>`
+        +`<span style="color:var(--sph-dim);flex-shrink:0">${ts}</span></div>`;
+    }
+  }).join('');
+  el.innerHTML=rows||`<div class="sph-meta">No events yet. Enable trace to record signal/pipe traffic.</div>`;
+}
+
 // ── パネル HTML ─────────────────────────────────────────────────
 const _panel = () => sph.ui.panel('abcd',
-  '<div id="abcd-content" style="flex:1;overflow-y:auto"></div>'
+  `<div style="display:flex;gap:6px;margin-bottom:8px;flex-shrink:0">
+    <button class="sph-btn sph-btn-ok" id="abcd-tab-reg" onclick="
+      document.getElementById('abcd-view-reg').style.display='';
+      document.getElementById('abcd-view-flow').style.display='none';
+      this.style.opacity=1;document.getElementById('abcd-tab-flow').style.opacity='.5'
+    ">Registry</button>
+    <button class="sph-btn" id="abcd-tab-flow" style="opacity:.5" onclick="
+      document.getElementById('abcd-view-reg').style.display='none';
+      document.getElementById('abcd-view-flow').style.display='';
+      this.style.opacity=1;document.getElementById('abcd-tab-reg').style.opacity='.5';
+      sph.call('abcd.flow.render')
+    ">Flow</button>
+    <button class="sph-btn" style="margin-left:auto" onclick="sph.call('abcd.refresh')">↺</button>
+  </div>
+  <div id="abcd-view-reg" style="flex:1;overflow-y:auto"><div id="abcd-content"></div></div>
+  <div id="abcd-view-flow" style="display:none;flex:1;overflow-y:auto">
+    <div style="display:flex;gap:6px;margin-bottom:6px;flex-shrink:0">
+      <button class="sph-btn sph-btn-ok" id="abcd-flow-toggle" onclick="sph.call('abcd.flow.toggle')">Enable Trace</button>
+      <button class="sph-btn" onclick="sph.call('abcd.flow.clear')">Clear</button>
+    </div>
+    <div id="abcd-flow-log" style="font-size:var(--sph-sz-sm)"></div>
+  </div>`
 );
 
 // ── sph.mount ───────────────────────────────────────────────────
@@ -4849,6 +4990,10 @@ sph.mount('abcd', 'ABCD', {
     { name: 'abcd.signal',      desc: 'Broadcast a named signal to subscribers',  args: 'signalName, payload, fromId?' },
     { name: 'abcd.on_signal',   desc: 'Subscribe to a signal',                    args: 'signalName, extId, fn → unsub' },
     { name: 'abcd.flow',        desc: 'Execute a pipeline of EXT steps',          args: 'steps[] → lastResult' },
+    { name: 'abcd.flow.toggle', desc: 'Toggle signal/pipe trace recording' },
+    { name: 'abcd.flow.clear',  desc: 'Clear flow trace log' },
+    { name: 'abcd.flow.render', desc: 'Render flow log into panel' },
+    { name: 'abcd.flow.log',    desc: 'Get flow trace log',                       args: '→ entry[]' },
     { name: 'abcd.refresh',     desc: 'Refresh panel and re-collect sph/meta' },
     { name: 'abcd.describe',    desc: 'Get ABCD runtime metadata' },
   ],
@@ -4860,11 +5005,22 @@ sph.mount('abcd', 'ABCD', {
     signal:    (name, payload, from)=> _signal(name, payload, from),
     on_signal: (name, extId, fn)    => _onSignal(name, extId, fn),
     flow:      (steps)              => _flow(steps),
+    // [v16.3] Flow Monitor API
+    'flow.toggle': ()=>{
+      _flowEnabled=!_flowEnabled;
+      const btn=document.getElementById('abcd-flow-toggle');
+      if(btn)btn.textContent=_flowEnabled?'Disable Trace':'Enable Trace';
+      sph.call('ide.log',[`[ABCD] Flow trace ${_flowEnabled?'enabled':'disabled'}`]);
+    },
+    'flow.clear':  ()=>{ _flowLog.length=0; _renderFlow(document.getElementById('abcd-flow-log')); },
+    'flow.render': ()=>_renderFlow(document.getElementById('abcd-flow-log')),
+    'flow.log':    ()=>[..._flowLog],
     refresh:   () => { _collectMeta(); _renderPanel(); },
     describe:  () => ({
       cat: 'C', version: '1.0',
       registered: _registry.size,
       subscribers: _subscribers.size,
+      flow: { enabled: _flowEnabled, events: _flowLog.length },
     }),
   },
   on: {
@@ -5714,12 +5870,12 @@ sph.mount('compute', 'COMPUTE ENGINE', {
 <script type="sph/tab" data-tab-name="main" data-tab-type="dsl" data-tab-order="0">
 -> main
 
-; ══ SAPPHIRE v0.6 統合デモ ═══════════════════════════════
+; ══ SAPPHIRE NG v16.3 統合デモ ══════════════════════════
 ; EXT直接呼び出し / ABCD / bridge / sound / ループ全部入り
 ; Ctrl+Enter で実行
 
 !main
-  sys.print "╔═ SAPPHIRE v0.6 ═══════════════════╗"
+  sys.print "╔═ SAPPHIRE NG v16.3 ═══════════════╗"
 
   ; ① テーマ操作（EXT直接呼び出し・戻り値なし）
   appearance.theme "dark"
@@ -5760,15 +5916,15 @@ sph.mount('compute', 'COMPUTE ENGINE', {
   sys.print "⑧ signal sent"
 
   ; ⑨ 安全設定の injection 確認
-  ; sph.register で上書き可能（DSLではなくJS側から）
-  ; sph.register('sph.loop.maxIter', 500)   → ループ上限を500に
-  ; sph.register('sph.loop.maxMs',   3000)  → タイムアウトを3秒に
-  ; sph.register('sph.ext.timeout',  2000)  → EXT呼び出しを2秒に
-  ; sph.register('sph.mem.strCap',   500)   → str[]上限を500に
-  sys.print "⑨ all limits are injection-configurable"
+  ; [v16.3] E017: sph.register は既存キーを上書き不可（カーネル保護）
+  ; 上書きが必要な場合は sph.unmount(id) → 再 mount の手順を踏む
+  ; デフォルト値は sph-core 初期化時に一度だけ登録済み:
+  ;   sph.loop.maxIter=1000000 / sph.loop.maxMs=10000
+  ;   sph.ext.timeout=5000 / sph.mem.strCap=1000
+  sys.print "⑨ limits: sph._regForce/unmount で上書き可"
 
   sys.print "╚═ all passed ══════════════════════╝"
-  sys.stop "SAPPHIRE v0.7 OK"
+  sys.stop "SAPPHIRE NG v16.3 OK"
 
 @loop_demo[#n]
   if #n <= 0 { -> break }
@@ -5985,21 +6141,60 @@ sph.mount('myext', {
 <tr><th>Feature</th><th>Category</th><th>Description</th></tr>
 <tr><td>SAFE_MATH / _safeEval</td><td>Security</td><td>ext.math.exec provides sandboxed numeric expression evaluation — replaces raw sys.f for math</td></tr>
 <tr><td>ALLOWED_EXT whitelist</td><td>Security</td><td>DSL EXT calls restricted to whitelist. Use sph.ext.allow(name) to permit additional EXTs</td></tr>
-<tr><td>sph._extCall</td><td>Security</td><td>Whitelist-checked EXT call entry for DSL sandbox</td></tr>
 <tr><td>W-TYPE warning</td><td>Compiler</td><td>Static type inference: warns on obvious sigil mismatches at compile time</td></tr>
 <tr><td>W-EXT warning</td><td>Runtime</td><td>Blocked EXT call emits W-EXT with the blocked name and reason</td></tr>
 <tr><td>E016</td><td>Runtime</td><td>Stack overflow guard: _safeCall depth tracked, E016 on exceeding sph.ext.callDepth</td></tr>
-<tr><td>sph.ext.allow/isAllowed</td><td>API</td><td>Public API to manage EXT whitelist from JS side</td></tr>
 <tr><td>q_slot freelist</td><td>Memory</td><td>Freelist-based slot reuse ({cur, free[]} per type) replaces simple counter</td></tr>
 </table>
 
-<h3>ext.math.exec — 安全な数式評価</h3>
-<pre><span class="cm">; DSLから安全に数式を評価</span>
-%result = ext.math.exec "sin(#angle) * 100"
-sys.print %result
+<h2>v16.3 Changes</h2>
+<table>
+<tr><th>Feature</th><th>Category</th><th>Description</th></tr>
+<tr><td>E017 — register lock</td><td>Governance</td><td>sph.register() rejects duplicate keys. Prevents API hijacking. Use sph.unmount() then re-register.</td></tr>
+<tr><td>E018 — mount collision</td><td>Governance</td><td>sph.mount() fires E018 on duplicate EXT ID. Singleton lifecycle enforced.</td></tr>
+<tr><td>E019 — signature check</td><td>Compiler</td><td>Arg count and type (number/string) validated at compile time against commands metadata.</td></tr>
+<tr><td>E020 — namespace guard</td><td>Compiler</td><td>Reserved for future sub-package access restriction enforcement.</td></tr>
+<tr><td>Deep Namespacing</td><td>Compiler</td><td>api:{ sub:{ method:fn } } registers as 'ext.sub.method'. DSL: <code>image.filter.blur 5</code></td></tr>
+<tr><td>Flow Signal Monitor</td><td>ABCD</td><td>signal/pipe traffic recorded in trace log. ABCD panel → Flow tab → Enable Trace.</td></tr>
+<tr><td>_regForce</td><td>Kernel</td><td>Internal forced register, bypasses E017. Used only by IDE kernel for run-time overrides.</td></tr>
+</table>
 
-<span class="cm">; sph.ext.allow で追加EXTを許可（JS側から）</span>
-sph.ext.allow('myext.compute')</pre>
+<h3>E019 — API Signature Mismatch</h3>
+<p>EXT の commands に <code>args</code> を定義すると、コンパイラが引数の数と型を静的に検証します。</p>
+<pre><span class="cm">; EXT側でメタデータを定義</span>
+commands: [
+  { name: 'sound.beep', args: 'freq:number, dur:number' }
+]
+
+<span class="cm">; DSL: 引数が足りない → E019</span>
+sound.beep 440        <span class="cm">; E019: expects (freq:number, dur:number) but got (440)</span>
+<span class="cm">; 型ミスマッチ → W-TYPE</span>
+sound.beep "high" 1.0 <span class="cm">; W-TYPE: Arg 1 of "sound.beep": expected number, got string</span>
+<span class="cm">; 正しい呼び出し</span>
+sound.beep 440 0.1</pre>
+
+<h3>Deep Namespacing — ネスト API</h3>
+<pre><span class="cm">; JS側での定義</span>
+sph.mount('image', 'IMAGE', {
+  api: {
+    filter: {
+      blur:   (v) => { /* ... */ },
+      sharpen:(v) => { /* ... */ },
+    },
+    io: { export: (fmt) => { /* ... */ } }
+  }
+});
+<span class="cm">; DSLから</span>
+image.filter.blur 5.0
+%s = image.filter.sharpen 2.0
+image.io.export "png"</pre>
+
+<h3>Flow Signal Monitor</h3>
+<pre><span class="cm">; ABCDパネル → Flow タブ → Enable Trace でトレース開始</span>
+<span class="cm">; JS側から制御</span>
+sph.call('abcd.flow.toggle')   <span class="cm">; enable/disable</span>
+sph.call('abcd.flow.log')      <span class="cm">; [{type,name/from/to,size,ts}]</span>
+sph.call('abcd.flow.clear')    <span class="cm">; ログクリア</span></pre>
 </div>
 <style>
 .v06-section{margin-top:20px;padding:16px;background:var(--sph-surface);border-left:3px solid var(--sph-accent);border-radius:0 4px 4px 0}
